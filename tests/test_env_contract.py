@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 
 from skyflow import dynamics
-from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.env import _METRICS_EMA_DECAY, SimConfig, SkyFlowEnv
 from skyflow.tasks.hover import HoverTask
 
 FLEET = 5
@@ -81,11 +81,18 @@ def test_step_shapes_dtypes_and_info(key):
     assert bool(jnp.all(state.steps == 1)) and bool(jnp.all(state.ep_len == 1))
 
 
-def test_metrics_are_scalars(key):
+def test_metrics_are_scalars_with_the_exact_documented_keys(key):
+    """Exact key set — DESIGN §7 env keys (outcome-fraction/ep-stat EMAs + live-fleet
+    means) plus the hover task's diagnostics; a subset check could not catch a dropped
+    contract key."""
     env = make_env()
     _, state = env.reset(key)
     m = env.metrics(state)
-    assert {"ep_return_mean", "ep_len_mean", "airborne_frac", "hover/dist"} <= set(m)
+    assert set(m) == {
+        "crash_frac", "success_frac", "trunc_frac", "ep_return_ema", "ep_len_ema",
+        "ep_return_mean", "ep_len_mean", "airborne_frac", "wind_speed_mean",
+        "hover/dist", "hover/goal_hold",
+    }
     for v in m.values():
         assert v.shape == ()
 
@@ -217,6 +224,52 @@ def test_termination_on_flyaway(key):
     # respawned inside the pad box, episode bookkeeping cleared
     assert bool(jnp.all(jnp.abs(state.plant[:, 0]) < 2.0))
     assert bool(jnp.all(state.steps == 0))
+    # §7 step 10: a fleet-wide crash registers in the crash EMA, not the truncation one
+    m = env.metrics(state)
+    alpha = _METRICS_EMA_DECAY**FLEET
+    assert float(m["crash_frac"]) == pytest.approx(1.0 - alpha, rel=1e-5)
+    assert float(m["trunc_frac"]) == 0.0
+
+
+# -- §7 step 10 episode bookkeeping EMAs -------------------------------------------------------
+
+
+def test_outcome_ema_metrics_update_on_completed_episodes(key):
+    """DESIGN §7 step 10 / §4 EMA leaves: zero after reset, untouched while no episode
+    finishes, then blended with the done-row means at decay**n_done on the step the
+    fleet truncates. Regression for metrics() lacking outcome fractions entirely."""
+    env = make_env(max_episode_steps=4, stuck_steps=10**6)
+    _, state = env.reset(key)
+    ema_keys = ("crash_frac", "success_frac", "trunc_frac", "ep_return_ema", "ep_len_ema")
+    m0 = env.metrics(state)
+    for k in ema_keys:
+        assert m0[k].shape == () and m0[k].dtype == jnp.float32
+        assert float(m0[k]) == 0.0
+
+    a = jnp.zeros((FLEET, 4), jnp.float32)
+    returns = np.zeros(FLEET, np.float64)
+    for t in range(1, 4):
+        _, state, reward, done, _ = env.step(state, a)
+        returns += np.asarray(reward, np.float64)
+        assert not bool(done.any())
+        m = env.metrics(state)
+        for k in ema_keys:
+            assert float(m[k]) == 0.0, f"{k} moved before any episode completed (t={t})"
+
+    _, state, reward, done, info = env.step(state, a)
+    returns += np.asarray(reward, np.float64)
+    assert bool(done.all()) and bool(info["truncated"].all())
+
+    m = env.metrics(state)
+    alpha = _METRICS_EMA_DECAY**FLEET  # FLEET episodes completed on this step
+    assert float(m["trunc_frac"]) == pytest.approx(1.0 - alpha, rel=1e-5)
+    assert float(m["crash_frac"]) == 0.0
+    assert float(m["ep_len_ema"]) == pytest.approx((1.0 - alpha) * 4.0, rel=1e-5)
+    assert float(m["ep_return_ema"]) == pytest.approx(
+        (1.0 - alpha) * returns.mean(), rel=1e-4
+    )
+    # live-fleet means reset with the respawn — they track in-progress accumulators
+    assert float(m["ep_len_mean"]) == 0.0
 
 
 # -- final_obs -------------------------------------------------------------------------------
@@ -355,6 +408,20 @@ class _FakeFleet:
 
     def close(self):
         pass
+
+
+@pytest.mark.parametrize("hz", [500.0, 2000.0, 999.0])
+def test_sticks_requires_1khz_physics(hz):
+    """The firmware tick is hard-fixed at 1 ms (types.FirmwareFleet, DESIGN §10): any
+    non-1000 physics_hz in sticks mode would silently skew Betaflight's virtual clock
+    against the plant, so construction must refuse it — even with an injected fleet."""
+    fleet = 3
+    with pytest.raises(ValueError, match="physics_hz=1000"):
+        SkyFlowEnv(
+            SimConfig(num_envs=fleet, control="sticks", physics_hz=hz, control_hz=100.0),
+            task=HoverTask(),
+            firmware_fleet=_FakeFleet(fleet),
+        )
 
 
 def test_sticks_pipeline_with_injected_fleet(key):

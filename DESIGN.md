@@ -108,6 +108,8 @@ delay_idx [F] int32   # per-world delay draw
 last_action [F,4]
 steps [F] int32; airborne [F] bool
 ep_return [F]; ep_len [F] int32
+crash_frac 0-d; success_frac 0-d; trunc_frac 0-d   # f32 outcome-fraction EMAs over completed episodes (§7 step 10)
+ep_return_ema 0-d; ep_len_ema 0-d                  # f32 completed-episode return/length EMAs (§7 step 10)
 task_state: Any       # opaque task pytree
 ```
 
@@ -160,7 +162,7 @@ class SimConfig:
     airframe: str = "crazyflie"
     control: str = "motors"            # "motors" | "sticks" (§10)
     control_hz: float = 100.0          # physics fixed at physics_hz
-    physics_hz: float = 1000.0
+    physics_hz: float = 1000.0         # sticks mode requires exactly 1000 (§10: 1 kHz firmware tick)
     differentiable: bool = False       # raises NotImplementedError("planned") if True
     # randomization / disturbance
     physics_dr_scale: float = 1.0
@@ -204,7 +206,11 @@ Pure functions; the caller jits. **Step pipeline (order is normative):**
    delay draw, cleared buffers/wind, re-observe with `fresh_spawn=True`; blend all state
    leaves with `tree_where(done, reset_leaf, leaf)`. Pre-reset obs goes to
    `info["final_obs"]`; `info["terminated"]/["truncated"]` are the pre-reset flags.
-10. Episode bookkeeping EMAs for `metrics`.
+10. Episode bookkeeping EMAs for `metrics`: on the pre-reset done rows, update the
+    SimState EMA leaves (§4) — outcome fractions (crash / success-at-end / pure
+    truncation) and completed-episode return/length — with the done-row means, decayed
+    `0.99` per completed episode (`α = 0.99^n_done`; no-op when nothing finished).
+    EMAs start at 0 after `reset` and warm up from there.
 
 ## 8. Ground contact (harness bookkeeping, not physics)
 
@@ -258,7 +264,11 @@ Sticks substep order (normative, from the verified nav-train sequence): synth se
 (FLU→FRD flip; baro from z-up altitude, isothermal 101325 Pa / 8434 m — a harness-side
 sensor model, documented as such) → optional inverse board-align yaw rotation →
 `fw_step` → motors [0,1] reordered by `motor_perm` → motor duties feed the throttle map
-as u (ZOH for that 1 ms substep). `control="sticks"` without a fleet instance and without
+as u (ZOH for that 1 ms substep). `control="sticks"` requires `physics_hz == 1000`: each
+physics substep pairs one plant step with exactly one 1 kHz firmware tick (the firmware's
+virtual clock advances 1 ms per tick, unconditionally), so any other rate would silently
+skew firmware time against simulated time — rejected with ValueError at construction.
+`control="sticks"` without a fleet instance and without
 cudaflight importable → ImportError with install guidance at construction.
 `differentiable=True` + sticks → raise. Motors mode never touches this module.
 

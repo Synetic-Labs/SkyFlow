@@ -1,10 +1,17 @@
 # SkyFlow
 
-A fleet-batched quadrotor **simulator** in pure JAX. Physics is generated from the
-[SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics) symbolic spec;
-SkyFlow is the harness around it — stepping, domain randomization, disturbances,
-sensors, vision, tasks. SkyFlow contains zero handwritten continuous dynamics and zero
-training code (DESIGN.md is the contract of record).
+A fleet-batched quadrotor simulator in pure JAX. One jitted `env.step` advances
+thousands of worlds together, with physics, disturbances, sensors, vision, and resets
+all inside the compiled step; rollout throughput scales with the accelerator, not with
+Python.
+
+The physics is not written here, and that is the point. Every force, torque, and sensor
+equation is generated from the
+[SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics) symbolic spec,
+where each term is verified against published sources and golden-tested per backend.
+SkyFlow is the harness around that plant: stepping, domain randomization, disturbances,
+sensors, vision, tasks. A physics correction lands once, in the spec, and every
+consumer inherits it.
 
 ```python
 import jax
@@ -26,28 +33,43 @@ the pre-reset observation and flags come back through `info["final_obs"]` /
 
 ## What it is
 
-**A platform plus tasks.** The env owns the plant scan (RK4 physics at 1 kHz under a
-100 Hz control loop by default), per-world parameter randomization, OU wind, random
-pokes, command transport delay, the ground-contact heuristic, the generic crash set,
-and in-jit auto-reset. A **task** owns the objective: spawn distribution, observation,
-reward, task-specific terminals. One platform, many tasks.
+### One platform, many tasks
 
-**Generated physics.** Every force, torque, and sensor equation lives in the
-SkyFlow-Dynamics symbolic spec — verified against published sources and golden-tested
-per backend. If a physics term is missing it is added there and consumed here, never
-implemented here. The built-in airframe is the spec's system-identified Crazyflie;
-`register_airframe` adds vehicles from spec parameter rows.
+The env owns the world and everything that happens to the vehicle: RK4 physics at 1 kHz
+under a 100 Hz control loop, per-world parameter randomization, Ornstein–Uhlenbeck
+wind, random pokes, command transport delay, ground contact, crash detection, and
+in-jit auto-reset. A task owns only the objective — spawn distribution, observation,
+reward, task-specific terminals — behind a small protocol. A new experiment is a new
+task registered from outside the package, not a fork of the simulator.
 
-**Vision without a rasterizer.** `gate_course` in vision mode renders analytic ray-cast
-coverage masks of the gate frames directly from pose, batched over the fleet, inside
-jit — a segmentation mask, not RGB, which is what a perception front-end hands a policy
-at deploy time. Persistent mask-corruption families ship in `skyflow.vision.mask_noise`.
+### Physics with provenance
 
-**Firmware in the loop.** `control="sticks"` closes the loop through real Betaflight
-firmware (the `cudaflight` SITL, `firmware` extra): AETR sticks in, per-motor duties
-out, ticked at 1 kHz inside the substep scan. `control="motors"` is pure JAX and never
-touches that seam. Consuming repos with their own GPU firmware fleet inject it via
-`SkyFlowEnv(cfg, firmware_fleet=...)`.
+Handwritten simulator dynamics decay: coefficients lose their sources, sign conventions
+drift, and every sim becomes its own dialect of the same equations. Generating the
+dynamics from a symbolic spec keeps one auditable model, with every term traceable to a
+published source. The built-in airframe is the spec's Crazyflie reference row
+(mixed provenance, documented per coefficient in the spec);
+`register_airframe` adds vehicles from spec parameter rows. A missing physics term is
+added to the spec and consumed here, never implemented here.
+
+### Vision inside jit
+
+`gate_course` in vision mode renders analytic ray-cast coverage masks of the gate
+frames directly from pose — no rasterizer, no host round-trip, batched over the fleet
+inside jit. A segmentation mask is what a classical perception front-end hands the
+policy at deploy time, so the policy trains on the representation it will fly with.
+`skyflow.vision.mask_noise` corrupts the clean render with the artifact families a real
+front-end produces — branding holes, occluders, glow, speckle — and the artifacts
+persist across frames instead of resampling every step.
+
+### Real firmware in the loop
+
+A stick-level policy ultimately flies through Betaflight, so `control="sticks"` closes
+the loop through the real firmware (the `cudaflight` SITL, `firmware` extra): AETR
+sticks in, per-motor duties out, ticked at 1 kHz inside the substep scan. What the
+policy learns to command is what the vehicle will run. `control="motors"` is pure JAX
+and never touches that seam; consuming repos with their own GPU firmware fleet inject
+it via `SkyFlowEnv(cfg, firmware_fleet=...)`.
 
 ## Install
 
@@ -62,8 +84,8 @@ Requires Python 3.12+. Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[j
 ## Tasks
 
 `hover` and `gate_course` (with a figure-eight course builder) ship as reference tasks.
-Research tasks live in the consuming repo: implement the `Task` protocol from
-`skyflow.types` and register a builder —
+They are examples, not the extent of the sim: research tasks live in the consuming
+repo. Implement the `Task` protocol from `skyflow.types` and register a builder —
 
 ```python
 from skyflow import SimConfig, SkyFlowEnv, register_task
@@ -92,12 +114,13 @@ firmware sensor boundary.
 
 ## Scope
 
-Deliberately **not** here:
+SkyFlow is deliberately only the simulator:
 
-- **Training code.** No RL algorithms, losses, replay, obs normalization, policy
-  networks, or config frameworks. Training repos import SkyFlow and own all of that.
-- **A differentiability claim.** The design avoids blockers (pure functions, no host
-  state on the motors path) and the roadmap includes a differentiable variant, but
+- **No training code.** No RL algorithms, losses, replay, obs normalization, policy
+  networks, or config frameworks. Training repos import SkyFlow and own all of that;
+  the sim stays a small dependency rather than a framework.
+- **No differentiability claim.** The design avoids the usual blockers (pure functions,
+  no host state on the motors path) and a differentiable variant is on the roadmap, but
   `differentiable=True` raises `NotImplementedError("planned")` today rather than
   promising gradients that haven't been verified.
 
@@ -109,6 +132,9 @@ uv run ruff check .
 uv run python examples/fly_hover.py
 uv run python examples/fly_figure_eight.py --save-masks 6
 ```
+
+[DESIGN.md](DESIGN.md) is the contract of record: interfaces change there first, then
+in code.
 
 ## Credits
 

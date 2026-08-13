@@ -26,7 +26,9 @@ Step pipeline (order is normative, DESIGN.md §7):
  8. IMU measurement + task `observe`
  9. in-jit auto-reset of done worlds via `tree_where` blending; the pre-reset observation
     goes to info["final_obs"], the pre-reset flags to info["terminated"/"truncated"]
-10. episode bookkeeping (per-world return/length accumulators feeding `metrics`)
+10. episode bookkeeping EMAs for `metrics`: the SimState EMA leaves (outcome fractions,
+    completed-episode return/length) update from the pre-reset done rows, decayed
+    `_METRICS_EMA_DECAY` per completed episode; no-op when nothing finished
 """
 
 from __future__ import annotations
@@ -53,6 +55,10 @@ _GROUND_BAND_M = 0.05
 #: Descent speed at which touching down inside the band counts as a crash, m/s (§7).
 _CRASH_DESCENT_MPS = 1.0
 
+#: Episode-bookkeeping EMA decay per COMPLETED episode (§7 step 10): a step finishing
+#: n episodes keeps `decay**n` of the old EMA and blends in the done-row mean.
+_METRICS_EMA_DECAY = 0.99
+
 
 @dataclass(frozen=True)
 class SimConfig:
@@ -69,7 +75,7 @@ class SimConfig:
     airframe: str = "crazyflie"
     control: str = "motors"  # "motors" | "sticks" (DESIGN.md §10)
     control_hz: float = 100.0
-    physics_hz: float = 1000.0
+    physics_hz: float = 1000.0  # sticks mode requires exactly 1000 (§10: 1 kHz fw tick)
     differentiable: bool = False  # raises NotImplementedError("planned") if True
     # randomization / disturbance
     physics_dr_scale: float = 1.0
@@ -241,6 +247,12 @@ class SkyFlowEnv:
 
         self._fw: FirmwareFleet | None = None
         if cfg.control == "sticks":
+            if cfg.physics_hz != 1000.0:
+                raise ValueError(
+                    f"sticks mode requires physics_hz=1000: the firmware tick is fixed "
+                    f"at 1 kHz and each substep pairs one plant step with exactly one "
+                    f"tick (DESIGN.md §10); got physics_hz={cfg.physics_hz}"
+                )
             # Imported here, not at module top: motors mode never touches the firmware
             # seam (DESIGN.md §10), and this module must import without the wheel.
             from skyflow import firmware as _firmware
@@ -330,6 +342,11 @@ class SkyFlowEnv:
             airborne=jnp.zeros(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
             ep_len=jnp.zeros(f, jnp.int32),
+            crash_frac=jnp.zeros((), jnp.float32),
+            success_frac=jnp.zeros((), jnp.float32),
+            trunc_frac=jnp.zeros((), jnp.float32),
+            ep_return_ema=jnp.zeros((), jnp.float32),
+            ep_len_ema=jnp.zeros((), jnp.float32),
             task_state=task_state,
         )
         return obs, state
@@ -460,9 +477,28 @@ class SkyFlowEnv:
         imu = sensors.measure(plant, omega_last, wind_vel, state.params)
         obs, ts_out = self.task.observe(plant, ev.task_state, imu, action, k_obs, fresh_spawn=False)
 
-        # 10 (accumulate before the blend so done rows report full-episode stats in info).
+        # 10 (accumulated before the blend so done rows report full-episode stats in
+        # info and feed the EMAs below).
         ep_return = state.ep_return + reward
         ep_len = state.ep_len + 1
+
+        # 10. Episode bookkeeping EMAs (§7 step 10): fleet-global 0-d leaves, updated
+        # with the done-row means and decayed per completed episode; when nothing
+        # finished alpha = 1 and the EMAs pass through unchanged. Kept out of the §7
+        # step 9 tree_where blend below — they are cross-episode, not per-world.
+        n_done = jnp.sum(done.astype(jnp.float32))
+        alpha = jnp.asarray(_METRICS_EMA_DECAY, jnp.float32) ** n_done
+        denom = jnp.maximum(n_done, 1.0)
+
+        def ema(old: Array, rows: Array) -> Array:
+            done_mean = jnp.sum(jnp.where(done, rows.astype(jnp.float32), 0.0)) / denom
+            return (alpha * old + (1.0 - alpha) * done_mean).astype(jnp.float32)
+
+        crash_frac = ema(state.crash_frac, crash | ev.crash)
+        success_frac = ema(state.success_frac, ev.success)
+        trunc_frac = ema(state.trunc_frac, truncated & ~terminated)
+        ep_return_ema = ema(state.ep_return_ema, ep_return)
+        ep_len_ema = ema(state.ep_len_ema, ep_len)
 
         # 9. Auto-reset: fresh spawn + fresh DR params + fresh delay draw + cleared
         # buffers/wind for done worlds, blended leaf-wise; live worlds pass through
@@ -515,7 +551,16 @@ class SkyFlowEnv:
             blob, fwstate = self._fw.reset(blob, fwstate, done.astype(jnp.uint8))
             ts_state = _FirmwareCarry(task=ts_state, blob=blob, fwstate=fwstate)
 
-        state_out = SimState(key=k_carry, task_state=ts_state, **merged)
+        state_out = SimState(
+            key=k_carry,
+            task_state=ts_state,
+            crash_frac=crash_frac,
+            success_frac=success_frac,
+            trunc_frac=trunc_frac,
+            ep_return_ema=ep_return_ema,
+            ep_len_ema=ep_len_ema,
+            **merged,
+        )
         info: StepInfo = {
             **ev.info,
             "terminated": terminated,
@@ -529,13 +574,21 @@ class SkyFlowEnv:
 
     def metrics(self, state: SimState) -> dict[str, Array]:
         """
-        Scalar fleet means for logging: episode accumulators, airborne fraction, wind
-        magnitude, and the task's own diagnostics. All values are 0-d f32 — cheap to
-        device-get at any cadence. (SimState §4 carries no cross-episode storage, so
-        these are means over the live fleet, not smoothed outcome rates.)
+        Scalar means for logging (DESIGN.md §7): outcome fractions and episode stats as
+        EMAs over COMPLETED episodes (step 10 bookkeeping — crash_frac / success_frac /
+        trunc_frac, ep_return_ema / ep_len_ema; 0 until the first episode finishes),
+        plus instantaneous live-fleet means (ep_return_mean / ep_len_mean average the
+        IN-PROGRESS accumulators, airborne_frac and wind_speed_mean the current state)
+        and the task's own diagnostics. All values are 0-d f32 — cheap to device-get at
+        any cadence.
         """
         ts = state.task_state.task if self._fw is not None else state.task_state
         out = {
+            "crash_frac": state.crash_frac,
+            "success_frac": state.success_frac,
+            "trunc_frac": state.trunc_frac,
+            "ep_return_ema": state.ep_return_ema,
+            "ep_len_ema": state.ep_len_ema,
             "ep_return_mean": jnp.mean(state.ep_return),
             "ep_len_mean": jnp.mean(state.ep_len.astype(jnp.float32)),
             "airborne_frac": jnp.mean(state.airborne.astype(jnp.float32)),

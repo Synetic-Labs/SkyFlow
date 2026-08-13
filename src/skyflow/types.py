@@ -154,6 +154,13 @@ class SimState:
     airborne: Array  # [F] bool
     ep_return: Array  # [F]
     ep_len: Array  # [F] int32
+    # -- §7 step 10 episode-bookkeeping EMAs (0-d f32, fleet-global by design): updated
+    # from the pre-reset done rows each step, decayed per completed episode, start at 0.
+    crash_frac: Array  # 0-d f32 — EMA fraction of completed episodes ending in a crash
+    success_frac: Array  # 0-d f32 — EMA fraction whose final step evaluated success
+    trunc_frac: Array  # 0-d f32 — EMA fraction ending by pure truncation (no termination)
+    ep_return_ema: Array  # 0-d f32 — EMA of completed-episode return
+    ep_len_ema: Array  # 0-d f32 — EMA of completed-episode length, control steps
     task_state: Any  # opaque task pytree
 
     def replace(self, **updates: Any) -> "SimState":

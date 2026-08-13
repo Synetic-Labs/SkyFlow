@@ -203,6 +203,11 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         airborne=jnp.zeros(f, bool),
         ep_return=jnp.zeros(f, jnp.float32),
         ep_len=jnp.zeros(f, jnp.int32),
+        crash_frac=jnp.zeros((), jnp.float32),
+        success_frac=jnp.zeros((), jnp.float32),
+        trunc_frac=jnp.zeros((), jnp.float32),
+        ep_return_ema=jnp.zeros((), jnp.float32),
+        ep_len_ema=jnp.zeros((), jnp.float32),
         task_state={"goal": jnp.zeros((f, 3), jnp.float32)},
     )
 

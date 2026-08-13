@@ -3,193 +3,21 @@ DESIGN.md §11, suite 5 (gate part) — GateCourseTask pass/crash/progress logic
 dynamics-free synthetic plant states: plant rows [F,17] are built directly, so nothing
 here depends on env.py or the dynamics backend.
 
-The vision modules are being built in parallel to the frozen public API (DESIGN.md §2,
-§9). When `skyflow.vision.gates` / `.camera` / `.renderer` are importable they are used
-as-is; any that is MISSING is replaced by a minimal z-up mock with the documented
-signature (flat-plane crossing test, upright gates, zero-mask renderer) so this suite
-stays runnable before integration. Mocks are only installed for absent modules — a
-present-but-broken module fails loudly here, as it should.
+The shipped `skyflow.vision` modules (DESIGN.md §2: gates/camera/renderer/mask_noise)
+are used as-is. This suite once carried a mock fallback for not-yet-integrated vision
+modules; it was unreachable by construction (`import skyflow` pulls in
+`skyflow.vision.gates` through the tasks registry before any mock could install) and
+vision ships complete, so it was removed rather than made real.
 """
 
-import importlib
 import math
-import sys
-import types as _pytypes
-from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-MOCKED: set[str] = set()
-
-
-def _mock_gates_module() -> _pytypes.ModuleType:
-    """skyflow.vision.gates stand-in: upright z-up gates, flat-plane crossing test.
-
-    Mirrors the real public surface — builders take z-up definitions, geometry reads
-    back through the `*_world` properties, `classify_crossings` takes z-up positions.
-    The mock keeps its internal arrays z-up too, so the properties are pass-throughs.
-    """
-    mod = _pytypes.ModuleType("skyflow.vision.gates")
-
-    class GateSet:
-        """Public surface only; yaw about world +z, pitch unsupported (=0)."""
-
-        def __init__(self, centers, yaws, inner_half, outer_half):
-            self.centers = jnp.asarray(centers, jnp.float32).reshape(-1, 3)
-            yaws = jnp.asarray(yaws, jnp.float32).reshape(-1)
-            c, s = jnp.cos(yaws), jnp.sin(yaws)
-            z = jnp.zeros_like(c)
-            self.yaws = yaws
-            self.normals = jnp.stack([c, s, z], axis=-1)
-            self.laterals = jnp.stack([-s, c, z], axis=-1)
-            self.verticals = jnp.stack([z, z, jnp.ones_like(c)], axis=-1)
-            g = self.centers.shape[0]
-            self.inner_half = jnp.broadcast_to(
-                jnp.asarray(inner_half, jnp.float32).reshape(-1, 2), (g, 2)
-            )
-            self.outer_half = jnp.broadcast_to(
-                jnp.asarray(outer_half, jnp.float32).reshape(-1, 2), (g, 2)
-            )
-            self.depths = jnp.zeros((g,), jnp.float32)
-
-        @classmethod
-        def build(cls, centers, yaws, inner_half=(0.275, 0.275), frame_width=0.225,
-                  pitches=None, depth=0.0):
-            del pitches, depth
-            inner = jnp.asarray(inner_half, jnp.float32)
-            return cls(centers, yaws, inner, inner + float(frame_width))
-
-        def __len__(self):
-            return int(self.centers.shape[0])
-
-        centers_world = property(lambda self: self.centers)
-        normals_world = property(lambda self: self.normals)
-        laterals_world = property(lambda self: self.laterals)
-        verticals_world = property(lambda self: self.verticals)
-
-    def classify_crossings(prev_pos, pos, gates, body_radius=0.0):
-        """Flat-plane port of the nav-train test: (pass_fwd, pass_bwd, hit) all [F,G]."""
-        r = float(body_radius)
-        d_prev = prev_pos[:, None, :] - gates.centers[None]
-        seg = (pos - prev_pos)[:, None, :]
-        oo_n = jnp.sum(d_prev * gates.normals[None], axis=-1)
-        dd_n = jnp.sum(seg * gates.normals[None], axis=-1)
-        oo_l = jnp.sum(d_prev * gates.laterals[None], axis=-1)
-        dd_l = jnp.sum(seg * gates.laterals[None], axis=-1)
-        oo_v = jnp.sum(d_prev * gates.verticals[None], axis=-1)
-        dd_v = jnp.sum(seg * gates.verticals[None], axis=-1)
-        prev_sd, sd = oo_n, oo_n + dd_n
-        crossed = (prev_sd * sd) < 0.0
-        denom = prev_sd - sd
-        alpha = prev_sd / jnp.where(jnp.abs(denom) < 1e-9, 1e-9, denom)
-        cp_lat = jnp.abs(oo_l + alpha * dd_l)
-        cp_vert = jnp.abs(oo_v + alpha * dd_v)
-        in_inner = (cp_lat < gates.inner_half[None, :, 0] - r) & (
-            cp_vert < gates.inner_half[None, :, 1] - r
-        )
-        in_outer = (cp_lat <= gates.outer_half[None, :, 0] + r) & (
-            cp_vert <= gates.outer_half[None, :, 1] + r
-        )
-        hit = crossed & in_outer & ~in_inner
-        passed = crossed & in_inner
-        forward = prev_sd < 0.0
-        return passed & forward, passed & ~forward, hit
-
-    def figure_eight(k_gates_per_lobe, lobe_radius_m=2.5, alt_m=1.5,
-                     inner_half=(0.275, 0.275), outer_half=None, depth=0.0):
-        """2k gates on a lemniscate of Bernoulli, each facing the travel tangent."""
-        del outer_half
-        rows, yaws = _lemniscate_rows(
-            int(k_gates_per_lobe), 2.0 * float(lobe_radius_m), float(alt_m)
-        )
-        return GateSet.build(rows, yaws, inner_half=inner_half, depth=depth)
-
-    mod.GateSet = GateSet
-    mod.classify_crossings = classify_crossings
-    mod.figure_eight = figure_eight
-    return mod
-
-
-def _lemniscate_rows(k: int, a: float, alt: float):
-    """2k centres + tangent yaws on x² = a²·cos2θ (Bernoulli), avoiding the origin."""
-    n = 2 * k
-    centers, yaws = [], []
-    for i in range(n):
-        th = 2.0 * math.pi * i / n
-
-        def pt(t):
-            d = 1.0 + math.sin(t) ** 2
-            return a * math.cos(t) / d, a * math.sin(t) * math.cos(t) / d
-
-        x, y = pt(th)
-        x2, y2 = pt(th + 1e-4)
-        x1, y1 = pt(th - 1e-4)
-        centers.append((x, y, alt))
-        yaws.append(math.atan2(y2 - y1, x2 - x1))
-    return centers, yaws
-
-
-def _mock_camera_module() -> _pytypes.ModuleType:
-    mod = _pytypes.ModuleType("skyflow.vision.camera")
-
-    @dataclass(frozen=True)
-    class CameraModel:
-        height: int = 32
-        width: int = 32
-        fov_x_deg: float = 99.0
-        fov_y_deg: float = 79.8
-        mount_pitch_deg: float = 40.0
-        offset_body: tuple = (0.02, 0.0, 0.05)
-        supersample: int = 2
-
-    mod.CameraModel = CameraModel
-    return mod
-
-
-def _mock_renderer_module() -> _pytypes.ModuleType:
-    mod = _pytypes.ModuleType("skyflow.vision.renderer")
-
-    def render_masks(cam, gates, pos, quat, **kwargs):
-        del gates, quat, kwargs
-        return jnp.zeros((pos.shape[0], cam.height, cam.width), jnp.float32)
-
-    mod.render_masks = render_masks
-    return mod
-
-
-def _install_vision_mocks() -> None:
-    import skyflow
-
-    try:
-        importlib.import_module("skyflow.vision")
-    except ModuleNotFoundError:
-        pkg = _pytypes.ModuleType("skyflow.vision")
-        pkg.__path__ = []
-        sys.modules["skyflow.vision"] = pkg
-        skyflow.vision = pkg
-        MOCKED.add("skyflow.vision")
-    builders = {
-        "gates": _mock_gates_module,
-        "camera": _mock_camera_module,
-        "renderer": _mock_renderer_module,
-    }
-    for name, build in builders.items():
-        full = f"skyflow.vision.{name}"
-        try:
-            importlib.import_module(full)
-        except ModuleNotFoundError:
-            mod = build()
-            sys.modules[full] = mod
-            setattr(sys.modules["skyflow.vision"], name, mod)
-            MOCKED.add(full)
-
-
-_install_vision_mocks()
-
-from skyflow.tasks.gate_course import GateCourseTask, GateTaskState  # noqa: E402
-from skyflow.vision.gates import GateSet, figure_eight  # noqa: E402
+from skyflow.tasks.gate_course import GateCourseTask, GateTaskState
+from skyflow.vision.gates import GateSet, figure_eight
 
 # -- synthetic plant states ---------------------------------------------------------
 
