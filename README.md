@@ -1,17 +1,11 @@
 # SkyFlow
 
-A fleet-batched quadrotor simulator in pure JAX. One jitted `env.step` advances
-thousands of worlds together, with physics, disturbances, sensors, vision, and resets
-all inside the compiled step; rollout throughput scales with the accelerator, not with
-Python.
+An accurate and fast quadrotor simulator in JAX. Fully compiled for a pure GPU environment training simulation.
 
-The physics is not written here, and that is the point. Every force, torque, and sensor
-equation is generated from the
-[SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics) symbolic spec,
-where each term is verified against published sources and golden-tested per backend.
-SkyFlow is the harness around that plant: stepping, domain randomization, disturbances,
-sensors, vision, tasks. A physics correction lands once, in the spec, and every
-consumer inherits it.
+The physics dynamics is generated from the seperate repo here:
+[SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics).
+This maintains the symbolic spec, where each term is verified against published sources and per backend.
+SkyFlow is the harness around that plant and inherits from it.
 
 ```python
 import jax
@@ -33,43 +27,32 @@ the pre-reset observation and flags come back through `info["final_obs"]` /
 
 ## What it is
 
-### One platform, many tasks
+### Environment
 
-The env owns the world and everything that happens to the vehicle: RK4 physics at 1 kHz
-under a 100 Hz control loop, per-world parameter randomization, Ornstein–Uhlenbeck
-wind, random pokes, command transport delay, ground contact, crash detection, and
-in-jit auto-reset. A task owns only the objective — spawn distribution, observation,
-reward, task-specific terminals — behind a small protocol. A new experiment is a new
-task registered from outside the package, not a fork of the simulator.
+The env owns the world and everything that happens to the vehicle: RK4 physics, 
+per-world parameter randomization, Ornstein–Uhlenbeck wind, random pokes, 
+command transport delay, ground contact, crash detection, and in-jit auto-reset. 
+A task owns the objective; spawn distribution, observation, reward, 
+task-specific terminals.
 
-### Physics with provenance
+### Airframe
 
-Handwritten simulator dynamics decay: coefficients lose their sources, sign conventions
-drift, and every sim becomes its own dialect of the same equations. Generating the
-dynamics from a symbolic spec keeps one auditable model, with every term traceable to a
-published source. The built-in airframe is the spec's Crazyflie reference row
-(mixed provenance, documented per coefficient in the spec);
-`register_airframe` adds vehicles from spec parameter rows. A missing physics term is
-added to the spec and consumed here, never implemented here.
+The built-in airframe is the spec's Crazyflie reference row;
+`register_airframe` adds vehicles from spec parameter rows.
 
 ### Vision inside jit
 
 `gate_course` in vision mode renders analytic ray-cast coverage masks of the gate
 frames directly from pose — no rasterizer, no host round-trip, batched over the fleet
-inside jit. A segmentation mask is what a classical perception front-end hands the
-policy at deploy time, so the policy trains on the representation it will fly with.
-`skyflow.vision.mask_noise` corrupts the clean render with the artifact families a real
-front-end produces — branding holes, occluders, glow, speckle — and the artifacts
-persist across frames instead of resampling every step.
+inside jit. `skyflow.vision.mask_noise` corrupts the clean render with the artifact families;
+branding holes, occluders, glow, speckle.
 
-### Real firmware in the loop
+### firmware in the loop
 
-A stick-level policy ultimately flies through Betaflight, so `control="sticks"` closes
+A stick-level policy can fly through Betaflight, `control="sticks"` closes
 the loop through the real firmware (the `cudaflight` SITL, `firmware` extra): AETR
-sticks in, per-motor duties out, ticked at 1 kHz inside the substep scan. What the
-policy learns to command is what the vehicle will run. `control="motors"` is pure JAX
-and never touches that seam; consuming repos with their own GPU firmware fleet inject
-it via `SkyFlowEnv(cfg, firmware_fleet=...)`.
+sticks in, per-motor duties out, ticked at 1 kHz inside the substep scan. `control="motors"`
+is pure raw motor output.
 
 ## Install
 
@@ -84,8 +67,7 @@ Requires Python 3.12+. Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[j
 ## Tasks
 
 `hover` and `gate_course` (with a figure-eight course builder) ship as reference tasks.
-They are examples, not the extent of the sim: research tasks live in the consuming
-repo. Implement the `Task` protocol from `skyflow.types` and register a builder —
+Implement the `Task` protocol from `skyflow.types` and register a builder:
 
 ```python
 from skyflow import SimConfig, SkyFlowEnv, register_task
@@ -95,34 +77,17 @@ env = SkyFlowEnv(SimConfig(num_envs=1024, task="my_task", task_kwargs={...}))
 ```
 
 The env only ever reaches a task through the protocol, so a registered task is a
-first-class citizen — nothing special-cases the built-ins. Names are refused on
-collision (variants register under their own names). `task_kwargs` passes to the
-builder unmodified; the env-owned `spawn_dr_scale` and `control_hz` are forwarded to
-builders that name them.
+first-class citizen.`task_kwargs` passes to the builder unmodified; 
+the env-owned `spawn_dr_scale` and `control_hz` are forwarded to builders that name them.
 
 Course geometry for gate tasks lives in `skyflow.vision.gates`: `from_waypoints` takes
-z-up world rows so a course is config data, and `line`/`circle`/`figure_eight` generate
-the standard shapes.
+z-up world rows, and `line`/`circle`/`figure_eight` generate the standard shapes.
 
 ## Conventions
 
-World frame right-handed z-up; body FLU; quaternions wxyz scalar-first Hamilton
-body→world; SI units, rotor speeds in rad/s — identical to SkyFlow-Dynamics, states
-pass through untranslated. Every array the env creates is float32 with the fleet axis
-`[F, ...]` leading. NED/FRD survives only inside `vision/` internals and at the
-firmware sensor boundary.
-
-## Scope
-
-SkyFlow is deliberately only the simulator:
-
-- **No training code.** No RL algorithms, losses, replay, obs normalization, policy
-  networks, or config frameworks. Training repos import SkyFlow and own all of that;
-  the sim stays a small dependency rather than a framework.
-- **No differentiability claim.** The design avoids the usual blockers (pure functions,
-  no host state on the motors path) and a differentiable variant is on the roadmap, but
-  `differentiable=True` raises `NotImplementedError("planned")` today rather than
-  promising gradients that haven't been verified.
+World frame right-handed z-up; body FLU; quaternions wxyz scalar-first Hamilton body→world;
+ SI units, rotor speeds in rad/s. Every array the env creates is float32 with the fleet axis
+`[F, ...]` leading. NED/FRD used only inside `vision/` internals and for firmware sensor.
 
 ## Development
 
@@ -132,9 +97,6 @@ uv run ruff check .
 uv run python examples/fly_hover.py
 uv run python examples/fly_figure_eight.py --save-masks 6
 ```
-
-[DESIGN.md](DESIGN.md) is the contract of record: interfaces change there first, then
-in code.
 
 ## Credits
 
@@ -149,8 +111,6 @@ SkyFlow stands on work that came before it:
   ports its pass/centering machinery.
 - Physics and coefficient provenance is tracked per term in the SkyFlow-Dynamics
   registry, source by source.
-
-Any errors in the adaptation are ours, not theirs.
 
 ## License
 
