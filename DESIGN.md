@@ -54,10 +54,10 @@ examples/
 tests/                  # pytest; §11 lists the required suites
 ```
 
-Dependencies: `jax>=0.5`, `numpy>=1.26`, `skyflow-dynamics[jax]` (uv source: editable path
+Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: editable path
 `../SkyFlow-Dynamics` until published, then git). Extras: `cuda` → `jax[cuda13]`;
-`firmware` → `cudaflight` (path source; treat as open source). Dev group: `pytest>=8`,
-`ruff>=0.6`. License MIT. Version 0.2.0.
+`firmware` → `cudaflight` (path source; treat as open source). Dev group: `pytest>=9`,
+`ruff>=0.16`. License MIT. Version 0.2.0.
 
 ## 3. Conventions (one frame inside)
 

@@ -1,7 +1,7 @@
 [project]
 name = "skyflow"
 version = "0.2.0"
-description = "Fleet-batched quadrotor simulator in pure JAX. Physics is generated from the SkyFlow-Dynamics symbolic spec; SkyFlow is the harness: stepping, disturbances, randomization, sensors, vision, tasks."
+description = "An accurate and fast quadrotor simulator in JAX, fully compiled for pure GPU training."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
@@ -16,19 +16,19 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "jax>=0.5",
-    "numpy>=1.26",
+    "jax>=0.11",
+    "numpy>=2",
     "skyflow-dynamics[jax]",
 ]
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.5"]
+cuda = ["jax[cuda13]>=0.11"]
 # Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. The CPU SITL backend
 # needs cudaflight >= 0.2.1 (libcpuflight + aux API).
 firmware = ["cudaflight>=0.2.1"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=9", "ruff>=0.16"]
 
 [tool.uv.sources]
 # Local sibling checkout until published; switch to a git URL on release.

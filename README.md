@@ -2,7 +2,7 @@
 
 An accurate and fast quadrotor simulator in JAX. Fully compiled for a pure GPU environment training simulation.
 
-The physics dynamics is generated from the seperate repo here:
+The physics dynamics is generated from the separate repo here:
 [SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics).
 This maintains the symbolic spec, where each term is verified against published sources and per backend.
 SkyFlow is the harness around that plant and inherits from it.
