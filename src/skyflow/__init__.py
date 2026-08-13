@@ -1,28 +1,44 @@
-"""SkyFlow — a differentiable, fleet-batched quadrotor simulator in pure JAX.
+"""
+SkyFlow — fleet-batched quadrotor simulator in pure JAX.
 
-The whole rollout (physics, sensors, camera, reward) is one ``lax.scan`` on the
-accelerator: thousands of drones step together, nothing leaves the device, and the
-step is differentiable end-to-end.
-
-Layout:
-
-* :mod:`plant` / :mod:`params` — the analytic quadrotor model and its per-airframe
-  coefficients. Pure functions over arrays; no env, no state, trivially testable.
-* :mod:`env` — the *platform*: the plant, domain randomization, disturbances,
-  transport latency, the fused rollout, the generic crash set and the in-jit
-  auto-reset.
-* :mod:`tasks` — the *objective*: spawn, observation, reward, task terminals.
-  ``hover`` ships; register your own with :func:`skyflow.tasks.register_task`.
-* :mod:`render` — analytic gate-mask rendering and mask-noise randomization.
-
-``env`` is not re-exported here. Importing it constructs nothing, but keeping it an
-explicit ``from skyflow.env import SkyFlowEnv`` keeps :mod:`plant`/:mod:`params`
-importable in isolation for unit tests and offline analysis.
-
-    from skyflow.env import SkyFlowEnv
-    env = SkyFlowEnv(num_envs=4096, task="hover", control="motors")
-
-MIT licensed. See README.md for credits and scope.
+Physics is generated from the SkyFlow-Dynamics symbolic spec; SkyFlow is the harness:
+stepping, disturbances, randomization, sensors, vision, tasks (DESIGN.md §1). The public
+surface is the platform (`SkyFlowEnv` + `SimConfig`), the two registries (`register_task`,
+`register_airframe`), and the shared types consuming repos implement against (DESIGN.md §2).
 """
 
-__version__ = "0.1.0"
+from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.params import Airframe, register_airframe
+from skyflow.tasks import build_task, register_task
+from skyflow.types import (
+    Array,
+    FirmwareFleet,
+    ObsSpec,
+    ObsTerm,
+    PlantState,
+    SimState,
+    StepInfo,
+    Task,
+    TaskEval,
+)
+
+__version__ = "0.2.0"
+
+__all__ = [
+    "Airframe",
+    "Array",
+    "FirmwareFleet",
+    "ObsSpec",
+    "ObsTerm",
+    "PlantState",
+    "SimConfig",
+    "SimState",
+    "SkyFlowEnv",
+    "StepInfo",
+    "Task",
+    "TaskEval",
+    "__version__",
+    "build_task",
+    "register_airframe",
+    "register_task",
+]

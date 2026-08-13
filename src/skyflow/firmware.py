@@ -1,0 +1,260 @@
+"""
+Betaflight-in-the-loop seam for control="sticks" (DESIGN.md §10).
+
+SkyFlow's public frames are world z-up / body FLU, but Betaflight wants NED/FRD sensors;
+this module is one of the two places NED/FRD is allowed to exist (DESIGN.md §3). The
+boundary layout is fixed by the cudaflight wheel (v0.2.1, verified through the nav-train
+integration):
+
+    sensors [F, 7] f32 = gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)
+                         (level hover ⇒ az = −9.81)
+    sticks  [F, 4] f32 = AETR (roll, pitch, throttle, yaw) in [−1, 1]
+    motors  [F, 4] f32 in [0, 1], QUADX order;  armed [F] u8
+
+Both fleet classes implement `types.FirmwareFleet`: the firmware state is value-threaded
+as a (blob, fwstate) pair so `fw_step` composes into the env's `lax.scan` as a pure-shaped
+call. `CpuFirmwareFleet` (libcpuflight.so, ctypes) is complete and self-contained — any
+fleet size, no CUDA, jits via ordered `io_callback`, but is NOT vmappable or replayable
+because the real firmware state mutates host-side and the threaded pair is a zero-length
+placeholder. `GpuFirmwareFleet` (libcudaflight.so, in-jit XLA FFI, genuinely donated
+buffers) raises NotImplementedError until cudaflight absorbs its FFI half; its constructor
+documents the exact contract it will implement. nav-train's existing GPU fleet satisfies
+the protocol and can be injected today via `SkyFlowEnv(cfg, firmware_fleet=...)`.
+
+The two sensor helpers below are the ONLY sensor packaging DESIGN.md §10 authorizes in
+this module: a frame flip and an isothermal barometer. Anything that models physics
+(the IMU itself) comes from the generated backend through sensors.py.
+
+cudaflight imports stay inside the constructors so `import skyflow.firmware` (and motors
+mode, which never touches this module) works without the wheel installed.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import os
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental import io_callback
+
+__all__ = ["CpuFirmwareFleet", "GpuFirmwareFleet", "baro_pa", "flu_to_frd"]
+
+_INSTALL_GUIDANCE = (
+    'control="sticks" needs the cudaflight wheel (Betaflight SITL fleets). Install the '
+    "firmware extra — `uv sync --extra firmware` / `pip install skyflow[firmware]` — or "
+    "add the cudaflight wheel to the environment directly."
+)
+
+# Isothermal barometer constants, matching the verified nav-train sensor packaging:
+# P = 101325 Pa at sea level, scale height 8434 m.
+_SEA_LEVEL_PA = 101325.0
+_BARO_SCALE_M = 8434.0
+
+
+def flu_to_frd(v: jax.Array) -> jax.Array:
+    """
+    Flip [..., 3] vectors between FLU and FRD (equally z-up world and NED): (x, −y, −z).
+
+    Harness-side sensor PACKAGING for the firmware boundary, not spec physics — the frames
+    share the x axis and negate the other two, so the map is elementwise, dtype-preserving,
+    and its own inverse. Used to hand body-FLU gyro/specific-force rows from the generated
+    IMU to Betaflight as FRD (DESIGN.md §10 authorizes exactly this flip here).
+    """
+    v = jnp.asarray(v)
+    return v * jnp.array([1.0, -1.0, -1.0], dtype=v.dtype)
+
+
+def baro_pa(alt_m: jax.Array) -> jax.Array:
+    """
+    Barometric pressure Pa from z-up altitude m: 101325·exp(−alt/8434).
+
+    Harness-side sensor MODEL for the firmware boundary, not spec physics — an isothermal
+    atmosphere (the verified nav-train packaging), good to ~0.1% over indoor flight
+    envelopes; Betaflight only differentiates it for altitude hold. Sea level ⇒ 101325 Pa.
+    DESIGN.md §10 authorizes exactly this barometer here; a physical atmosphere model
+    would go through the SkyFlow-Dynamics INTAKE protocol instead.
+    """
+    alt_m = jnp.asarray(alt_m)
+    return _SEA_LEVEL_PA * jnp.exp(-alt_m / _BARO_SCALE_M)
+
+
+class CpuFirmwareFleet:
+    """
+    Betaflight CPU SITL fleet (libcpuflight.so) — the self-contained sticks backend.
+
+    Instances step sequentially in-process through ctypes, so any fleet size works (the
+    GPU fleet refuses n < 3) and no CUDA is needed; at small interactive sizes this
+    outruns a GPU dispatch. Every `fw_step`/`reset` crosses to the host through
+    `io_callback(ordered=True)`, so the env's `lax.scan` jits unchanged — but the REAL
+    firmware state lives in the ctypes handle and mutates in place. The threaded
+    (blob, fwstate) pair is a zero-length uint8 placeholder carried only for
+    `types.FirmwareFleet` parity: this fleet is NOT vmappable and NOT replayable
+    (re-running a traced step re-mutates the one real fleet).
+
+    Construction boots `fleet` firmware instances, lets them settle `settle_ms` virtual
+    milliseconds, arms, and snapshots — `fresh_firmware_state()` and `reset()` restore
+    that armed-on-ground snapshot. `eeprom` is a boot-ready Betaflight config image from
+    the cudaflight `--cli-dump` converter (None boots stock defaults); `lib` overrides
+    the wheel's packaged libcpuflight.so path.
+    """
+
+    def __init__(
+        self,
+        fleet: int,
+        *,
+        settle_ms: int = 0,
+        eeprom: str | os.PathLike[str] | None = None,
+        lib: str | os.PathLike[str] | None = None,
+    ) -> None:
+        try:
+            from cudaflight.lib import load_cpu
+        except ImportError as e:
+            raise ImportError(_INSTALL_GUIDANCE) from e
+
+        self.fleet = int(fleet)
+        self._lib = load_cpu(lib)
+        eeprom_arg = str(eeprom).encode() if eeprom else None
+        self._h = self._lib.cpuflight_create_eeprom(self.fleet, settle_ms, eeprom_arg)
+        if not self._h:
+            raise RuntimeError(f"cpuflight_create failed: {self._lib.cpuflight_error().decode()}")
+        self.act_dim = int(self._lib.cpuflight_act_dim(self._h))
+
+    # -- host sides of the ordered io_callbacks --------------------------------------
+
+    def _host_step(self, sticks: np.ndarray, sensors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """One 1 kHz tick for the whole fleet through ctypes → (motors [F,4], armed [F])."""
+        sticks = np.ascontiguousarray(sticks, np.float32)
+        sensors = np.ascontiguousarray(sensors, np.float32)
+        motors = np.empty((self.fleet, 4), np.float32)
+        armed = np.empty((self.fleet,), np.uint8)
+        rc = self._lib.cpuflight_fw_step(
+            self._h,
+            sticks.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            sensors.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            motors.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+            armed.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8)),
+            1,
+        )
+        if rc != 0:  # 0 on success — fail loudly rather than fly on stale output buffers
+            raise RuntimeError(
+                f"cpuflight_fw_step failed ({rc}): {self._lib.cpuflight_error().decode()}"
+            )
+        return motors, armed
+
+    def _host_reset(self, mask: np.ndarray) -> np.ndarray:
+        """Restore the flagged instances (uint8 [F]) to the armed snapshot."""
+        mask = np.ascontiguousarray(mask, np.uint8)
+        rc = self._lib.cpuflight_reset_mask(
+            self._h, mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        )
+        if rc != 0:
+            raise RuntimeError(
+                f"cpuflight_reset_mask failed ({rc}): {self._lib.cpuflight_error().decode()}"
+            )
+        return np.zeros((0,), np.uint8)
+
+    def _host_reset_all(self) -> np.ndarray:
+        """Restore ALL instances to the armed snapshot."""
+        self._lib.cpuflight_reset_all(self._h)
+        return np.zeros((0,), np.uint8)
+
+    # -- types.FirmwareFleet ----------------------------------------------------------
+
+    def fresh_firmware_state(self) -> tuple[jax.Array, jax.Array]:
+        """Restore ALL instances to the armed snapshot; placeholder (blob, fwstate)."""
+        blob = io_callback(
+            self._host_reset_all, jax.ShapeDtypeStruct((0,), jnp.uint8), ordered=True
+        )
+        return blob, jnp.zeros((0,), jnp.uint8)
+
+    def fw_step(
+        self, blob: jax.Array, fwstate: jax.Array, sticks: jax.Array, sensors: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """One 1 kHz firmware tick → (blob, fwstate, motors [F,4] in [0,1], armed u8 [F])."""
+        motors, armed = io_callback(
+            self._host_step,
+            (
+                jax.ShapeDtypeStruct((self.fleet, 4), jnp.float32),
+                jax.ShapeDtypeStruct((self.fleet,), jnp.uint8),
+            ),
+            sticks,
+            sensors,
+            ordered=True,
+        )
+        return blob, fwstate, motors, armed
+
+    def reset(
+        self, blob: jax.Array, fwstate: jax.Array, mask: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """Restore the worlds selected by mask (u8 [F]) to the armed snapshot."""
+        blob = io_callback(
+            self._host_reset, jax.ShapeDtypeStruct((0,), jnp.uint8), mask, ordered=True
+        )
+        return blob, fwstate
+
+    def close(self) -> None:
+        """Destroy the SITL instances; the fleet is unusable afterwards."""
+        if getattr(self, "_h", None):
+            self._lib.cpuflight_destroy(self._h)
+            self._h = None
+
+    def __del__(self) -> None:  # best-effort teardown (interpreter-shutdown safe)
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class GpuFirmwareFleet:
+    """
+    Betaflight CUDA fleet (libcudaflight.so) — NOT YET AVAILABLE from SkyFlow.
+
+    The in-jit FFI half (XLA custom-call handlers for step/reset) currently lives in
+    nav-train; cudaflight absorbs it on open-sourcing, and this class lands then. Until
+    that release the constructor raises, and nav-train's `FirmwareFleet` — which already
+    satisfies `types.FirmwareFleet` — plugs in via `SkyFlowEnv(cfg, firmware_fleet=...)`.
+    """
+
+    def __init__(
+        self,
+        fleet: int,
+        *,
+        device_index: int = 0,
+        settle_ms: int = 0,
+        eeprom: str | os.PathLike[str] | None = None,
+        cubin: str | os.PathLike[str] | None = None,
+        lib: str | os.PathLike[str] | None = None,
+    ) -> None:
+        """
+        Raises NotImplementedError. Contract this constructor implements once cudaflight
+        ships its FFI half (the verified nav-train sequence, DESIGN.md §10):
+
+        - `XLA_PYTHON_CLIENT_PREALLOCATE=false` must be exported BEFORE importing jax,
+          or XLA's arena leaves no VRAM for the firmware instance arrays.
+        - XLA claims the primary CUDA context first: touch the target device (e.g.
+          `jnp.zeros(1, device=...)` + block_until_ready) before `cudaflight_create*`,
+          so the firmware kernels share XLA's context instead of racing it for one.
+        - Create via `cudaflight_create_eeprom_ex(cubin, fleet, device_index, settle_ms,
+          eeprom, with_grad=0)` — no differentiable-rollout scratch, ~1.5× more worlds —
+          falling back to `cudaflight_create_eeprom` on older libraries.
+        - `fleet >= 3`: the runtime relocation table cannot be discovered below 3
+          instances; smaller fleets belong to CpuFirmwareFleet.
+        - Firmware state is GENUINELY value-threaded, unlike the CPU placeholders: blob
+          [F·stride] u8 and fwstate [F·state_size] u8 ride through `jax.ffi.ffi_call`
+          with input_output_aliases (donated in place), copied at construction from the
+          armed-on-ground snapshot buffers (`cudaflight_snap_ptr`/`_snap_state_ptr`);
+          `fresh_firmware_state`/`reset` restore from that snapshot.
+        - bfSetBase runs before every step/reset launch: the handler points the global
+          instance base at wherever XLA placed the donated blob and the kernel rebases
+          on entry (a masked reset leaves a stale base; the next step's rebase fixes it).
+          This makes the fleet vmappable-in-principle only per-handle — one handle, one
+          device, `fleet` worlds.
+        """
+        raise NotImplementedError(
+            "GpuFirmwareFleet waits on cudaflight absorbing its XLA FFI half (the in-jit "
+            "step/reset custom calls now living in nav-train). Use CpuFirmwareFleet, or "
+            "inject nav-train's GPU fleet via SkyFlowEnv(cfg, firmware_fleet=...). The "
+            "constructor docstring records the exact contract this class will implement."
+        )

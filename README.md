@@ -1,117 +1,128 @@
 # SkyFlow
 
-A differentiable, fleet-batched quadrotor simulator in pure JAX — built for training
-reinforcement-learning flight policies fast enough to iterate on.
-
-The whole rollout — physics, sensors, camera, reward — is one `lax.scan` on the
-accelerator. Thousands of drones step together, nothing leaves the device, and the entire
-step is differentiable end-to-end, so the same environment serves PPO, SAC, and
-analytic-policy-gradient / BPTT methods without a second implementation.
+A fleet-batched quadrotor **simulator** in pure JAX. Physics is generated from the
+[SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics) symbolic spec;
+SkyFlow is the harness around it — stepping, domain randomization, disturbances,
+sensors, vision, tasks. SkyFlow contains zero handwritten continuous dynamics and zero
+training code (DESIGN.md is the contract of record).
 
 ```python
 import jax
-from skyflow.env import SkyFlowEnv
+import jax.numpy as jnp
+from skyflow import SimConfig, SkyFlowEnv
 
-env = SkyFlowEnv(num_envs=4096, task="hover", control="motors", control_hz=90.0)
+env = SkyFlowEnv(SimConfig(num_envs=4096, task="hover"))
 
-key = jax.random.key(0)
-obs, state = env.jax_reset(key)
+obs, state = env.reset(jax.random.PRNGKey(0))
+step = jax.jit(env.step)  # pure functions — the caller jits
 
-action = jax.numpy.zeros((env.fleet, env.act_dim))
-obs, state, reward, done, info = jax.jit(env.jax_step)(state, action)
+action = jnp.zeros((env.fleet, env.act_dim))  # [F,4] in [-1,1]
+obs, state, reward, done, info = step(state, action)
 ```
+
+Every world steps together, nothing leaves the device, and done worlds respawn in-jit:
+the pre-reset observation and flags come back through `info["final_obs"]` /
+`info["terminated"]` / `info["truncated"]`, so a training loop never sees a dead state.
 
 ## What it is
 
-**An analytic plant, not a game engine.** The dynamics are a 46-coefficient rigid-body
-quadrotor model — thrust curve with motor lag, body drag, axial inflow, per-motor
-roll/pitch/yaw torque, rate damping, gyroscopic coupling — integrated with RK4 at 1 kHz
-under a policy stepping at 90 Hz. There is no renderer in the loop and no physics engine
-to marshal state in and out of, which is what makes the whole thing traceable by JAX.
+**A platform plus tasks.** The env owns the plant scan (RK4 physics at 1 kHz under a
+100 Hz control loop by default), per-world parameter randomization, OU wind, random
+pokes, command transport delay, the ground-contact heuristic, the generic crash set,
+and in-jit auto-reset. A **task** owns the objective: spawn distribution, observation,
+reward, task-specific terminals. One platform, many tasks.
 
-**Coefficients that came from a real drone.** The bundled `air75_ii_racer` airframe is a
-BETAFPV Air75 II Racer with every coefficient system-identified from Vicon motion-capture
-flight, not guessed from a datasheet. `PlantParams` has no field defaults on purpose: an
-airframe states all of its numbers or it does not exist, so nothing silently inherits
-another drone's physics.
+**Generated physics.** Every force, torque, and sensor equation lives in the
+SkyFlow-Dynamics symbolic spec — verified against published sources and golden-tested
+per backend. If a physics term is missing it is added there and consumed here, never
+implemented here. The built-in airframe is the spec's system-identified Crazyflie;
+`register_airframe` adds vehicles from spec parameter rows.
 
-**Differentiable.** `differentiable=True` (with `control="motors"`) makes the full substep
-rollout a gradient path, for short-horizon BPTT and analytic policy gradients. Vision mode
-is *visual BPTT*: the mask is input-only for gradients — the coverage render is piecewise
-constant in pose and explicitly stop-gradiented — so credit flows through the dynamics and
-the proprioceptive tail while the CNN still trains through the policy pathway.
+**Vision without a rasterizer.** `gate_course` in vision mode renders analytic ray-cast
+coverage masks of the gate frames directly from pose, batched over the fleet, inside
+jit — a segmentation mask, not RGB, which is what a perception front-end hands a policy
+at deploy time. Persistent mask-corruption families ship in `skyflow.vision.mask_noise`.
 
-**Vision without a rasterizer.** Gates are rendered analytically to a coverage mask
-directly from pose, batched over the fleet, with a camera model, configurable rate
-(a 30 Hz camera under a 90 Hz control loop), and persistent mask-noise domain
-randomization. It is a segmentation mask, not RGB — which is exactly the input a
-perception front-end hands a policy at deploy time.
-
-**Built to transfer, not just to score.** Domain randomization over every plant
-coefficient, sample-and-hold sensor staleness, transport latency, OU wind, and spawn
-jitter are all first-class knobs rather than afterthoughts.
+**Firmware in the loop.** `control="sticks"` closes the loop through real Betaflight
+firmware (the `cudaflight` SITL, `firmware` extra): AETR sticks in, per-motor duties
+out, ticked at 1 kHz inside the substep scan. `control="motors"` is pure JAX and never
+touches that seam. Consuming repos with their own GPU firmware fleet inject it via
+`SkyFlowEnv(cfg, firmware_fleet=...)`.
 
 ## Install
 
 ```bash
-pip install -e .            # CPU
-pip install -e '.[cuda]'    # CUDA 13 wheels for JAX
+uv sync                     # CPU
+uv sync --extra cuda        # CUDA 13 wheels for JAX
+uv sync --extra firmware    # + cudaflight for control="sticks"
 ```
 
-Requires Python 3.12+. The only runtime dependencies are `jax` and `numpy`.
+Requires Python 3.12+. Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[jax]`.
 
 ## Tasks
 
-The environment is the *platform* — plant, randomization, disturbances, latency, the
-rollout scan, the generic crash set, and the in-jit auto-reset. A **task** is the
-*objective*: spawn distribution, observation, reward, and task-specific terminals. One
-platform, many tasks.
-
-`hover` ships with the package. Add your own against the `Task` protocol in
-`skyflow.tasks.base` and register it:
+`hover` and `gate_course` (with a figure-eight course builder) ship as reference tasks.
+Research tasks live in the consuming repo: implement the `Task` protocol from
+`skyflow.types` and register a builder —
 
 ```python
-from skyflow.tasks import register_task
-register_task("my_task", MyTask)
+from skyflow import SimConfig, SkyFlowEnv, register_task
 
-env = SkyFlowEnv(num_envs=1024, task="my_task", control="motors")
+register_task("my_task", MyTask)
+env = SkyFlowEnv(SimConfig(num_envs=1024, task="my_task", task_kwargs={...}))
 ```
 
 The env only ever reaches a task through the protocol, so a registered task is a
-first-class citizen — nothing special-cases the built-in. Registering an existing name
-replaces it, which is how you override `hover` without forking.
+first-class citizen — nothing special-cases the built-ins. Names are refused on
+collision (variants register under their own names). `task_kwargs` passes to the
+builder unmodified; the env-owned `spawn_dr_scale` and `control_hz` are forwarded to
+builders that name them.
 
-Course geometry for gate-based tasks lives in `skyflow.render.courses`: `from_waypoints`
-takes `[north, east, alt, yaw_deg]` rows so a course is config data, and `line`/`circle`
-generate the standard shapes.
+Course geometry for gate tasks lives in `skyflow.vision.gates`: `from_waypoints` takes
+z-up world rows so a course is config data, and `line`/`circle`/`figure_eight` generate
+the standard shapes.
+
+## Conventions
+
+World frame right-handed z-up; body FLU; quaternions wxyz scalar-first Hamilton
+body→world; SI units, rotor speeds in rad/s — identical to SkyFlow-Dynamics, states
+pass through untranslated. Every array the env creates is float32 with the fleet axis
+`[F, ...]` leading. NED/FRD survives only inside `vision/` internals and at the
+firmware sensor boundary.
 
 ## Scope
 
-Two things are deliberately **not** in this distribution:
+Deliberately **not** here:
 
-- **Betaflight-in-the-loop control.** `control="motors"` (direct per-motor thrust) is pure
-  JAX and is what ships. The stick and rate control modes close the loop through real
-  Betaflight firmware compiled to an XLA custom call, which needs a prebuilt `cudaflight`
-  wheel distributed separately. Requesting those modes raises with an explanation.
-- **Research tasks.** Gate-racing objectives with filter-in-the-loop observations,
-  state-estimator overlays, and competition-specific course formats live downstream in the
-  projects that use them. The `Task` protocol is the seam.
+- **Training code.** No RL algorithms, losses, replay, obs normalization, policy
+  networks, or config frameworks. Training repos import SkyFlow and own all of that.
+- **A differentiability claim.** The design avoids blockers (pure functions, no host
+  state on the motors path) and the roadmap includes a differentiable variant, but
+  `differentiable=True` raises `NotImplementedError("planned")` today rather than
+  promising gradients that haven't been verified.
+
+## Development
+
+```bash
+uv run pytest -q         # full suite, CPU, deterministic keys
+uv run ruff check .
+uv run python examples/fly_hover.py
+uv run python examples/fly_figure_eight.py --save-masks 6
+```
 
 ## Credits
 
 SkyFlow stands on work that came before it:
 
 - **[crazyflow](https://github.com/utiasDSL/crazyflow)** — the JAX-first, fleet-batched
-  quadrotor-RL environment design. The NED conventions, the sensor-synthesis seam, and the
-  general shape of a firmware-in-the-loop JAX rollout follow its lead.
-- **[RotorPy](https://github.com/spencerfolk/rotorpy)** — a reference for aerodynamic
-  modelling beyond simple thrust-and-torque: the drag, inflow and wake terms that make a
-  quadrotor model hold up at speed rather than only near hover.
-- **SkyDreamer** — the analytic quadrotor model this plant implements, from
-  *"SkyDreamer: Interpretable End-to-End Vision-Based Drone Racing with Model-Based
-  Reinforcement Learning"* (Diermayr et al., 2025, [arXiv:2510.14783](https://arxiv.org/abs/2510.14783)).
-  The plant structure and its Table II reference coefficients are the published starting
-  point that the bundled airframe re-fits against real flight.
+  quadrotor-RL environment design. The sensor-synthesis seam and the general shape of a
+  firmware-in-the-loop JAX rollout follow its lead.
+- **SkyDreamer** — *"SkyDreamer: Interpretable End-to-End Vision-Based Drone Racing
+  with Model-Based Reinforcement Learning"* (Diermayr et al., 2025,
+  [arXiv:2510.14783](https://arxiv.org/abs/2510.14783)) — the gate-course reward shape
+  ports its pass/centering machinery.
+- Physics and coefficient provenance is tracked per term in the SkyFlow-Dynamics
+  registry, source by source.
 
 Any errors in the adaptation are ours, not theirs.
 

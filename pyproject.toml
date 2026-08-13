@@ -1,12 +1,12 @@
 [project]
 name = "skyflow"
-version = "0.1.0"
-description = "A differentiable, fleet-batched JAX quadrotor simulator for reinforcement learning"
+version = "0.2.0"
+description = "Fleet-batched quadrotor simulator in pure JAX. Physics is generated from the SkyFlow-Dynamics symbolic spec; SkyFlow is the harness: stepping, disturbances, randomization, sensors, vision, tasks."
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.12"
 authors = [{ name = "Synetic Labs" }]
-keywords = ["jax", "quadrotor", "drone", "simulation", "reinforcement-learning", "differentiable"]
+keywords = ["jax", "quadrotor", "drone", "simulation", "reinforcement-learning"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -16,13 +16,26 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "jax>=0.4.35",
+    "jax>=0.5",
     "numpy>=1.26",
+    "skyflow-dynamics[jax]",
 ]
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.4.35"]
+cuda = ["jax[cuda13]>=0.5"]
+# Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. The CPU SITL backend
+# needs cudaflight >= 0.2.1 (libcpuflight + aux API).
+firmware = ["cudaflight>=0.2.1"]
+
+[dependency-groups]
 dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.uv.sources]
+# Local sibling checkout until published; switch to a git URL on release.
+skyflow-dynamics = { path = "../SkyFlow-Dynamics", editable = true }
+# Release wheel (binaries are generated artifacts — cudaflight is not pip-installable from
+# source). Local vendored copy until the public GitHub release URL replaces it.
+cudaflight = { path = "../nav-train/.vendor/cudaflight-0.2.1-py3-none-linux_x86_64.whl" }
 
 [project.urls]
 Homepage = "https://github.com/Synetic-Labs/SkyFlow"

@@ -1,0 +1,334 @@
+"""
+Gate-course task — ordered racing through a GateSet course (DESIGN.md §9).
+
+The course is a `skyflow.vision.gates.GateSet` (default: the shipped figure-eight
+lemniscate builder). Each world chases one ACTIVE gate at a time: reward is distance
+progress toward the active gate's pre-gate point, plus a centering-weighted pass credit
+when `classify_crossings` reports a clean forward transit, minus a body-rate penalty.
+Touching any gate's frame solid (frame hit) or carrying the active gate's forward plane
+crossing outside its opening (miss — wide fly-arounds included) is a task crash; passing
+the last gate is success and terminates the episode.
+
+Ported, simplified, from nav-train's gate task (nav/envs/functional/crazyflow/tasks/gate/
+env.py) and its SkyDreamer reward port (nav/envs/functional/skyflow/reward.py, Diermayr
+et al. 2025, arXiv 2510.14783). The centering measure is SkyDreamer's Chebyshev miss at
+the centre-plane crossing point — here normalized per axis so rectangular openings score
+the same as square ones — giving centering ∈ (0, 1] on every clean pass. The depth
+ratchet, back-half cash-out, and slow-speed gain of the full SkyDreamer shape are
+training-repo refinements and stay out of the shipped reward (DESIGN.md §9).
+
+Frames: world z-up, body FLU, quaternion wxyz Hamilton body→world (DESIGN.md §3). The
+vision modules convert to their internal NED at their own public boundaries, so every
+array crossing this module is z-up FLU.
+
+Observations (state mode, gate blocks and velocity in body FLU): [gate_rel(3),
+gate_normal(3), next_gate_rel(3), vel_body(3), rot_matrix(9), last_action(4)] = 25.
+Vision mode replaces the three gate blocks with the rendered coverage mask [H, W, 1]
+(flattened, leading the obs vector) and keeps the same proprio tail. All outputs are
+float32 with the fleet axis leading.
+"""
+
+from typing import TYPE_CHECKING, NamedTuple
+
+import jax
+import jax.numpy as jnp
+
+from skyflow.tasks.base import finalize_obs, quat_to_rot
+from skyflow.types import Array, ObsSpec, ObsTerm, TaskEval
+from skyflow.vision.gates import GateSet, classify_crossings, figure_eight
+
+if TYPE_CHECKING:
+    from skyflow.vision.camera import CameraModel
+
+__all__ = ["GateCourseTask", "GateTaskState"]
+
+_UP = (0.0, 0.0, 1.0)  # world z-up; altitude jitter uses this, not a gate's tilted vertical
+
+
+class GateTaskState(NamedTuple):
+    """Per-world course progress (a pytree carried through SimState.task_state)."""
+
+    active_gate: Array  # [F] int32 — index of the gate to pass next (clips at the last)
+    passes: Array  # [F] int32 — clean active-gate passes this episode (metric)
+
+
+def _world_to_body(rot: Array, vec: Array) -> Array:
+    """Rotate world rows [F,3] into body FLU with R(q)ᵀ: (Rᵀ v)_b = Σ_a R_ab v_a."""
+    return jnp.einsum("fab,fa->fb", rot, vec)
+
+
+class GateCourseTask:
+    """Ordered gate racing over a shared course, state or vision observations.
+
+    One `GateSet` serves the whole fleet (worlds are physically independent and the
+    reward is gate-relative, so shared absolute placement costs nothing — and lets the
+    analytic renderer serve every world in vision mode). Both obs variants share this
+    class behind the `vision` flag; `image_shape` is (H, W, 1) in vision mode, else None.
+    Reward constants live in the constructor with the shipped defaults (DESIGN.md §9);
+    no reward code exists anywhere else.
+    """
+
+    success_terminates = True
+
+    def __init__(
+        self,
+        gates: GateSet | None = None,
+        *,
+        vision: bool = False,
+        camera: "CameraModel | None" = None,
+        body_radius_m: float = 0.0,
+        w_prog: float = 1.0,
+        w_gate: float = 10.0,
+        w_rate: float = 0.01,
+        pre_gate_offset_m: float = 0.5,
+        spawn_mode: str = "podium",
+        spawn_dist_m: float = 1.5,
+        podium_height_m: float = 0.3,
+        spawn_lateral_m: float = 0.4,
+        spawn_alt_jitter_m: float = 0.3,
+        spawn_yaw_jitter_rad: float = 0.3,
+    ):
+        """
+        Args:
+          gates: course geometry. None builds the shipped default figure-eight
+            (`figure_eight(3)`: six gates, 2.5 m lobes, 1.5 m altitude).
+          vision: observe the rendered gate mask instead of privileged gate geometry.
+          camera: vision-mode CameraModel; None takes the renderer's nominal camera.
+          body_radius_m: drone-as-sphere radius for `classify_crossings` — a pass needs
+            this much clearance from every bar, grazing within it is a frame hit.
+          w_prog: reward per metre of progress toward the active pre-gate point.
+          w_gate: pass credit scale; a pass pays w_gate·centering, centering ∈ (0, 1].
+          w_rate: penalty per rad/s of body-rate magnitude, each control step.
+          pre_gate_offset_m: pre-gate point distance in front of the plane (−normal
+            side). Progress pulls to the approach side only; the pass credit, not the
+            progress term, pays for committing through the opening.
+          spawn_mode: "podium" — every world starts behind gate 0 at podium height;
+            "spread" — each world starts behind a uniformly drawn gate at its altitude
+            (curriculum knob: seeds every course segment from step one).
+          spawn_dist_m / podium_height_m / spawn_lateral_m / spawn_alt_jitter_m /
+          spawn_yaw_jitter_rad: spawn geometry (metres, radians).
+        """
+        if spawn_mode not in ("podium", "spread"):
+            raise ValueError(f"spawn_mode must be 'podium' or 'spread', got {spawn_mode!r}")
+        self.gates = gates if gates is not None else figure_eight(3)
+        self.num_gates = len(self.gates)
+        self.body_radius_m = float(body_radius_m)
+        min_inner = float(jnp.min(self.gates.inner_half))
+        if self.body_radius_m >= min_inner:
+            raise ValueError(
+                f"body_radius_m={self.body_radius_m} closes a "
+                f"{2 * min_inner:.3f} m opening entirely"
+            )
+        self.w_prog = float(w_prog)
+        self.w_gate = float(w_gate)
+        self.w_rate = float(w_rate)
+        self.pre_gate_offset_m = float(pre_gate_offset_m)
+        self.spawn_mode = spawn_mode
+        self.spawn_dist_m = float(spawn_dist_m)
+        self.podium_height_m = float(podium_height_m)
+        self.spawn_lateral_m = float(spawn_lateral_m)
+        self.spawn_alt_jitter_m = float(spawn_alt_jitter_m)
+        self.spawn_yaw_jitter_rad = float(spawn_yaw_jitter_rad)
+
+        # Course geometry as fixed world-frame constants, read through the GateSet's
+        # public z-up properties (the raw fields are the renderer's internal NED —
+        # DESIGN.md §3a). They ride inside jitted programs as baked-in values, indexed
+        # per world by the active gate. Lateral/vertical signs are internal-convention;
+        # the centering measure only takes magnitudes along them.
+        self._centers = self.gates.centers_world  # [G, 3]
+        self._normals = self.gates.normals_world  # [G, 3] unit, facing flight direction
+        self._laterals = self.gates.laterals_world  # [G, 3] unit, in-plane horizontal
+        self._verticals = self.gates.verticals_world  # [G, 3] unit, in-plane vertical
+        self._inner = self.gates.inner_half  # [G, 2] (lateral, vertical) half-extents
+
+        self.vision = bool(vision)
+        tail = (ObsTerm("vel_body", 3), ObsTerm("rot_matrix", 9), ObsTerm("last_action", 4))
+        if self.vision:
+            # Imported here, not at module top: the state-only variant has no reason to
+            # pull the ray-cast machinery in, and stays usable without it.
+            from skyflow.vision.camera import CameraModel
+            from skyflow.vision.renderer import render_masks
+
+            self._camera = camera if camera is not None else CameraModel()
+            self._render_masks = render_masks
+            h, w = int(self._camera.height), int(self._camera.width)
+            self.image_shape: tuple[int, int, int] | None = (h, w, 1)
+            self.obs_spec = ObsSpec((ObsTerm("mask", h * w), *tail))
+        else:
+            self._camera = None
+            self.image_shape = None
+            self.obs_spec = ObsSpec(
+                (
+                    ObsTerm("gate_rel", 3),
+                    ObsTerm("gate_normal", 3),
+                    ObsTerm("next_gate_rel", 3),
+                    *tail,
+                )
+            )
+
+    # -- Task protocol -------------------------------------------------------------
+
+    def spawn(self, key: Array, n: int, params: Array) -> tuple[Array, GateTaskState]:
+        """Fresh plant rows [n,17] f32 on the approach (−normal) side of the start gate.
+
+        Podium mode places every world behind gate 0 at podium height with lateral and
+        yaw jitter, facing the gate; spread mode draws the start gate uniformly and
+        spawns near its altitude (active_gate starts there). Velocity and body rates are
+        zero and rotors are at rest — the env's post-step clip lifts them to the
+        airframe's idle floor on the first substep. `params` is unused: the spawn is
+        course-relative geometry, no equilibrium solve is needed.
+        """
+        del params
+        k_gate, k_lat, k_alt, k_yaw = jax.random.split(key, 4)
+        if self.spawn_mode == "spread":
+            active = jax.random.randint(k_gate, (n,), 0, self.num_gates, dtype=jnp.int32)
+        else:
+            active = jnp.zeros((n,), jnp.int32)
+        center = self._centers[active]
+        normal = self._normals[active]
+        lateral = self._laterals[active]
+
+        lat_off = jax.random.uniform(k_lat, (n, 1), jnp.float32, -1.0, 1.0)
+        pos = center - self.spawn_dist_m * normal + self.spawn_lateral_m * lat_off * lateral
+        if self.spawn_mode == "podium":
+            pos = pos.at[:, 2].set(self.podium_height_m)
+        else:
+            alt_off = jax.random.uniform(k_alt, (n, 1), jnp.float32, -1.0, 1.0)
+            pos = pos + self.spawn_alt_jitter_m * alt_off * jnp.asarray(_UP, jnp.float32)
+            pos = pos.at[:, 2].set(jnp.maximum(pos[:, 2], 0.05))  # never below the ground
+
+        # Face the gate: heading = bearing of the through-normal, plus yaw jitter, level.
+        yaw_off = jax.random.uniform(k_yaw, (n,), jnp.float32, -1.0, 1.0)
+        half = 0.5 * (jnp.arctan2(normal[:, 1], normal[:, 0]) + self.spawn_yaw_jitter_rad * yaw_off)
+        zeros = jnp.zeros_like(half)
+        quat = jnp.stack([jnp.cos(half), zeros, zeros, jnp.sin(half)], axis=-1)
+
+        plant = jnp.concatenate(
+            [pos, jnp.zeros((n, 3)), quat, jnp.zeros((n, 3)), jnp.zeros((n, 4))], axis=-1
+        ).astype(jnp.float32)
+        return plant, GateTaskState(active_gate=active, passes=jnp.zeros((n,), jnp.int32))
+
+    def observe(
+        self,
+        plant: Array,
+        task_state: GateTaskState,
+        imu: tuple[Array, Array],
+        last_action: Array,
+        key: Array,
+        fresh_spawn: bool,
+    ) -> tuple[Array, GateTaskState]:
+        """Obs rows [n, obs_spec.dim] f32; task_state passes through unchanged.
+
+        `imu`, `key` and `fresh_spawn` are unused: this task observes exact state (the
+        IMU packaging stays in sensors.py), and the persistent mask-corruption families
+        for vision obs are deferred work (DESIGN.md §12). rot_matrix flattens row-major
+        (tasks.base.quat_to_rot) — the same nine numbers, in the same order, nav-train's
+        `_orientation` feeds its policies.
+        """
+        del imu, key, fresh_spawn
+        pos = plant[:, 0:3]
+        vel = plant[:, 3:6]
+        quat = plant[:, 6:10]
+        rot = quat_to_rot(quat)
+        vel_body = _world_to_body(rot, vel)
+        rot_flat = rot.reshape(pos.shape[0], 9)
+
+        if self.vision:
+            mask = self._render_masks(self._camera, self.gates, pos, quat)
+            head = [mask.reshape(pos.shape[0], -1)]
+        else:
+            active = task_state.active_gate
+            nxt = jnp.minimum(active + 1, self.num_gates - 1)
+            head = [
+                _world_to_body(rot, self._centers[active] - pos),
+                _world_to_body(rot, jnp.broadcast_to(self._normals[active], pos.shape)),
+                _world_to_body(rot, self._centers[nxt] - pos),
+            ]
+        obs = jnp.concatenate([*head, vel_body, rot_flat, last_action], axis=-1)
+        return finalize_obs(obs), task_state
+
+    def evaluate(
+        self, prev_plant: Array, plant: Array, task_state: GateTaskState
+    ) -> TaskEval:
+        """Reward/success/crash on the transition prev_plant → plant (DESIGN.md §9).
+
+        reward = w_prog·(d_prev − d) toward the active pre-gate point
+               + w_gate·centering on a clean forward pass of the active gate
+               − w_rate·‖ω‖.
+        Crash: the segment touched ANY gate's frame solid (frame hit, from
+        `classify_crossings`), or crossed the active gate's centre plane forward
+        without a clean pass (miss — the nav-train event, which also catches wide
+        fly-arounds beyond the outer edge; pass and miss partition every forward
+        transit). Success: clean pass of the last gate. On a pass the active gate
+        advances (clipping at the last); progress this step is measured against the
+        pre-advance gate for both endpoints, so the term stays telescoping.
+        """
+        pos_prev = prev_plant[:, 0:3]
+        pos = plant[:, 0:3]
+        omega = plant[:, 10:13]
+        active = task_state.active_gate
+        fleet = pos.shape[0]
+
+        center = self._centers[active]
+        normal = self._normals[active]
+
+        pre_point = center - self.pre_gate_offset_m * normal
+        d_prev = jnp.linalg.norm(pre_point - pos_prev, axis=-1)
+        d = jnp.linalg.norm(pre_point - pos, axis=-1)
+        reward = self.w_prog * (d_prev - d)
+
+        fwd, _bwd, hit = classify_crossings(pos_prev, pos, self.gates, self.body_radius_m)
+        passed = fwd[jnp.arange(fleet), active]
+
+        # Centering at the centre-plane crossing point: SkyDreamer's Chebyshev miss,
+        # normalized per axis (rectangular openings score like square ones). On a pass
+        # the crossing point is strictly inside the opening (classify_crossings), so
+        # centering ∈ (0, 1]; elsewhere it is zeroed and pays nothing.
+        oo = pos_prev - center
+        seg = pos - pos_prev
+        prev_sd = jnp.sum(oo * normal, axis=-1)
+        sd = prev_sd + jnp.sum(seg * normal, axis=-1)
+        denom = prev_sd - sd
+        alpha = prev_sd / jnp.where(jnp.abs(denom) < 1e-9, 1e-9, denom)
+        cp = oo + alpha[:, None] * seg
+        lat = jnp.abs(jnp.sum(cp * self._laterals[active], axis=-1)) / self._inner[active, 0]
+        vert = jnp.abs(jnp.sum(cp * self._verticals[active], axis=-1)) / self._inner[active, 1]
+        centering = jnp.where(passed, 1.0 - jnp.maximum(lat, vert), 0.0)
+        reward = reward + self.w_gate * centering
+
+        # Miss: forward crossing of the active centre plane that is not a clean pass —
+        # the same crossing predicate classify_crossings applies, so pass and miss
+        # partition every forward transit. Catches wide fly-arounds beyond the outer
+        # edge, which touch no solid but end the attempt (the nav-train miss event).
+        missed = (prev_sd * sd < 0.0) & (prev_sd < 0.0) & ~passed
+        crash = jnp.any(hit, axis=-1) | missed
+
+        reward = reward - self.w_rate * jnp.linalg.norm(omega, axis=-1)
+
+        success = passed & (active == self.num_gates - 1)
+        new_active = jnp.where(
+            passed, jnp.minimum(active + 1, self.num_gates - 1), active
+        ).astype(jnp.int32)
+        new_state = GateTaskState(
+            active_gate=new_active, passes=task_state.passes + passed.astype(jnp.int32)
+        )
+        info = {
+            "gate_passed": passed.astype(jnp.float32),
+            "gate_missed": missed.astype(jnp.float32),
+            "gate_centering": centering.astype(jnp.float32),
+            "gate_active": new_active.astype(jnp.float32),
+        }
+        return TaskEval(
+            reward=reward.astype(jnp.float32),
+            success=success,
+            crash=crash,
+            info=info,
+            task_state=new_state,
+        )
+
+    def metrics(self, task_state: GateTaskState) -> dict[str, Array]:
+        """Course-progress diagnostics, all [F] float32."""
+        return {
+            "gate/active_idx": task_state.active_gate.astype(jnp.float32),
+            "gate/passes": task_state.passes.astype(jnp.float32),
+        }

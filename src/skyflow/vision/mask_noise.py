@@ -1,64 +1,61 @@
-"""Sensor noise for the analytic gate mask — make the perfect render look like
-a real mask pipeline's output.
+"""
+Sensor noise for the analytic gate mask — make the perfect render look like a real
+onboard mask pipeline's output.
 
-The reference "GateNet" is not a network: it is a classical HSV orange filter
-over the camera frame (H 0–13, S ≥ 41, V ≥ 102, 2×2 opening, cyan racing-line
-reclaim). Running that filter over real captured laps shows these artifact
-families the clean render lacks:
+The deployment front-end this models is not a network: it is a classical HSV color filter
+over the camera frame (orange threshold + small morphological opening), area-downsampled
+to the policy resolution. Real captures of such a pipeline show artifact families the
+clean render lacks:
 
-1. **Band holes** — the gate face carries dark branding (lettering, checker
-   decals, sponsor logos) that the filter excludes, punching chunks out of
-   the frame band; distant gates fragment into partial rings.
-2. **Occluders** — an indoor scene puts structure between drone and gate:
-   pillars and ceiling trusses. Modeled as two black shapes: a thin
-   band at ANY angle with a finite random length (a beam/edge crossing part of
-   the view), and a RARE thick dead-straight full-span band that is either
-   VERTICAL (a pillar up close) or HORIZONTAL (a ceiling truss / beam), chosen
-   50/50.
-3. **Glow false positives** — gate light bathing nearby surfaces reads as
-   orange: occasional large amorphous blobs.
-4. **Speckle** — faint scattered floor-glow dots (sub-pixel at 640×360, so
+1. **Band holes** — the gate face carries dark branding (lettering, checker decals,
+   sponsor logos) that the filter excludes, punching chunks out of the frame band;
+   distant gates fragment into partial rings.
+2. **Occluders** — indoor flight spaces put structure between drone and gate: pillars
+   and ceiling trusses. Modeled as two black shapes: a thin band at ANY angle with a
+   finite random length (a beam/edge crossing part of the view), and a RARE thick
+   dead-straight full-span band that is either VERTICAL (a pillar up close) or
+   HORIZONTAL (a ceiling truss / beam), chosen 50/50.
+3. **Glow false positives** — gate light bathing nearby surfaces reads as orange:
+   occasional large amorphous blobs.
+4. **Speckle** — faint scattered floor-glow dots (sub-pixel at capture resolution, so
    they downsample to faint values, never full white).
-5. **Resampling blur** — JPEG + downsample rounds small rings; the sim's
-   crisp squares occasionally get a light 3×3 blur to match.
+5. **Resampling blur** — JPEG + downsample rounds small rings; the sim's crisp squares
+   occasionally get a light 3×3 blur to match.
 
-BINARY DISCIPLINE: the real mask is binary at 640×360; the 64×64 policy view
-is its area-downsample, so intermediate values exist ONLY as sub-pixel
-averaging at edges — never as flat grey. Every artifact here erases to 0 or
-adds at 1.0, with a ~1 px anti-alias ramp at its boundary; only the speckle is
-faint (it represents sub-pixel dots).
+BINARY DISCIPLINE: the real mask is binary at capture resolution; the low-res policy view
+is its area-downsample, so intermediate values exist ONLY as sub-pixel averaging at edges
+— never as flat grey. Every artifact here erases to 0 or adds at 1.0, with a ~1 px
+anti-alias ramp at its boundary; only the speckle is faint (it represents sub-pixel dots).
 
 PERSISTENCE: a world's artifacts are a pure function of its per-family keys
-(:data:`NOISE_FAMILIES` of them), so *holding* a key across control steps
-freezes that artifact on screen — the way real decal holes, pillars and glow
-stay in view for many frames instead of flickering in and out per step.
-:func:`noise_state_init` / :func:`noise_state_step` carry (keys, ttl) through
-an env's task state: each (world, family) draw lives a random 1..``hold``
-frames, then is resampled. A caller that carries no noise state draws
-:func:`fresh_noise_keys` every frame instead — same distribution, artifacts
-redraw i.i.d. per frame.
+(:data:`NOISE_FAMILIES` of them), so *holding* a key across control steps freezes that
+artifact on screen — the way real decal holes, pillars and glow stay in view for many
+frames instead of flickering in and out per step. :func:`noise_state_init` /
+:func:`noise_state_step` carry (keys, ttl) through an env's task state: each
+(world, family) draw lives a random 1..``hold`` frames, then is resampled. A caller that
+carries no noise state draws :func:`fresh_noise_keys` every frame instead — same
+distribution, artifacts redraw i.i.d. per frame.
 
-:func:`corrupt_mask` applies all of it to a rendered soft mask ([F, H, W] in
-[0, 1]): pure JAX, static shapes, branchless (Bernoulli gates are ``where``
-masks), so it jits and runs inside the training scan at negligible cost next
-to the ray-cast render. Outward glow widening of the band is handled
-geometrically in ``render_masks(..., outer_grow=...)``, not here — tasks that
-persist it draw the width from the extra :data:`GROW_FAMILY` key slot
-(:func:`grow_from_keys`). Tuned by eye against real captured frames run
-through the same HSV filter.
+:func:`corrupt_mask` applies all of it to a rendered soft mask ([F, H, W] in [0, 1]):
+pure JAX, static shapes, branchless (Bernoulli gates are ``where`` masks), so it jits and
+runs inside a training scan at negligible cost next to the ray-cast render. Outward glow
+widening of the band is handled geometrically in ``render_masks(..., outer_grow=...)``,
+not here — tasks that persist it draw the width from the extra :data:`GROW_FAMILY` key
+slot (:func:`grow_from_keys`). Defaults were tuned by eye against real captures of the
+reference HSV pipeline.
 
-:func:`erasure_at` answers the INVERSE question — "is this pixel under a hole
-or an occluder" — at arbitrary coordinates, without rendering. It exists so a
-consumer that never sees the mask can stay consistent with it: the training
-filter's synthetic corner detector samples it
-at each projected gate corner, so a pillar that hides a gate from the policy's
-CNN also hides it from the filter. The occluder shapes therefore have ONE
-definition each (:func:`_stick_at`, :func:`_pillar_at`, called with grid
-coordinates by the renderer and point coordinates by the sampler) and the
-erasing families' defaults are module constants, so the two cannot drift apart.
+:func:`erasure_at` answers the INVERSE question — "is this pixel under a hole or an
+occluder" — at arbitrary coordinates, without rendering. It exists so a consumer that
+never sees the mask can stay consistent with it: a state-side synthetic detector can
+sample it at each projected gate corner, so a pillar that hides a gate from the policy's
+mask also hides it from that consumer. The occluder shapes therefore have ONE definition
+each (:func:`_stick_at`, :func:`_pillar_at`, called with grid coordinates by the renderer
+and point coordinates by the sampler) and the erasing families' defaults are module
+constants, so the two cannot drift apart.
+
+Provenance: ported from the nav-train mask-corruption module with the algorithms, family
+set and tuned defaults unchanged.
 """
-
-from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
@@ -70,9 +67,9 @@ NOISE_FAMILIES = 6
 # -- ERASING-family defaults, shared by corrupt_mask and erasure_at ------------
 # Module-level rather than inline defaults because TWO functions must agree on
 # them: the renderer that paints these artifacts into the policy's mask, and
-# :func:`erasure_at`, which asks whether a given pixel is under one. A copied
-# literal in the second signature is a silent-drift hazard — the whole point of
-# erasure_at is that the filter loses exactly the corners the policy's mask
+# erasure_at, which asks whether a given pixel is under one. A copied literal in
+# the second signature is a silent-drift hazard — the whole point of erasure_at
+# is that a state-side consumer loses exactly the corners the policy's mask
 # lost, and a stale duplicate of `pillar_width` would break that quietly.
 # The ADDING families (glow blob, speckle) and the blur have no such twin, so
 # their defaults stay inline on corrupt_mask.
@@ -85,7 +82,7 @@ BAND_WIDTH = (1.25, 3.25)
 BAND_LEN = (18.0, 70.0)
 PILLAR_PROB = 0.05
 # the pop-up vertical bar's width: 10%..50% of the 64 px frame (6.4..32 px),
-# so it spans a tenth of the view up to half of it (2026-07-23, was 10..22 px).
+# so it spans a tenth of the view up to half of it.
 PILLAR_WIDTH = (6.4, 32.0)
 # Tasks that also persist the renderer's outward glow bleed (render_masks
 # ``outer_grow``) append ONE extra key slot after the artifact families, so the
@@ -148,7 +145,7 @@ def grow_from_keys(noise_keys: jax.Array, mean: float, sd: float) -> jax.Array:
     return jnp.clip(mean + sd * jax.vmap(jax.random.normal)(gk), 0.0, None)
 
 
-# -- per-world artifact draws (vmapped over the fleet by corrupt_mask_*) ------
+# -- per-world artifact draws (vmapped over the fleet by corrupt_mask) ---------
 
 def _blob_field1(key: jax.Array, h: int, w: int, cells: int) -> jax.Array:
     """Smooth low-frequency random field in ~[0, 1]: uniform noise on a coarse
@@ -262,8 +259,6 @@ def corrupt_mask(
     # floor-glow speckle: sparse faint salt (sub-pixel dots, so never white).
     speckle_p: float = 0.0008,
     # occasional light blur: rounds small rings like the real JPEG+resample.
-    # (0.10 -> 0.07, 2026-07-21: toned down a tad — the artifact churn already
-    # softens plenty once holds stretch to ~1 s.)
     blur_prob: float = 0.07,
 ) -> jax.Array:
     """Corrupt a rendered gate mask [F, H, W] (soft, [0, 1]) like the real HSV
@@ -332,8 +327,7 @@ def _blob_field_at(key: jax.Array, h: int, w: int, cells: int,
     clamped at the edges — so a point sample equals the full render's value at
     that pixel. Unlike the two occluders this is a re-implementation rather than
     a shared definition (the grid path goes through ``jax.image.resize``, which
-    takes no coordinates), so ``test_mask_noise_point_sampler_matches_render``
-    pins the two together."""
+    takes no coordinates), so the vision test suite pins the two together."""
     u = jax.random.uniform(key, (cells, cells))
     gx = jnp.clip((xs + 0.5) * (cells / w) - 0.5, 0.0, cells - 1.0)
     gy = jnp.clip((ys + 0.5) * (cells / h) - 0.5, 0.0, cells - 1.0)
@@ -368,14 +362,14 @@ def erasure_at(
 
     The inverse question to :func:`corrupt_mask`: instead of "what does the mask
     look like", "is *this* pixel under a hole or an occluder". It exists so a
-    consumer that never sees the rendered mask — the training filter's synthetic
+    consumer that never sees the rendered mask — e.g. a state-side synthetic
     corner detector — can lose exactly the corners the policy's mask lost. A
-    pillar that hides gate 5 from the CNN must hide it from the filter too, or
-    the filter is reading through an occluder and the policy learns to trust an
-    information channel with no deploy analogue.
+    pillar that hides a gate from the policy's mask must hide it from that
+    consumer too, or it is reading through an occluder and the policy learns to
+    trust an information channel with no deploy analogue.
 
     ``pts_px`` is ``[F, M, 2]`` as **(x, y) = (column, row)** in the SAME pixel
-    frame as ``mask`` — a caller working at a different resolution must rescale
+    frame as the mask — a caller working at a different resolution must rescale
     first. ``noise_keys`` is the carried ``[F, >=NOISE_FAMILIES, 2]`` state, so
     the answer is a pure function of the same keys that painted the frame.
 
