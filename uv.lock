@@ -580,7 +580,7 @@ requires-dist = [
     { name = "jax", specifier = ">=0.11" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.11" },
     { name = "numpy", specifier = ">=2" },
-    { name = "skyflow-dynamics", extras = ["jax"], editable = "../SkyFlow-Dynamics" },
+    { name = "skyflow-dynamics", extras = ["jax"], git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics" },
 ]
 provides-extras = ["cuda", "firmware"]
 
@@ -593,7 +593,7 @@ dev = [
 [[package]]
 name = "skyflow-dynamics"
 version = "0.1.0"
-source = { editable = "../SkyFlow-Dynamics" }
+source = { git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics#b90f9791ffcb5157ce2d5a3db25845e766b5acf9" }
 dependencies = [
     { name = "numpy" },
     { name = "sympy" },
@@ -602,20 +602,6 @@ dependencies = [
 [package.optional-dependencies]
 jax = [
     { name = "jax" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "jax", marker = "extra == 'jax'", specifier = ">=0.5" },
-    { name = "numpy", specifier = ">=1.26" },
-    { name = "sympy", specifier = ">=1.12" },
-]
-provides-extras = ["jax"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "jax", specifier = ">=0.5" },
-    { name = "pytest", specifier = ">=8" },
 ]
 
 [[package]]
