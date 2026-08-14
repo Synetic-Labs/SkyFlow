@@ -56,7 +56,7 @@ tests/                  # pytest; §11 lists the required suites
 
 Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: editable path
 `../SkyFlow-Dynamics` until published, then git). Extras: `cuda` → `jax[cuda13]`;
-`firmware` → `cudaflight` (path source; treat as open source). Dev group: `pytest>=9`,
+`firmware` → `cudaflight` (public GitHub release-wheel URL source). Dev group: `pytest>=9`,
 `ruff>=0.16`. License MIT. Version 0.2.0.
 
 ## 3. Conventions (one frame inside)
@@ -241,12 +241,13 @@ Reward constants live in task kwargs with the shipped defaults; no reward code i
 
 ## 10. firmware.py — control="sticks"
 
-cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration): package
+cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration; Python API
+unchanged through v0.3.1): package
 `cudaflight`, no core deps; sensor input per 1 kHz tick = f32 [F,7] NED/FRD
 `[gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)]` (level hover ⇒
 az = -9.81); sticks f32 [F,4] AETR in [-1,1]; output motors f32 [F,4] in [0,1] QUADX
 order + armed u8 [F]; GPU fleet needs n ≥ 3 and the in-jit FFI half currently lives in
-nav-train (cudaflight will absorb it on open-sourcing); CPU SITL (`libcpuflight.so`,
+nav-train (cudaflight is public now but does not yet ship it); CPU SITL (`libcpuflight.so`,
 ctypes + `io_callback(ordered=True)`) is self-contained, works for any fleet size, jits
 but is not vmappable/replayable.
 

@@ -23,9 +23,9 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = ["jax[cuda13]>=0.11"]
-# Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. The CPU SITL backend
-# needs cudaflight >= 0.2.1 (libcpuflight + aux API).
-firmware = ["cudaflight>=0.2.1"]
+# Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. Floor = current public
+# release; the CPU SITL backend it needs (libcpuflight + aux API) exists since 0.2.1.
+firmware = ["cudaflight>=0.3.1"]
 
 [dependency-groups]
 dev = ["pytest>=9", "ruff>=0.16"]
@@ -33,9 +33,9 @@ dev = ["pytest>=9", "ruff>=0.16"]
 [tool.uv.sources]
 # Local sibling checkout until published; switch to a git URL on release.
 skyflow-dynamics = { path = "../SkyFlow-Dynamics", editable = true }
-# Release wheel (binaries are generated artifacts — cudaflight is not pip-installable from
-# source). Local vendored copy until the public GitHub release URL replaces it.
-cudaflight = { path = "../nav-train/.vendor/cudaflight-0.2.1-py3-none-linux_x86_64.whl" }
+# Public release wheel (binaries are generated artifacts — cudaflight is not
+# pip-installable from source, and is not on PyPI). Bump the URL to move versions.
+cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.1/cudaflight-0.3.1-py3-none-linux_x86_64.whl" }
 
 [project.urls]
 Homepage = "https://github.com/Synetic-Labs/SkyFlow"

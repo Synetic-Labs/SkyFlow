@@ -18,17 +18,18 @@ wheels = [
 
 [[package]]
 name = "cudaflight"
-version = "0.2.1"
-source = { path = "../nav-train/.vendor/cudaflight-0.2.1-py3-none-linux_x86_64.whl" }
+version = "0.3.1"
+source = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.1/cudaflight-0.3.1-py3-none-linux_x86_64.whl" }
 wheels = [
-    { filename = "cudaflight-0.2.1-py3-none-linux_x86_64.whl", hash = "sha256:963f78107c05e63a836ecae4dc828d5891a658153e1433244b6495e0eec09f9a" },
+    { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.1/cudaflight-0.3.1-py3-none-linux_x86_64.whl", hash = "sha256:c56b4b84fcad0a9dceda8b741484c3a113076f8ab2cd9b2791ac4a5bedc2f31a" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "jax", marker = "extra == 'jax'" },
+    { name = "jax", extras = ["cuda12"], marker = "extra == 'jax'" },
     { name = "numpy", marker = "extra == 'torch'" },
     { name = "numpy", marker = "extra == 'viz'" },
+    { name = "pillow", marker = "extra == 'viz'" },
     { name = "pygame", marker = "extra == 'viz'" },
     { name = "torch", marker = "extra == 'torch'" },
     { name = "torch", marker = "extra == 'viz'" },
@@ -575,7 +576,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cudaflight", marker = "extra == 'firmware'", path = "../nav-train/.vendor/cudaflight-0.2.1-py3-none-linux_x86_64.whl" },
+    { name = "cudaflight", marker = "extra == 'firmware'", url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.1/cudaflight-0.3.1-py3-none-linux_x86_64.whl" },
     { name = "jax", specifier = ">=0.11" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.11" },
     { name = "numpy", specifier = ">=2" },

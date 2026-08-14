@@ -15,6 +15,7 @@ venv/
 htmlcov/
 
 # JAX / local artifacts
+benchmark/data/
 *.npz
 *.orbax
 runs/
