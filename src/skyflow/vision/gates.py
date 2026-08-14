@@ -185,13 +185,13 @@ def _gateset_from_world(
     depths: jax.Array,
 ) -> GateSet:
     """
-    The single z-up→NED conversion site (DESIGN.md §3a): centres get the (x, −y, −z)
+    The single z-up→NED conversion site (DESIGN.md §3a): centres get the (x, -y, -z)
     flip; yaw flips sign (public yaw is about +z/up, the internal yaw about NED down);
     pitch passes through (up-positive in both frames — "up" survives the flip).
     """
     centers_ned = flip_xyz(jnp.asarray(centers_world, jnp.float32).reshape(-1, 3))
     yaws_ned = -jnp.asarray(yaws_world, jnp.float32).reshape(-1)
-    pitches = (None if pitches_world is None
+    pitches = (jnp.zeros_like(yaws_ned) if pitches_world is None
                else jnp.asarray(pitches_world, jnp.float32).reshape(-1))
     return GateSet(centers=centers_ned, yaws=yaws_ned, inner_half=inner_half,
                    outer_half=outer_half, pitches=pitches, depths=depths)
@@ -267,7 +267,7 @@ def classify_crossings(
 
     ``body_radius`` models the drone as a sphere instead of a point: the gate solid is
     inflated by r (Minkowski sum, square-cornered box approximation — outer + r,
-    opening − r, depth + 2r) so a pass needs r of clearance from every bar and grazing
+    opening - r, depth + 2r) so a pass needs r of clearance from every bar and grazing
     within r of one is a hit. The RENDERED mask is untouched — the camera sees the
     physical gate; only contact inflates.
 
@@ -379,7 +379,7 @@ def circle(
         theta = sense * 2.0 * math.pi * i / n_gates
         x = radius_m * math.cos(theta)
         y = radius_m * math.sin(theta)
-        # travel direction = d(position)/d(theta) · sense = (−sinθ, cosθ) · sense
+        # travel direction = d(position)/d(theta) · sense = (-sinθ, cosθ) · sense
         yaw = math.degrees(math.atan2(sense * math.cos(theta),
                                       sense * -math.sin(theta)))
         rows.append([x, y, alt_m, yaw])
@@ -403,7 +403,7 @@ def figure_eight(
         x(t) = a·cos t / (1 + sin²t),   y(t) = a·sin t·cos t / (1 + sin²t)
 
     with a = 2·``lobe_radius_m`` (each lobe spans 2·lobe_radius_m along ±x from the
-    crossover). Flight order follows t from −π/2: the right lobe counter-clockwise, then
+    crossover). Flight order follows t from -π/2: the right lobe counter-clockwise, then
     the left lobe clockwise — the ∞ shape — so consecutive transits of the crossover run
     along the two DIFFERENT diagonals (alternating crossing directions at the centre, the
     property the gate task's alternating-normals test pins). Gates sit at k evenly spaced
@@ -426,7 +426,7 @@ def figure_eight(
         d = 1.0 + s * s
         centers.append((a * c / d, a * s * c / d, float(alt_m)))
         # tangent = (dx/dt, dy/dt); the parametrization runs in flight direction, so no
-        # sign fix-up: dx/dt = −a·s·(3 − s²)/d², dy/dt = a·(c⁴ − s² − s⁴)/d²
+        # sign fix-up: dx/dt = -a·s·(3 - s²)/d², dy/dt = a·(c⁴ - s² - s⁴)/d²
         dx = -a * s * (3.0 - s * s) / (d * d)
         dy = a * (c**4 - s**2 - s**4) / (d * d)
         yaws.append(math.atan2(dy, dx))

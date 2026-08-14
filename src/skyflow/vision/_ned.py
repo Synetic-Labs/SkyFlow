@@ -4,7 +4,7 @@ Frame conversion at the vision boundary — z-up FLU outside, NED/FRD inside (DE
 The renderer math in this package is ported from a NED/FRD implementation verified against
 MuJoCo segmentation renders, and stays in that frame. These helpers are the single
 conversion site its public entry points use: world z-up ↔ NED and body FLU ↔ FRD are the
-SAME (x, −y, −z) flip, so one vector negation converts positions and one quaternion
+SAME (x, -y, -z) flip, so one vector negation converts positions and one quaternion
 conjugation converts attitudes for both frame pairs at once. All maps here are
 self-inverse. Frame bookkeeping only — no physics (DESIGN.md §1 boundary).
 

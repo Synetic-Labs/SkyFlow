@@ -46,7 +46,7 @@ def waypoint_path(gates, step_m: float) -> np.ndarray:
     for wp in waypoints[1:]:
         start = path[-1]
         leg = wp - start
-        steps = max(2, int(math.ceil(np.linalg.norm(leg) / step_m)) + 1)
+        steps = max(2, math.ceil(np.linalg.norm(leg) / step_m) + 1)
         for t in np.linspace(0.0, 1.0, steps)[1:]:
             path.append(start + t * leg)
     return np.asarray(path, np.float32)
@@ -65,7 +65,7 @@ def save_masks(gates, path: np.ndarray, count: int, outdir: Path) -> None:
     from skyflow.vision.renderer import render_masks
 
     try:
-        from matplotlib.image import imsave
+        from matplotlib.image import imsave  # pyright: ignore[reportMissingImports]
     except ImportError:
         imsave = None
         print("matplotlib not installed — saving raw .npy masks instead of PNGs")
@@ -89,7 +89,7 @@ def save_masks(gates, path: np.ndarray, count: int, outdir: Path) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[1])
     ap.add_argument("--speed", type=float, default=2.0, help="tracer speed, m/s")
     ap.add_argument("--dt", type=float, default=0.02, help="control step, s")
     ap.add_argument("--save-masks", type=int, default=0, metavar="N",

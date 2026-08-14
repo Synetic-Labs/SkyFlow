@@ -61,8 +61,8 @@ def _scan_rollout(env, state, action, n_steps: int, collect):
 
 def test_ou_wind_stationary_std_matches_config(key):
     """Exact OU discretization ⇒ stationary per-axis std equals wind_std_mps. 256 worlds
-    × 250 post-burn-in steps × 3 axes at α≈0.967 give ≈3.2k effective samples: the 0.12
-    tolerances sit beyond 4σ of both the mean and std estimators."""
+    x 250 post-burn-in steps x 3 axes at decay ≈ 0.967 give ≈3.2k effective samples: the
+    0.12 tolerances sit beyond 4 std errors of both the mean and std estimators."""
     fleet, std, tau = 256, 1.5, 0.3
     env = make_env(fleet, wind_std_mps=std, wind_tau_s=tau, physics_hz=500.0)
     _, state = env.reset(key)
@@ -70,7 +70,7 @@ def test_ou_wind_stationary_std_matches_config(key):
     _, (winds, dones) = _scan_rollout(env, state, idle, 400, lambda s, i: s.wind_vel)
     assert not bool(dones.any()), "a reset would have cleared wind state mid-measurement"
 
-    sample = np.asarray(winds[150:])  # burn-in: var reaches σ²(1−α^300) ≈ σ² to 0.1%
+    sample = np.asarray(winds[150:])  # burn-in: var reaches var_inf·(1-decay^300) ≈ var_inf to 0.1%
     assert abs(sample.std() - std) < 0.12
     assert abs(sample.mean()) < 0.12
 
@@ -91,7 +91,7 @@ def test_wind_stays_exactly_zero_when_disabled(key):
 def test_poke_rate_matches_poke_prob(key):
     """poke_force_n = 0 keeps the draws physically inert (no crash/reset interference)
     while info["poke_active"] still reports the Bernoulli gate. n = 256·200 draws ⇒
-    se ≈ 0.0016; tolerance 0.015 is ≈9σ."""
+    se ≈ 0.0016; tolerance 0.015 is ≈9 standard errors."""
     fleet, prob = 256, 0.15
     env = make_env(fleet, poke_prob=prob, poke_force_n=0.0)
     _, state = env.reset(key)
@@ -122,7 +122,7 @@ def test_pokes_shove_through_exogenous_inputs(key):
         a = jnp.zeros((fleet, 4), jnp.float32)
         for _ in range(3):
             _, state, _, done, _ = env.step(state, a)
-        assert not bool(done.any())
+            assert not bool(done.any())
         return np.asarray(state.plant)
 
     quiet = run(0.0, 0.0)
@@ -146,7 +146,7 @@ def test_wind_enters_aerodynamics_on_a_draggy_vehicle(key):
         a = jnp.zeros((fleet, 4), jnp.float32)
         for _ in range(10):
             _, state, _, done, _ = env.step(state, a)
-        assert not bool(done.any())
+            assert not bool(done.any())
         return np.asarray(state.plant)
 
     calm = run(0.0)

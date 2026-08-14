@@ -7,8 +7,8 @@ boundary layout is fixed by the cudaflight wheel (v0.2.1, verified through the n
 integration):
 
     sensors [F, 7] f32 = gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)
-                         (level hover ⇒ az = −9.81)
-    sticks  [F, 4] f32 = AETR (roll, pitch, throttle, yaw) in [−1, 1]
+                         (level hover ⇒ az = -9.81)
+    sticks  [F, 4] f32 = AETR (roll, pitch, throttle, yaw) in [-1, 1]
     motors  [F, 4] f32 in [0, 1], QUADX order;  armed [F] u8
 
 Both fleet classes implement `types.FirmwareFleet`: the firmware state is value-threaded
@@ -29,8 +29,6 @@ cudaflight imports stay inside the constructors so `import skyflow.firmware` (an
 mode, which never touches this module) works without the wheel installed.
 """
 
-from __future__ import annotations
-
 import ctypes
 import os
 
@@ -38,6 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import io_callback
+from jax.typing import ArrayLike
 
 __all__ = ["CpuFirmwareFleet", "GpuFirmwareFleet", "baro_pa", "flu_to_frd"]
 
@@ -53,9 +52,9 @@ _SEA_LEVEL_PA = 101325.0
 _BARO_SCALE_M = 8434.0
 
 
-def flu_to_frd(v: jax.Array) -> jax.Array:
+def flu_to_frd(v: ArrayLike) -> jax.Array:
     """
-    Flip [..., 3] vectors between FLU and FRD (equally z-up world and NED): (x, −y, −z).
+    Flip [..., 3] vectors between FLU and FRD (equally z-up world and NED): (x, -y, -z).
 
     Harness-side sensor PACKAGING for the firmware boundary, not spec physics — the frames
     share the x axis and negate the other two, so the map is elementwise, dtype-preserving,
@@ -66,9 +65,9 @@ def flu_to_frd(v: jax.Array) -> jax.Array:
     return v * jnp.array([1.0, -1.0, -1.0], dtype=v.dtype)
 
 
-def baro_pa(alt_m: jax.Array) -> jax.Array:
+def baro_pa(alt_m: ArrayLike) -> jax.Array:
     """
-    Barometric pressure Pa from z-up altitude m: 101325·exp(−alt/8434).
+    Barometric pressure Pa from z-up altitude m: 101325·exp(-alt/8434).
 
     Harness-side sensor MODEL for the firmware boundary, not spec physics — an isothermal
     atmosphere (the verified nav-train packaging), good to ~0.1% over indoor flight
@@ -237,7 +236,7 @@ class GpuFirmwareFleet:
           `jnp.zeros(1, device=...)` + block_until_ready) before `cudaflight_create*`,
           so the firmware kernels share XLA's context instead of racing it for one.
         - Create via `cudaflight_create_eeprom_ex(cubin, fleet, device_index, settle_ms,
-          eeprom, with_grad=0)` — no differentiable-rollout scratch, ~1.5× more worlds —
+          eeprom, with_grad=0)` — no differentiable-rollout scratch, ~1.5x more worlds —
           falling back to `cudaflight_create_eeprom` on older libraries.
         - `fleet >= 3`: the runtime relocation table cannot be discovered below 3
           instances; smaller fleets belong to CpuFirmwareFleet.

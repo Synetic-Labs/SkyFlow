@@ -1,5 +1,6 @@
 """
-Gate-course task — ordered racing through a GateSet course (DESIGN.md §9).
+Gate-course task, registered as `figure_eight` — ordered racing through a GateSet course
+(DESIGN.md §9).
 
 The course is a `skyflow.vision.gates.GateSet` (default: the shipped figure-eight
 lemniscate builder). Each world chases one ACTIVE gate at a time: reward is distance
@@ -99,7 +100,7 @@ class GateCourseTask:
           w_prog: reward per metre of progress toward the active pre-gate point.
           w_gate: pass credit scale; a pass pays w_gate·centering, centering ∈ (0, 1].
           w_rate: penalty per rad/s of body-rate magnitude, each control step.
-          pre_gate_offset_m: pre-gate point distance in front of the plane (−normal
+          pre_gate_offset_m: pre-gate point distance in front of the plane (-normal
             side). Progress pulls to the approach side only; the pass credit, not the
             progress term, pays for committing through the opening.
           spawn_mode: "podium" — every world starts behind gate 0 at podium height;
@@ -169,7 +170,7 @@ class GateCourseTask:
     # -- Task protocol -------------------------------------------------------------
 
     def spawn(self, key: Array, n: int, params: Array) -> tuple[Array, GateTaskState]:
-        """Fresh plant rows [n,17] f32 on the approach (−normal) side of the start gate.
+        """Fresh plant rows [n,17] f32 on the approach (-normal) side of the start gate.
 
         Podium mode places every world behind gate 0 at podium height with lateral and
         yaw jitter, facing the gate; spread mode draws the start gate uniformly and
@@ -234,7 +235,9 @@ class GateCourseTask:
         rot_flat = rot.reshape(pos.shape[0], 9)
 
         if self.vision:
-            mask = self._render_masks(self._camera, self.gates, pos, quat)
+            camera = self._camera
+            assert camera is not None  # __init__ always builds one in vision mode
+            mask = self._render_masks(camera, self.gates, pos, quat)
             head = [mask.reshape(pos.shape[0], -1)]
         else:
             active = task_state.active_gate
@@ -252,9 +255,9 @@ class GateCourseTask:
     ) -> TaskEval:
         """Reward/success/crash on the transition prev_plant → plant (DESIGN.md §9).
 
-        reward = w_prog·(d_prev − d) toward the active pre-gate point
+        reward = w_prog·(d_prev - d) toward the active pre-gate point
                + w_gate·centering on a clean forward pass of the active gate
-               − w_rate·‖ω‖.
+               - w_rate·‖ω‖.
         Crash: the segment touched ANY gate's frame solid (frame hit, from
         `classify_crossings`), or crossed the active gate's centre plane forward
         without a clean pass (miss — the nav-train event, which also catches wide

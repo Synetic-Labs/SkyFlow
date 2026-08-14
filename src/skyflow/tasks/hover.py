@@ -9,13 +9,13 @@ leaving the safe box, which bounds exploration long before the env's flyaway set
 
 Reward per control step (shipped defaults in the constructor; no reward code elsewhere):
 
-    w_pos·exp(−3·d) + w_hold·exp(−50·d) − w_vel·|v| − w_rate·|ω| + w_prog·(d_prev² − d²)
+    w_pos·exp(-3·d) + w_hold·exp(-50·d) - w_vel·|v| - w_rate·|ω| + w_prog·(d_prev² - d²)
 
 The two exponentials pay for coarse approach and precise hold; the progress term
 telescopes over a held goal (both endpoints measure against the same goal, so a goal
 switch never pays), and the speed/rate penalties damp the equilibrium.
 
-Frames (DESIGN.md §3): observations are world z-up — `rel_pos` = goal − x and `vel` are
+Frames (DESIGN.md §3): observations are world z-up — `rel_pos` = goal - x and `vel` are
 world-frame rows, with the body→world rotation matrix flattened alongside, matching the
 §9 layout [rel_pos(3), vel(3), rot_matrix(9), last_action(4)] = 19. All outputs are
 float32 with the fleet axis leading.
@@ -37,7 +37,7 @@ class HoverTaskState(NamedTuple):
 
     goal: Array  # [F,3] f32 world-frame setpoint
     hold: Array  # [F] int32 control steps the current goal has been held
-    dist: Array  # [F] f32 latest |goal − x| m (metrics)
+    dist: Array  # [F] f32 latest |goal - x| m (metrics)
 
 
 class HoverTask:
@@ -89,7 +89,7 @@ class HoverTask:
             carries no clock — like spawn_dr_scale, the env forwards
             SimConfig.control_hz when building this task from the registry).
           safe_xy_m / safe_z_m: safe box — leaving it is the task crash.
-          success_radius_m: |goal − x| below this is success (never terminates).
+          success_radius_m: |goal - x| below this is success (never terminates).
           obs_noise: half-width of additive uniform observation noise; 0 disables.
           w_pos / w_hold / w_vel / w_rate / w_prog: reward weights (module docstring).
         """

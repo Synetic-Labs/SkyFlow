@@ -30,7 +30,7 @@ the pre-reset observation and flags come back through `info["final_obs"]` /
 ### Environment
 
 The env owns the world and everything that happens to the vehicle: RK4 physics, 
-per-world parameter randomization, Ornstein–Uhlenbeck wind, random pokes, 
+per-world parameter randomization, Ornstein-Uhlenbeck wind, random pokes, 
 command transport delay, ground contact, crash detection, and in-jit auto-reset. 
 A task owns the objective; spawn distribution, observation, reward, 
 task-specific terminals.
@@ -42,7 +42,7 @@ The built-in airframe is the spec's Crazyflie reference row;
 
 ### Vision inside jit
 
-`gate_course` in vision mode renders analytic ray-cast coverage masks of the gate
+`figure_eight` in vision mode renders analytic ray-cast coverage masks of the gate
 frames directly from pose — no rasterizer, no host round-trip, batched over the fleet
 inside jit. `skyflow.vision.mask_noise` corrupts the clean render with the artifact families;
 branding holes, occluders, glow, speckle.
@@ -66,8 +66,9 @@ Requires Python 3.12+. Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[j
 
 ## Tasks
 
-`hover` and `gate_course` (with a figure-eight course builder) ship as reference tasks.
-Implement the `Task` protocol from `skyflow.types` and register a builder:
+`hover` and `figure_eight` ship as reference tasks. `figure_eight` is the generic
+`GateCourseTask` flying its default figure-eight course; any `GateSet` passes through
+`task_kwargs`. Implement the `Task` protocol from `skyflow.types` and register a builder:
 
 ```python
 from skyflow import SimConfig, SkyFlowEnv, register_task

@@ -9,7 +9,7 @@ camera frame. Flat gates are trivial geometry, so that mask renders analytically
 
 Method — per-pixel ray-cast against each gate's SOLID frame (not forward polygon
 projection): back-project each pixel into a world ray and intersect it with the gate solid
-— the outer box (outer rectangle × ``depths[g]`` thick along the normal) minus the
+— the outer box (outer rectangle x ``depths[g]`` thick along the normal) minus the
 inner-opening prism — via slab intervals in the gate's own axis frame. A pixel is marked
 when the ray's inside-the-outer-box interval has any part outside the opening interval and
 in front of the camera. This renders the true silhouette: at oblique views the bars' side
@@ -121,9 +121,9 @@ def render_masks(
     cam_origin, rays_world = _camera_rays(cam, pos_ned, quat_ned, R_body_from_cam)
     fleet = pos_ned.shape[0]
 
-    # Per-gate ray–solid intersection, unioned at subray resolution. A Python loop over
-    # the (static, small) gate count keeps peak memory at F×P per gate instead of
-    # materializing an F×P×G block; the frame bars share one mask class, so a boolean OR
+    # Per-gate ray-solid intersection, unioned at subray resolution. A Python loop over
+    # the (static, small) gate count keeps peak memory at F·P per gate instead of
+    # materializing an F·P·G block; the frame bars share one mask class, so a boolean OR
     # is the exact composite (no depth sorting).
     grow = None if outer_grow is None else outer_grow[:, None]       # [F, 1]
     band_any = jnp.zeros(rays_world.shape[:2], bool)                 # [F, P]
@@ -145,7 +145,7 @@ def render_masks(
             gates.inner_half[g, 0], gates.inner_half[g, 1])
         band_any = band_any | _hits_solid(a0, a1, b0, b1, 1e-6, _BIG)
 
-    # [F, H·ss, W·ss] -> average each ss×ss block into a soft [F, H, W] coverage
+    # [F, H·ss, W·ss] -> average each ss x ss block into a soft [F, H, W] coverage
     band = band_any.astype(jnp.float32).reshape(fleet, H, ss, W, ss)
     return band.mean(axis=(2, 4))
 
@@ -212,7 +212,7 @@ def render_masks_perworld(
     """
     H, W, ss = cam.height, cam.width, cam.supersample
     pos_ned, quat_ned = pose_ned(pos, quat)
-    # world z-up gate geometry → internal NED: the same (x, −y, −z) flip on every world
+    # world z-up gate geometry → internal NED: the same (x, -y, -z) flip on every world
     # vector (orthogonal, so all gate-frame dot products below are preserved exactly)
     centers = flip_xyz(centers)
     normals = flip_xyz(normals)

@@ -136,7 +136,7 @@ def imu(plant, omega_cmd, wind_vel, params, *, motor_model: str = "first_order")
 def throttle_to_omega(u, w_min, w_max, k):
     """
     Normalized throttle u ∈ [0,1] [F,4] → commanded rotor speed Ω_c [F,4] rad/s via the
-    verified curve Ω_c = (Ω_max−Ω_min)·√(k·u² + (1−k)·u) + Ω_min (spec.motor). The
+    verified curve Ω_c = (Ω_max-Ω_min)·√(k·u² + (1-k)·u) + Ω_min (spec.motor). The
     generated function is elementwise and broadcasts over the fleet axis, so it needs no
     vmap; endpoints are exact (u=0 → w_min, u=1 → w_max) for any blend k ∈ [0,1].
     """

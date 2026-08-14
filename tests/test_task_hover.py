@@ -5,6 +5,8 @@ here depends on env.py or the dynamics backend. The task is imported directly (n
 the tasks/ registry, which is integrated separately).
 """
 
+from itertools import pairwise
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -187,11 +189,11 @@ def test_goal_resamples_every_hold_steps():
 
 
 def test_reward_increases_as_distance_falls():
-    """Static hovers (no progress/penalty terms): r(d) = w_pos·e^(−3d) + w_hold·e^(−50d)
+    """Static hovers (no progress/penalty terms): r(d) = w_pos·e^(-3d) + w_hold·e^(-50d)
     is strictly decreasing in d, so closer must always pay more."""
     task = HoverTask()
     rewards = [float(_eval_at(task, d, d).reward[0]) for d in [2.0, 1.5, 1.0, 0.5, 0.2, 0.05]]
-    assert all(b > a for a, b in zip(rewards, rewards[1:])), rewards  # noqa: B905 — pairwise
+    assert all(b > a for a, b in pairwise(rewards)), rewards
 
 
 def test_progress_term_pays_squared_distance_shrink():

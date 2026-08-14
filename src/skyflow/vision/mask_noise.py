@@ -20,7 +20,7 @@ clean render lacks:
 4. **Speckle** — faint scattered floor-glow dots (sub-pixel at capture resolution, so
    they downsample to faint values, never full white).
 5. **Resampling blur** — JPEG + downsample rounds small rings; the sim's crisp squares
-   occasionally get a light 3×3 blur to match.
+   occasionally get a light 3x3 blur to match.
 
 BINARY DISCIPLINE: the real mask is binary at capture resolution; the low-res policy view
 is its area-downsample, so intermediate values exist ONLY as sub-pixel averaging at edges
@@ -149,7 +149,7 @@ def grow_from_keys(noise_keys: jax.Array, mean: float, sd: float) -> jax.Array:
 
 def _blob_field1(key: jax.Array, h: int, w: int, cells: int) -> jax.Array:
     """Smooth low-frequency random field in ~[0, 1]: uniform noise on a coarse
-    ``cells``×``cells`` grid, bilinearly upsampled to [h, w]. Thresholding
+    ``cells`` x ``cells`` grid, bilinearly upsampled to [h, w]. Thresholding
     it yields blobby regions of ~(h/cells) px scale."""
     u = jax.random.uniform(key, (cells, cells))
     return jax.image.resize(u, (h, w), method="linear")
@@ -225,7 +225,7 @@ def _pillar1(key: jax.Array, h: int, w: int, **kw) -> jax.Array:
 
 
 def _blur3(m: jax.Array) -> jax.Array:
-    """3×3 binomial blur ([1,2,1]⊗[1,2,1]/16) via shifted adds — cheap and
+    """3x3 binomial blur ([1,2,1]⊗[1,2,1]/16) via shifted adds — cheap and
     conv-free. Edge pixels reuse their own value (edge padding)."""
     p = jnp.pad(m, ((0, 0), (1, 1), (1, 1)), mode="edge")
     r = (p[:, :-2, :] + 2.0 * p[:, 1:-1, :] + p[:, 2:, :]) * 0.25   # vertical

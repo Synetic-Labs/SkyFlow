@@ -22,7 +22,7 @@ def test_vision_task_jitted_rollout_smoke():
     env = SkyFlowEnv(
         SimConfig(
             num_envs=FLEET,
-            task="gate_course",
+            task="figure_eight",
             task_kwargs={"vision": True},
             physics_dr_scale=0.0,
         )
@@ -36,10 +36,10 @@ def test_vision_task_jitted_rollout_smoke():
     jstep = jax.jit(env.step)
     action = jnp.zeros((FLEET, 4), jnp.float32)  # mid throttle, no differential
     for _ in range(STEPS):
-        obs, state, reward, done, info = jstep(state, action)
+        obs, state, reward, _done, _info = jstep(state, action)
+        assert bool(jnp.isfinite(reward).all()) and reward.dtype == jnp.float32
 
     assert obs.shape == (FLEET, env.obs_dim) and obs.dtype == jnp.float32
     assert bool(jnp.isfinite(obs).all())
-    assert bool(jnp.isfinite(reward).all()) and reward.dtype == jnp.float32
     mask = obs[:, : h * w]
     assert float(mask.min()) >= 0.0 and float(mask.max()) <= 1.0

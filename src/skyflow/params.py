@@ -4,7 +4,7 @@ Airframe registry and domain randomization (DESIGN.md §6).
 An Airframe is a spec parameter dict (skyflow_dynamics SCHEMA keys, validated by
 pack_params) plus the harness-side quantities the spec charter keeps out of the ODE: the
 rotor-speed operating limits (the dict's `limits` entry) and the throttle-curve blend of
-the command map. Randomization is multiplicative — per-entry factors 1 + scale·U(−b, +b)
+the command map. Randomization is multiplicative — per-entry factors 1 + scale·U(-b, +b)
 with brackets from DR_BRACKETS — so zero-valued nominals stay exactly zero and the
 structural keys (spin, axis, grav) are never touched. The same routine runs at reset and
 at in-jit auto-reset respawn.
@@ -29,7 +29,7 @@ class Airframe:
     values: dict  # spec SCHEMA row (+ its `limits` entry), pack_params-validated
     rotor_speed_min: float  # rad/s — post-step clip floor and throttle-map Ω_min
     rotor_speed_max: float  # rad/s — post-step clip ceiling and throttle-map Ω_max
-    throttle_k: float  # blend of the verified curve Ω_c = ΔΩ·√(k·u² + (1−k)·u) + Ω_min
+    throttle_k: float  # blend of the verified curve Ω_c = ΔΩ·√(k·u² + (1-k)·u) + Ω_min
 
 
 def _from_spec(name: str, values: dict, throttle_k: float) -> Airframe:
@@ -69,7 +69,7 @@ def register_airframe(name: str, airframe: Airframe) -> None:
 #: airframe's geometry class, grav is the world, not the vehicle (DESIGN.md §6).
 NEVER_JITTER: tuple[str, ...] = ("spin", "axis", "grav")
 
-#: SCHEMA key → half-width b of the multiplicative jitter factor 1 + scale·U(−b, +b).
+#: SCHEMA key → half-width b of the multiplicative jitter factor 1 + scale·U(-b, +b).
 #: §6 fixes mass/inertia/ct*/cq*/tau_m/k_d/k_z/r_prop; the rest follow their families:
 #: motor-response coefficients like tau_m (0.20), rotor inertia like inertia (0.15),
 #: secondary aero like k_d/k_z (0.30), geometry not jittered like r_prop (0.0).
@@ -123,7 +123,7 @@ def sample_params(key, airframe: Airframe, fleet: int, scale: float):
     """
     Per-world randomized flat parameter rows [fleet, P] float32 (pack_params order).
 
-    Each stored entry gets an independent multiplicative factor 1 + scale·U(−b, +b) with
+    Each stored entry gets an independent multiplicative factor 1 + scale·U(-b, +b) with
     b from DR_BRACKETS (log-uniform-style: symmetric relative jitter about the nominal).
     Consequences of the multiplicative form: zero nominals stay exactly zero, scale=0
     returns the nominal row bit-exactly, and spin/axis/grav are never jittered (masked

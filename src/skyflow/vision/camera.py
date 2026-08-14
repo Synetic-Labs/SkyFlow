@@ -4,13 +4,13 @@ Pinhole camera model for the analytic mask renderer (DESIGN.md §2).
 Public frame contract (DESIGN.md §3): the mount is stated in body FLU — x forward, y left,
 z up. The ray-cast internals are ported NED/FRD math and consume the private
 ``_R_frd_from_cam`` / ``_offset_frd`` twins, both derived from the same FLU fields by the
-(x, −y, −z) flip, so a mount is authored in exactly one frame. The camera's own image
+(x, -y, -z) flip, so a mount is authored in exactly one frame. The camera's own image
 frame is the standard pinhole convention — x right, y down, z forward along the optical
 axis — which is camera-frame, not NED/FRD, and appears in public docstrings unchanged.
 
-Defaults model the BetaFPV C03 as flown: 64×64 policy view; 99° × 79.8° fields of view
+Defaults model the BetaFPV C03 as flown: 64x64 policy view; 99° x 79.8° fields of view
 (the real sensor undistorted then squashed to a square frame has fx ≠ fy, so the focal
-lengths are tracked separately); 25° up-tilt (``mount_pitch_deg = −25``); lens 2 cm
+lengths are tracked separately); 25° up-tilt (``mount_pitch_deg = -25``); lens 2 cm
 forward and 2 cm above the body origin.
 
 Ported from the nav-train gate renderer (validated there against MuJoCo segmentation
@@ -31,7 +31,7 @@ class CameraModel:
     Pinhole camera mounted on the drone body (FLU).
 
     The optical axis is body +x pitched by ``mount_pitch_deg`` about the body lateral
-    axis — positive tilts it DOWN, so the default −25° is the racing 25° up-tilt.
+    axis — positive tilts it DOWN, so the default -25° is the racing 25° up-tilt.
     ``fov_x_deg`` / ``fov_y_deg`` are the horizontal / vertical fields of view in degrees
     and may differ. ``offset_body`` is the lens position relative to the body origin in
     FLU metres (small; it mostly matters at very close range). The image frame is
@@ -47,7 +47,7 @@ class CameraModel:
     width: int = 64
     fov_x_deg: float = 99.0  # horizontal FOV (BetaFPV C03, undistorted)
     fov_y_deg: float = 79.8  # vertical FOV
-    mount_pitch_deg: float = -25.0  # + = optical axis down; −25 = 25° up-tilt
+    mount_pitch_deg: float = -25.0  # + = optical axis down; -25 = 25° up-tilt
     offset_body: tuple[float, float, float] = (0.02, 0.0, 0.02)  # FLU m: 2 cm fwd, 2 cm up
     supersample: int = 2
 
@@ -72,11 +72,11 @@ class CameraModel:
     @property
     def _R_frd_from_cam(self) -> jax.Array:
         """
-        3×3 rotation mapping a camera-frame vector into body FRD — the ported internal
+        3x3 rotation mapping a camera-frame vector into body FRD — the ported internal
         mount math (DESIGN.md §3a). Camera axes expressed in FRD, with downward pitch θ:
 
           right   (cam +x) = body +y                  = [0, 1, 0]
-          down    (cam +y) = forward × right          = [−sinθ, 0, cosθ]
+          down    (cam +y) = forward x right          = [-sinθ, 0, cosθ]
           forward (cam +z) = body +x tilted down by θ = [cosθ, 0, sinθ]
 
         The columns are these body-frame axis vectors.
@@ -96,10 +96,10 @@ class CameraModel:
     @property
     def R_body_from_cam(self) -> jax.Array:
         """
-        3×3 rotation mapping a camera-frame vector (x right, y down, z forward) into body
+        3x3 rotation mapping a camera-frame vector (x right, y down, z forward) into body
         FLU — the public statement of the mount. Derived from the ported FRD matrix by the
-        (x, −y, −z) row flip, so both frames read one definition. At zero pitch the
-        optical axis is exactly body +x; the default −25° pitch gives (cos 25°, 0, sin 25°).
+        (x, -y, -z) row flip, so both frames read one definition. At zero pitch the
+        optical axis is exactly body +x; the default -25° pitch gives (cos 25°, 0, sin 25°).
         """
         return self._R_frd_from_cam * jnp.array([[1.0], [-1.0], [-1.0]], jnp.float32)
 
@@ -108,7 +108,7 @@ class CameraModel:
         """
         Ray directions in the camera frame at the supersampled grid, shape
         [H·ss, W·ss, 3] (un-normalised; z = 1). Sub-pixel j maps to base-pixel coordinate
-        (j + 0.5)/ss and through the pinhole as [(u−cx)/f, (v−cy)/f, 1]; cx/cy/f are in
+        (j + 0.5)/ss and through the pinhole as [(u-cx)/f, (v-cy)/f, 1]; cx/cy/f are in
         base-pixel units. Sampling at sub-pixel centres keeps the exact left/right +
         up/down symmetry about (cx, cy).
         """

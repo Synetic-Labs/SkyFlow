@@ -149,7 +149,7 @@ def _figure_eight_course():
 
 
 def test_figure_eight_tour_progresses_active_gate_monotonically():
-    """A scripted pre→post waypoint tour advances active_gate 0 → G−1 without regression.
+    """A scripted pre→post waypoint tour advances active_gate 0 → G-1 without regression.
 
     World 0 flies the tour; world 1 stays parked to prove per-world isolation of the
     course state. Asymmetric pre/post offsets keep samples off the exact gate planes.
@@ -168,7 +168,7 @@ def test_figure_eight_tour_progresses_active_gate_monotonically():
     for wp in waypoints[1:]:
         start = path[-1]
         leg = wp - start
-        steps = max(2, int(math.ceil(np.linalg.norm(leg) / 0.2)) + 1)
+        steps = max(2, math.ceil(np.linalg.norm(leg) / 0.2) + 1)
         for t in np.linspace(0.0, 1.0, steps)[1:]:
             path.append(start + t * leg)
     path = np.asarray(path, np.float32)
@@ -213,7 +213,7 @@ def test_spawn_shapes_and_start_side(nominal_params):
     )
     assert state.active_gate.shape == (n,) and state.active_gate.dtype == jnp.int32
     assert bool(jnp.all(state.active_gate == 0)) and bool(jnp.all(state.passes == 0))
-    # podium spawn sits on the approach (−normal) side of gate 0
+    # podium spawn sits on the approach (-normal) side of gate 0
     c, nrm, _lat, _vert = _axes(gates, 0)
     signed = (np.asarray(plant[:, 0:3], np.float64) - c) @ nrm
     assert (signed < 0.0).all()

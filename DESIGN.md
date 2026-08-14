@@ -15,7 +15,7 @@ SkyFlow is a fleet-batched quadrotor **simulator** in pure JAX. It is only the s
   policy networks, checkpoints, logging frameworks, or Hydra/omegaconf. Training repos
   import SkyFlow and own all of that.
 - **Tasks are examples.** SkyFlow ships the Task protocol plus two reference tasks
-  (`hover`, `gate_course` with a figure-eight course). Real research tasks live in the
+  (`hover`, `figure_eight`). Real research tasks live in the
   consuming repo and register against the protocol.
 - Differentiability is **not claimed** in docs or API. The design avoids blockers
   (pure functions, no in-place host state on the motors path), and a `differentiable`
@@ -37,10 +37,10 @@ src/skyflow/
   sensors.py            # IMU packaging: generated imu_fn + noise/scale DR hooks (harness-side by spec charter)
   env.py                # SkyFlowEnv platform: substep scan, delay buffer, wind, pokes, ground, crash set, auto-reset
   tasks/
-    __init__.py         # registry: register_task/build_task; registers hover + gate_course
+    __init__.py         # registry: register_task/build_task; registers hover + figure_eight
     base.py             # obs helpers (world_to_body, finalize_obs), NO protocol here (protocol lives in types.py)
     hover.py            # HoverTask
-    gate_course.py      # GateCourseTask (state obs or vision obs) + gate pass/progress reward
+    gate_course.py      # GateCourseTask, registered as "figure_eight" (state or vision obs) + gate pass/progress reward
   vision/
     __init__.py
     camera.py           # CameraModel (intrinsics, mount, rays)
@@ -61,7 +61,7 @@ Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: edita
 
 ## 3. Conventions (one frame inside)
 
-- **World**: right-handed, ẑ up. Gravity −ẑ. **Body**: FLU (x forward, y left, z up).
+- **World**: right-handed, ẑ up. Gravity -ẑ. **Body**: FLU (x forward, y left, z up).
   **Quaternion**: wxyz scalar-first, Hamilton, body→world. **Units**: SI, rad/s rotor
   speeds. Identical to SkyFlow-Dynamics — states pass through untranslated.
 - NED/FRD exists in exactly two contained places: (a) inside `vision/` internals (the
@@ -192,15 +192,15 @@ Pure functions; the caller jits. **Step pipeline (order is normative):**
 2. Command map: motors mode → `u = (a+1)/2`, `Ω_c = throttle_to_omega(u, ...)`.
 3. Advance OU wind velocity (exact discretization: decay `exp(-dt/τ)` + kick).
 4. Poke sampling: with prob `poke_prob` per control step draw world-frame `F_ext` and
-   body `τ_ext` (uniform ball × magnitudes); else zeros. These pass through the backend's
+   body `τ_ext` (uniform ball · magnitudes); else zeros. These pass through the backend's
    exogenous inputs — never write velocity state directly.
 5. `lax.scan` over `decimation` substeps: `plant = dynamics.substep(...)` (ZOH on Ω_c,
    wind, F_ext, τ_ext) then ground contact (§8).
 6. Airborne latch; crash set: flyaway (|x|,|y| > bounds_xy, z > bounds_z, speed >
-   max_speed, rate > max_rate), ground crash (z < 0.05 ∧ airborne ∧ (descent > 1 m/s ∨
+   max_speed, rate > max_rate), ground crash (z < 0.05 and airborne and (descent > 1 m/s or
    tilt > limit)). Task `evaluate` on (prev_plant, plant): reward, success, task crash.
-7. `terminated = crash ∨ task_crash ∨ (success ∧ success_terminates)`;
-   `truncated = steps ≥ max_episode_steps ∨ stuck`; `done = terminated ∨ truncated`.
+7. `terminated = crash or task_crash or (success and success_terminates)`;
+   `truncated = steps ≥ max_episode_steps or stuck`; `done = terminated or truncated`.
 8. Observe: `imu = sensors.measure(...)`; `obs, task_state = task.observe(...)`.
 9. Auto-reset in-jit: for done worlds — fresh spawn (task), fresh params (DR), fresh
    delay draw, cleared buffers/wind, re-observe with `fresh_spawn=True`; blend all state
@@ -209,7 +209,7 @@ Pure functions; the caller jits. **Step pipeline (order is normative):**
 10. Episode bookkeeping EMAs for `metrics`: on the pre-reset done rows, update the
     SimState EMA leaves (§4) — outcome fractions (crash / success-at-end / pure
     truncation) and completed-episode return/length — with the done-row means, decayed
-    `0.99` per completed episode (`α = 0.99^n_done`; no-op when nothing finished).
+    `0.99` per completed episode (`alpha = 0.99^n_done`; no-op when nothing finished).
     EMAs start at 0 after `reset` and warm up from there.
 
 ## 8. Ground contact (harness bookkeeping, not physics)
@@ -224,13 +224,14 @@ the spec later.
 **hover** — spawn on ground pad (motors near idle) with jittered XY; goal setpoint drawn
 in a box, resampled every `goal_hold_s`; obs = `[rel_pos(3), vel(3), rot_matrix(9),
 last_action(4)]` = 19, with optional uniform obs noise; reward per control step:
-`w_pos·exp(-3·d) + w_hold·exp(-50·d) − w_vel·|v| − w_rate·|ω| + progress(d_prev² − d²)`;
+`w_pos·exp(-3·d) + w_hold·exp(-50·d) - w_vel·|v| - w_rate·|ω| + progress(d_prev² - d²)`;
 success `d < 0.1 m` (does not terminate); task crash: leaving the safe box.
 
-**gate_course** — course = `GateSet` from `vision/gates.py`; ships `figure_eight(...)`
-builder (lemniscate of Bernoulli through 2·k gates, alternating crossing directions at the
+**figure_eight** — the registered name of the generic `GateCourseTask`; course = `GateSet`
+from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder (lemniscate
+of Bernoulli through 2·k gates, alternating crossing directions at the
 center). Spawn: podium behind gate 1 or spread across gates (curriculum knob). Active-gate
-progress: `r = w_prog·(d_prev − d)` toward the pre-gate point + pass credit
+progress: `r = w_prog·(d_prev - d)` toward the pre-gate point + pass credit
 `w_gate·centering` on crossing (from `classify_crossings`; miss/frame-hit = task crash),
 minus rate penalty. Obs (state mode): `[gate_rel(3), gate_normal(3), next_gate_rel(3),
 vel_body(3), rot_matrix(9), last_action(4)]`; vision mode replaces the gate blocks with
@@ -243,7 +244,7 @@ Reward constants live in task kwargs with the shipped defaults; no reward code i
 cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration): package
 `cudaflight`, no core deps; sensor input per 1 kHz tick = f32 [F,7] NED/FRD
 `[gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)]` (level hover ⇒
-az = −9.81); sticks f32 [F,4] AETR in [−1,1]; output motors f32 [F,4] in [0,1] QUADX
+az = -9.81); sticks f32 [F,4] AETR in [-1,1]; output motors f32 [F,4] in [0,1] QUADX
 order + armed u8 [F]; GPU fleet needs n ≥ 3 and the in-jit FFI half currently lives in
 nav-train (cudaflight will absorb it on open-sourcing); CPU SITL (`libcpuflight.so`,
 ctypes + `io_callback(ordered=True)`) is self-contained, works for any fleet size, jits
@@ -286,7 +287,7 @@ cudaflight importable → ImportError with install guidance at construction.
 - `test_ground.py` — no penetration; resting vehicle stays; spawned-on-pad hover task
   takes off under full throttle.
 - `test_tasks.py` — hover: spawn/obs/reward shapes, reward increases as distance falls;
-  gate_course: scripted straight-line fly-through registers pass exactly once, centering
+  figure_eight (GateCourseTask): scripted straight-line fly-through registers pass exactly once, centering
   ∈ (0,1]; miss trajectory → crash; figure-eight builder: 2k gates, closed loop, gate
   normals alternate through the crossover.
 - `test_vision.py` — camera ray invariants (center pixel = optical axis, FOV edges);

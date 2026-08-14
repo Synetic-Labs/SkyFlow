@@ -38,7 +38,7 @@ def hover_throttle(airframe) -> tuple[float, float]:
     """(u_hover, g): throttle that balances weight, from the airframe's spec row.
 
     Ω_h = √(m·g / Σct2); the Crazyflie command map is linear (throttle_k = 1), so
-    u = (Ω_h − Ω_min)/(Ω_max − Ω_min)."""
+    u = (Ω_h - Ω_min)/(Ω_max - Ω_min)."""
     v = airframe.values
     g = float(v["grav"])
     omega_h = float(np.sqrt(v["mass"] * g / sum(v["ct2"])))
@@ -49,7 +49,7 @@ def hover_throttle(airframe) -> tuple[float, float]:
 
 
 def pd_action(obs: np.ndarray, omega: np.ndarray, u_hover: float, g: float) -> np.ndarray:
-    """[F,4] motor actions in [−1,1] from hover obs [rel_pos, vel, rot_matrix, ...]."""
+    """[F,4] motor actions in [-1,1] from hover obs [rel_pos, vel, rot_matrix, ...]."""
     rel, vel = obs[:, 0:3], obs[:, 3:6]
     rot = obs[:, 6:15].reshape(-1, 3, 3)  # body→world
 
@@ -69,15 +69,15 @@ def pd_action(obs: np.ndarray, omega: np.ndarray, u_hover: float, g: float) -> n
     u_coll = u_hover * np.sqrt(a_norm[:, 0] / g)
     mix = (
         Y_SIGN[None, :] * att[:, 0:1]  # +τx: raise the +y (left) rotors
-        - X_SIGN[None, :] * att[:, 1:2]  # +τy: raise the −x (rear) rotors
-        - SPIN[None, :] * att[:, 2:3]  # +τz: raise the CW (spin −1) rotors
+        - X_SIGN[None, :] * att[:, 1:2]  # +τy: raise the -x (rear) rotors
+        - SPIN[None, :] * att[:, 2:3]  # +τz: raise the CW (spin -1) rotors
     )
     u = np.clip(u_coll[:, None] + mix, 0.0, 1.0)
     return 2.0 * u - 1.0
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[1])
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[1])
     ap.add_argument("--seconds", type=float, default=3.0, help="flight time, s")
     ap.add_argument("--fleet", type=int, default=4, help="number of worlds")
     ap.add_argument("--seed", type=int, default=0, help="reset PRNG seed")
@@ -100,12 +100,12 @@ def main() -> None:
     print(f"  goal[0] = {goal[0].round(2)}, initial error {np.linalg.norm(np.asarray(obs)[:, 0:3], axis=-1).mean():.2f} m")
 
     jstep = jax.jit(env.step)
-    n_steps = int(round(args.seconds * cfg.control_hz))
+    n_steps = round(args.seconds * cfg.control_hz)
     for t in range(1, n_steps + 1):
         action = pd_action(
             np.asarray(obs), np.asarray(state.plant[:, 10:13]), u_hover, g
         )
-        obs, state, reward, done, info = jstep(state, jnp.asarray(action))
+        obs, state, _reward, done, _info = jstep(state, jnp.asarray(action))
         if bool(done.any()):
             raise SystemExit(f"episode ended early at step {t} — controller diverged")
         if t % int(cfg.control_hz / 2) == 0:

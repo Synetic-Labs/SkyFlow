@@ -52,12 +52,17 @@ packages = ["src/skyflow"]
 testpaths = ["tests"]
 addopts = "-ra"
 
+[tool.pyright]
+include = ["src", "tests", "examples"]
+venvPath = "."
+venv = ".venv"
+
 [tool.ruff]
 line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B"]
+select = ["E", "F", "W", "I", "UP", "B", "RUF"]
 ignore = [
     "E501",   # long lines: this codebase documents physics inline and wraps by meaning
     "E741",   # `l`/`I` as names: the dynamics follow the paper's notation

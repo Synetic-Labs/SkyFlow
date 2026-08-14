@@ -16,10 +16,10 @@ Step pipeline (order is normative, DESIGN.md §7):
 
  1. split the key; push the action into the delay ring, read the delayed action per world
  2. command map (motors mode: u = (a+1)/2 → verified throttle curve → Ω_c)
- 3. OU wind velocity advance (exact discretization: decay exp(−dt/τ) + matched kick)
+ 3. OU wind velocity advance (exact discretization: decay exp(-dt/τ) + matched kick)
  4. poke sampling (world-frame F_ext, body τ_ext through the backend's exogenous inputs —
     velocity state is never written directly)
- 5. `decimation` × [generated substep + ground contact §8], all inputs zero-order-held
+ 5. `decimation` x [generated substep + ground contact §8], all inputs zero-order-held
     (sticks mode re-derives Ω_c from the firmware every 1 kHz substep, §10)
  6. airborne latch; env crash set; task `evaluate` on the transition
  7. terminated / truncated / done
@@ -31,13 +31,11 @@ Step pipeline (order is normative, DESIGN.md §7):
     `_METRICS_EMA_DECAY` per completed episode; no-op when nothing finished
 """
 
-from __future__ import annotations
-
 import inspect
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -127,7 +125,7 @@ class _FirmwareCarry(NamedTuple):
 
 
 def _uniform_ball(key: Array, n: int) -> Array:
-    """[n,3] f32 points uniform in the unit ball (direction × radius^(1/3) law)."""
+    """[n,3] f32 points uniform in the unit ball (direction · radius^(1/3) law)."""
     k_dir, k_r = jax.random.split(key)
     v = jax.random.normal(k_dir, (n, 3), jnp.float32)
     v = v / jnp.maximum(jnp.linalg.norm(v, axis=-1, keepdims=True), 1e-6)
@@ -179,12 +177,13 @@ class SkyFlowEnv:
     truncated), so training code never sees a dead state.
 
     Exposes `fleet`, `obs_spec`, `obs_dim`, `act_dim` (=4), `image_shape`, `decimation`,
-    `dt_control` and `dt_physics`. Actions are [F,4] in [−1,1] (clipped defensively):
+    `dt_control` and `dt_physics`. Actions are [F,4] in [-1,1] (clipped defensively):
     motor throttles in motors mode, AETR sticks in sticks mode (§10).
 
-    info extras beyond the StepInfo contract, all [F]: `poke_active` (this step's poke
-    draw) and `ep_return`/`ep_len` (pre-reset episode accumulators, valid on done rows —
-    SimState has no post-hoc episode storage, so done-step stats surface here).
+    info keys beyond the pre-reset flags and observation, all [F]: `poke_active` (this
+    step's poke draw) and `ep_return`/`ep_len` (pre-reset episode accumulators, valid on
+    done rows — SimState has no post-hoc episode storage, so done-step stats surface
+    here), plus whatever the task's `evaluate` info carries.
     """
 
     def __init__(
@@ -370,6 +369,7 @@ class SkyFlowEnv:
             ts_in, blob, fwstate = state.task_state
         else:
             ts_in = state.task_state
+            blob = fwstate = None  # never read in motors mode
 
         # 1. Keys; delay ring (newest first) and the per-world delayed command.
         k_carry, k_wind, k_gate, k_poke_f, k_poke_tau, k_obs, k_reset = jax.random.split(
@@ -388,7 +388,7 @@ class SkyFlowEnv:
         )
 
         # 4. Pokes: exogenous inputs only — the backend integrates them, velocity state
-        # is never written. Uniform-ball direction × configured magnitude ceiling.
+        # is never written. Uniform-ball direction · configured magnitude ceiling.
         poke = jax.random.bernoulli(k_gate, cfg.poke_prob, (f,))
         f_ext = jnp.where(poke[:, None], cfg.poke_force_n * _uniform_ball(k_poke_f, f), 0.0)
         tau_ext = jnp.where(
@@ -404,7 +404,7 @@ class SkyFlowEnv:
                 jnp.float32
             )
 
-            def substep(carry, _):
+            def substep_motors(carry, _):
                 plant, impact = carry
                 raw = dynamics.substep(
                     plant, omega_cmd, wind_vel, f_ext, tau_ext, state.params,
@@ -414,14 +414,16 @@ class SkyFlowEnv:
                 return (_ground_contact(raw), impact), None
 
             (plant, impact), _ = jax.lax.scan(
-                substep, (state.plant, jnp.zeros(f, bool)), None, length=self.decimation
+                substep_motors, (state.plant, jnp.zeros(f, bool)), None, length=self.decimation
             )
             omega_last = omega_cmd
         else:
             # Sticks (§10, normative substep order): synth FRD sensors from the generated
             # IMU + isothermal baro → firmware tick → QUADX motors reordered by
             # motor_perm → duties feed the throttle map as u, ZOH for this 1 ms substep.
-            def substep(carry, _):
+            fw = self._fw
+
+            def substep_sticks(carry, _):
                 plant, blob, fwstate, omega_prev, impact = carry
                 accel, gyro = sensors.measure(plant, omega_prev, wind_vel, state.params)
                 rows = jnp.concatenate(
@@ -432,7 +434,7 @@ class SkyFlowEnv:
                     ],
                     axis=-1,
                 )
-                blob, fwstate, motors, _armed = self._fw.fw_step(blob, fwstate, delayed, rows)
+                blob, fwstate, motors, _armed = fw.fw_step(blob, fwstate, delayed, rows)
                 u = motors[:, self._motor_perm]
                 omega_cmd = dynamics.throttle_to_omega(u, w_min, w_max, k_thr).astype(
                     jnp.float32
@@ -446,7 +448,7 @@ class SkyFlowEnv:
 
             init = (state.plant, blob, fwstate, state.plant[:, 13:17], jnp.zeros(f, bool))
             (plant, blob, fwstate, omega_last, impact), _ = jax.lax.scan(
-                substep, init, None, length=self.decimation
+                substep_sticks, init, None, length=self.decimation
             )
 
         # 6. Airborne latch; env crash set; task verdict on the transition.
@@ -561,15 +563,19 @@ class SkyFlowEnv:
             ep_len_ema=ep_len_ema,
             **merged,
         )
-        info: StepInfo = {
-            **ev.info,
-            "terminated": terminated,
-            "truncated": truncated,
-            "final_obs": obs,
-            "poke_active": poke,
-            "ep_return": ep_return,
-            "ep_len": ep_len,
-        }
+        # cast: the task's ev.info keys ride along beyond the typed StepInfo contract.
+        info = cast(
+            "StepInfo",
+            {
+                **ev.info,
+                "terminated": terminated,
+                "truncated": truncated,
+                "final_obs": obs,
+                "poke_active": poke,
+                "ep_return": ep_return,
+                "ep_len": ep_len,
+            },
+        )
         return obs_out, state_out, reward, done, info
 
     def metrics(self, state: SimState) -> dict[str, Array]:

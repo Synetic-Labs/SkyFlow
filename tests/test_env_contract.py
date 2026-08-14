@@ -68,7 +68,7 @@ def test_reset_shapes_dtypes_finiteness(key):
 
 def test_step_shapes_dtypes_and_info(key):
     env = make_env()
-    obs0, state = env.reset(key)
+    _, state = env.reset(key)
     obs, state, reward, done, info = env.step(state, _actions(key, 1, FLEET)[0])
     assert obs.shape == (FLEET, 19) and obs.dtype == jnp.float32
     assert bool(jnp.all(jnp.isfinite(obs)))
@@ -286,15 +286,16 @@ def test_final_obs_is_the_pre_reset_observation(key):
     obs_a, state_a = env_a.reset(key)
     obs_b, state_b = env_b.reset(key)
     np.testing.assert_array_equal(np.asarray(obs_a), np.asarray(obs_b))
-    for t, a in enumerate(acts, start=1):
+    for a in acts[:-1]:
         obs_a, state_a, _, done_a, info_a = env_a.step(state_a, a)
         obs_b, state_b, _, done_b, _ = env_b.step(state_b, a)
-        if t < 4:
-            assert not bool(done_a.any())
-            # no reset ⇒ the returned obs IS the pre-reset obs
-            np.testing.assert_array_equal(
-                np.asarray(info_a["final_obs"]), np.asarray(obs_a)
-            )
+        assert not bool(done_a.any())
+        # no reset ⇒ the returned obs IS the pre-reset obs
+        np.testing.assert_array_equal(
+            np.asarray(info_a["final_obs"]), np.asarray(obs_a)
+        )
+    obs_a, state_a, _, done_a, info_a = env_a.step(state_a, acts[-1])
+    obs_b, state_b, _, done_b, _ = env_b.step(state_b, acts[-1])
     assert bool(done_a.all()) and not bool(done_b.any())
     np.testing.assert_array_equal(np.asarray(info_a["final_obs"]), np.asarray(obs_b))
     # while the returned obs is the fresh spawn's, not the dead state's
@@ -344,11 +345,10 @@ def test_jitted_50_step_rollout_no_nan_no_retrace(key):
     acts = _actions(jax.random.PRNGKey(21), 50, 8)
     obs, state = env.reset(key)
     for a in acts:
-        obs, state, reward, done, info = jstep(state, a)
-        assert bool(jnp.all(jnp.isfinite(obs)))
+        obs, state, reward, _done, _info = jstep(state, a)
+        assert bool(jnp.all(jnp.isfinite(obs))) and bool(jnp.all(jnp.isfinite(reward)))
     assert len(traces) == 1, f"env.step retraced: {len(traces)} traces for 50 calls"
     assert bool(jnp.all(jnp.isfinite(state.plant)))
-    assert bool(jnp.all(jnp.isfinite(reward)))
 
 
 # -- construction guards ------------------------------------------------------------------------
@@ -437,7 +437,7 @@ def test_sticks_pipeline_with_injected_fleet(key):
 
     # Throttle stick high → fake fleet outputs duty 1.0 → rotors spin up immediately.
     sticks = jnp.tile(jnp.asarray([0.0, 0.0, 1.0, 0.0], jnp.float32), (fleet, 1))
-    obs, state, reward, done, info = env.step(state, sticks)
+    obs, state, reward, _done, _info = env.step(state, sticks)
     assert obs.shape == (fleet, 19) and reward.shape == (fleet,)
     assert bool(jnp.all(state.plant[:, 13:17] > 0.0))
     # the firmware ticked once per 1 kHz substep

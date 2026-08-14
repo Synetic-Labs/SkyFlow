@@ -42,7 +42,7 @@ def test_flu_to_frd_batched_involution_and_dtype():
     out = flu_to_frd(v)
     assert out.shape == (5, 3) and out.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(flu_to_frd(out)), np.asarray(v))  # own inverse
-    # Level hover: generated-IMU specific force (0, 0, +g) in FLU becomes az = −g in FRD.
+    # Level hover: generated-IMU specific force (0, 0, +g) in FLU becomes az = -g in FRD.
     frd = flu_to_frd(jnp.array([0.0, 0.0, 9.81], jnp.float32))
     np.testing.assert_array_equal(
         np.asarray(frd),
@@ -118,10 +118,11 @@ def test_protocol_conformance(cpu_fleet):
 
 def test_hover_smoke_100_ticks_jitted(cpu_fleet):
     sticks, sensors = _hover_inputs()
-    assert np.asarray(sensors[:, 5] == -9.81).all()  # level hover ⇒ az = −9.81 (FRD)
+    assert np.asarray(sensors[:, 5] == -9.81).all()  # level hover ⇒ az = -9.81 (FRD)
 
     step = jax.jit(cpu_fleet.fw_step)  # ordered io_callback must survive jit
     blob, fwstate = cpu_fleet.fresh_firmware_state()
+    m = np.zeros((FLEET, 4), np.float32)
     for _ in range(100):
         blob, fwstate, motors, armed = step(blob, fwstate, sticks, sensors)
         m = np.asarray(motors)

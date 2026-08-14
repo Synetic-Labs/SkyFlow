@@ -11,7 +11,7 @@ repos implement against, and SimState is the single pytree the env scans.
 """
 
 import dataclasses
-from typing import Any, NamedTuple, Protocol, TypedDict
+from typing import Any, NamedTuple, Protocol, Self, TypedDict
 
 import jax
 
@@ -60,19 +60,24 @@ class TaskEval(NamedTuple):
 
 class StepInfo(TypedDict):
     """
-    Info returned by env.step. The fixed keys are the PRE-auto-reset flags and
-    observation; the task's `evaluate` info merges in as additional [F] entries.
+    Info returned by env.step. The fixed keys are the PRE-auto-reset flags, observation
+    and episode bookkeeping; the task's `evaluate` info merges in as additional [F]
+    entries (open by design — TypedDict cannot express the extra keys, so the env casts
+    at the merge site).
     """
 
-    terminated: Array  # [F] bool — crash ∨ task crash ∨ (success ∧ success_terminates)
+    terminated: Array  # [F] bool — crash or task crash or (success and success_terminates)
     truncated: Array  # [F] bool — episode-length / stuck cutoff
     final_obs: Array  # [F, obs_dim] f32 — observation before any auto-reset blend
+    poke_active: Array  # [F] bool — this step's poke Bernoulli draw
+    ep_return: Array  # [F] f32 — pre-reset episode return, valid on done rows
+    ep_len: Array  # [F] int32 — pre-reset episode length, valid on done rows
 
 
 class Task(Protocol):
     """
     A task decides what the vehicle attempts and senses (DESIGN.md §4, §9). SkyFlow ships
-    `hover` and `gate_course` as examples; research tasks live in consuming repos and
+    `hover` and `figure_eight` as examples; research tasks live in consuming repos and
     register against this protocol. All methods are pure and jit/vmap-safe.
     """
 
@@ -109,8 +114,8 @@ class FirmwareFleet(Protocol):
     """
     Betaflight-fleet seam for control="sticks" (DESIGN.md §10). Ticked at 1 kHz. Frames
     at this boundary only are NED/FRD: sensor rows f32 [F,7] = gyro_FRD rad/s (3),
-    specific force FRD m/s² (3) (level hover ⇒ az = −9.81), baro Pa (1); sticks f32 [F,4]
-    AETR in [−1,1]; motors f32 [F,4] in [0,1] QUADX order; armed u8 [F]. `blob` is the
+    specific force FRD m/s² (3) (level hover ⇒ az = -9.81), baro Pa (1); sticks f32 [F,4]
+    AETR in [-1,1]; motors f32 [F,4] in [0,1] QUADX order; armed u8 [F]. `blob` is the
     implementation's opaque device/host handle, `fwstate` its per-world pytree.
     """
 
@@ -163,6 +168,6 @@ class SimState:
     ep_len_ema: Array  # 0-d f32 — EMA of completed-episode length, control steps
     task_state: Any  # opaque task pytree
 
-    def replace(self, **updates: Any) -> "SimState":
+    def replace(self, **updates: Any) -> Self:
         """New SimState with the given leaves swapped (dataclasses.replace)."""
         return dataclasses.replace(self, **updates)

@@ -1,7 +1,7 @@
 """
 Task registry (DESIGN.md §2): the name → builder map behind `SimConfig.task`.
 
-SkyFlow ships two reference tasks — `hover` and `gate_course` — registered here at
+SkyFlow ships two reference tasks — `hover` and `figure_eight` — registered here at
 import; research tasks live in consuming repos and register against the same protocol
 (`skyflow.types.Task`), which makes them first-class: the env reaches every task through
 `build_task`, and nothing special-cases the built-ins. Builders receive
@@ -55,4 +55,4 @@ def build_task(name: str, **kwargs) -> Task:
 
 
 register_task("hover", HoverTask)
-register_task("gate_course", GateCourseTask)
+register_task("figure_eight", GateCourseTask)
