@@ -1,11 +1,9 @@
 # SkyFlow
 
-An accurate and fast quadrotor simulator in JAX. Fully compiled for a pure GPU environment training simulation.
+An accurate and fast quadrotor simulator in JAX. Advanced physics, massive parallel training.
 
-The physics dynamics is generated from the separate repo here:
-[SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics).
-This maintains the symbolic spec, where each term is verified against published sources and per backend.
-SkyFlow is the harness around that plant and inherits from it.
+The dynamics is generated from the [SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics).
+That maintains the symbolic spec, and SkyFlow is the harness.
 
 ```python
 import jax
@@ -20,11 +18,6 @@ step = jax.jit(env.step)  # pure functions — the caller jits
 action = jnp.zeros((env.fleet, env.act_dim))  # [F,4] in [-1,1]
 obs, state, reward, done, info = step(state, action)
 ```
-
-Every world steps together, nothing leaves the device, and done worlds respawn in-jit:
-the pre-reset observation and flags come back through `info["final_obs"]` /
-`info["terminated"]` / `info["truncated"]`, so a training loop never sees a dead state.
-
 ## What it is
 
 ### Environment
@@ -44,15 +37,12 @@ The built-in airframe is the spec's Crazyflie reference row;
 
 `figure_eight` in vision mode renders analytic ray-cast coverage masks of the gate
 frames directly from pose — no rasterizer, no host round-trip, batched over the fleet
-inside jit. `skyflow.vision.mask_noise` corrupts the clean render with the artifact families;
-branding holes, occluders, glow, speckle.
+inside jit.
 
 ### firmware in the loop
 
 A stick-level policy can fly through Betaflight, `control="sticks"` closes
-the loop through the real firmware (the `cudaflight` SITL, `firmware` extra): AETR
-sticks in, per-motor duties out, ticked at 1 kHz inside the substep scan. `control="motors"`
-is pure raw motor output.
+the loop through the real firmware (the `cudaflight` SITL, `firmware` extra)
 
 ## Install
 
@@ -62,13 +52,25 @@ uv sync --extra cuda        # CUDA 13 wheels for JAX
 uv sync --extra firmware    # + cudaflight for control="sticks"
 ```
 
-Requires Python 3.12+. Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[jax]`.
+Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[jax]`.
+
+## Performance
+
+Single-vehicle fleets on an NVIDIA RTX 4090:
+
+| worlds | physics steps/s | env steps/s |
+|---|---|---|
+| 64 | 1.3 M | 107 K |
+| 1024 | 23.7 M | 2.0 M |
+| 16384 | 487 M | 22.5 M |
+| 65536 | 1.08 B | 35.5 M |
+
+Physics steps are bare RK4 substeps of the plant at 1 kHz. 
+Env steps are 100 Hz control with observation, reward, termination, and in-jit reset.
 
 ## Tasks
 
-`hover` and `figure_eight` ship as reference tasks. `figure_eight` is the generic
-`GateCourseTask` flying its default figure-eight course; any `GateSet` passes through
-`task_kwargs`. Implement the `Task` protocol from `skyflow.types` and register a builder:
+`hover` and `figure_eight` ship as reference tasks.
 
 ```python
 from skyflow import SimConfig, SkyFlowEnv, register_task
@@ -77,27 +79,6 @@ register_task("my_task", MyTask)
 env = SkyFlowEnv(SimConfig(num_envs=1024, task="my_task", task_kwargs={...}))
 ```
 
-The env only ever reaches a task through the protocol, so a registered task is a
-first-class citizen.`task_kwargs` passes to the builder unmodified; 
-the env-owned `spawn_dr_scale` and `control_hz` are forwarded to builders that name them.
-
-Course geometry for gate tasks lives in `skyflow.vision.gates`: `from_waypoints` takes
-z-up world rows, and `line`/`circle`/`figure_eight` generate the standard shapes.
-
-## Conventions
-
-World frame right-handed z-up; body FLU; quaternions wxyz scalar-first Hamilton body→world;
- SI units, rotor speeds in rad/s. Every array the env creates is float32 with the fleet axis
-`[F, ...]` leading. NED/FRD used only inside `vision/` internals and for firmware sensor.
-
-## Development
-
-```bash
-uv run pytest -q         # full suite, CPU, deterministic keys
-uv run ruff check .
-uv run python examples/fly_hover.py
-uv run python examples/fly_figure_eight.py --save-masks 6
-```
 
 ## Credits
 
