@@ -206,12 +206,14 @@ class FlightLog:
         chans = dict(channels or {})
         if reward is not None:
             chans.setdefault("reward", reward)
+        # index BEFORE np.asarray: the gather happens device-side, so only the watch
+        # rows cross to the host — never a fleet-sized array
         for name, values in chans.items():
-            self._channels.setdefault(name, []).append(np.asarray(values)[idx])
+            self._channels.setdefault(name, []).append(np.asarray(values[idx]))
         for p in self._bind_paths:
             val = self._resolve_path(state, p)
             if val is not None:
-                self._binds.setdefault(p, []).append(np.asarray(val)[idx])
+                self._binds.setdefault(p, []).append(np.asarray(val[idx]))
 
     def extend(
         self,
