@@ -33,6 +33,7 @@ Step pipeline (order is normative, DESIGN.md §7):
 
 import inspect
 import math
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple, cast
@@ -72,6 +73,7 @@ class SimConfig:
     task_kwargs: dict = field(default_factory=dict)
     airframe: str = "crazyflie"
     control: str = "motors"  # "motors" | "sticks" (DESIGN.md §10)
+    firmware: str = "auto"  # sticks backend: "auto" | "cpu" | "gpu" (DESIGN.md §10)
     control_hz: float = 100.0
     physics_hz: float = 1000.0  # sticks mode requires exactly 1000 (§10: 1 kHz fw tick)
     differentiable: bool = False  # raises NotImplementedError("planned") if True
@@ -200,10 +202,12 @@ class SkyFlowEnv:
           task: pre-built Task instance; None builds `cfg.task` through the
             `skyflow.tasks` registry with `cfg.task_kwargs` (forwarding the env-owned
             `spawn_dr_scale` and `control_hz` to builders that name them).
-          firmware_fleet: injected `types.FirmwareFleet` for control="sticks" — this is
-            how nav-train plugs its GPU fleet in. None constructs the self-contained
-            `firmware.CpuFirmwareFleet`, which raises ImportError with install guidance
-            when the cudaflight wheel is absent (§10). Motors mode ignores it.
+          firmware_fleet: injected `types.FirmwareFleet` for control="sticks",
+            overriding `cfg.firmware`. None builds the backend `cfg.firmware` selects
+            (§10): "cpu"/"gpu" force one, "auto" picks the GPU fleet when fleet >= 3
+            and a CUDA device is visible, else the CPU SITL fleet. Construction raises
+            ImportError with install guidance when the cudaflight wheel is absent.
+            Motors mode ignores it.
           motor_perm: sticks mode only — sim rotor i takes firmware motor
             `motor_perm[i]`. The default maps Betaflight QUADX output order
             (RR, FR, RL, FL) onto the built-in airframes' rotor order (FL, FR, RR, RL).
@@ -258,8 +262,8 @@ class SkyFlowEnv:
 
             self._flu_to_frd = _firmware.flu_to_frd
             self._baro_pa = _firmware.baro_pa
-            fw = firmware_fleet if firmware_fleet is not None else _firmware.CpuFirmwareFleet(
-                self.fleet
+            fw = firmware_fleet if firmware_fleet is not None else self._build_fleet(
+                cfg, _firmware
             )
             if fw.act_dim != self.act_dim:
                 raise ValueError(f"firmware fleet act_dim {fw.act_dim} != {self.act_dim}")
@@ -268,6 +272,37 @@ class SkyFlowEnv:
                 raise ValueError(f"motor_perm must permute (0,1,2,3), got {motor_perm!r}")
             self._fw = fw
             self._motor_perm = jnp.asarray(perm, jnp.int32)
+
+    def _build_fleet(self, cfg: SimConfig, _firmware: Any) -> FirmwareFleet:
+        """cfg.firmware → a FirmwareFleet (DESIGN.md §10).
+
+        "cpu"/"gpu" force a backend and fail loudly. "auto" picks the GPU fleet when
+        `fleet >= 3` and a CUDA device is visible, and falls back to the CPU SITL
+        fleet with a warning when GPU construction fails (wheel too old, no VRAM, …).
+        """
+        if cfg.firmware not in ("auto", "cpu", "gpu"):
+            raise ValueError(
+                f'cfg.firmware must be "auto", "cpu" or "gpu", got {cfg.firmware!r}'
+            )
+        if cfg.firmware == "cpu":
+            return _firmware.CpuFirmwareFleet(self.fleet)
+        if cfg.firmware == "gpu":
+            return _firmware.GpuFirmwareFleet(self.fleet)
+        try:
+            gpu_visible = bool(jax.devices("gpu"))
+        except RuntimeError:
+            gpu_visible = False
+        if self.fleet >= 3 and gpu_visible:
+            try:
+                return _firmware.GpuFirmwareFleet(self.fleet)
+            except Exception as e:  # ImportError (wheel < 0.3.3), RuntimeError (create)
+                warnings.warn(
+                    f'firmware="auto": GPU fleet unavailable ({e}); '
+                    "using the CPU SITL fleet",
+                    RuntimeWarning,
+                    stacklevel=3,
+                )
+        return _firmware.CpuFirmwareFleet(self.fleet)
 
     @staticmethod
     def _build_task(cfg: SimConfig) -> Task:

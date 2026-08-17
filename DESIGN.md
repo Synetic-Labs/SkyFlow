@@ -69,7 +69,7 @@ tests/                  # pytest; §11 lists the required suites
 
 Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: the public git
 URL; was an editable sibling path before publication). Extras: `cuda` → `jax[cuda13]`;
-`firmware` → `cudaflight` (public GitHub release-wheel URL source); `viz` → nothing but
+`firmware` → `cudaflight>=0.3.3` (public GitHub release-wheel URL source); `viz` → nothing but
 `pygame-ce>=2.5` (§13; the maintained fork, imports as `pygame`). Dev group: `pytest>=9`,
 `ruff>=0.16`. License MIT. Version 0.2.0.
 
@@ -175,6 +175,7 @@ class SimConfig:
     task: str = "hover"; task_kwargs: dict = field(default_factory=dict)
     airframe: str = "crazyflie"
     control: str = "motors"            # "motors" | "sticks" (§10)
+    firmware: str = "auto"             # sticks backend: "auto" | "cpu" | "gpu" (§10)
     control_hz: float = 100.0          # physics fixed at physics_hz
     physics_hz: float = 1000.0         # sticks mode requires exactly 1000 (§10: 1 kHz firmware tick)
     differentiable: bool = False       # raises NotImplementedError("planned") if True
@@ -261,14 +262,15 @@ Reward constants live in task kwargs with the shipped defaults; no reward code i
 ## 10. firmware.py — control="sticks"
 
 cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration; Python API
-unchanged through v0.3.2): package
+additive through v0.3.3): package
 `cudaflight`, no core deps; sensor input per 1 kHz tick = f32 [F,7] NED/FRD
 `[gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)]` (level hover ⇒
 az = -9.81); sticks f32 [F,4] AETR in [-1,1]; output motors f32 [F,4] in [0,1] QUADX
-order + armed u8 [F]; GPU fleet needs n ≥ 3 and the in-jit FFI half currently lives in
-nav-train (cudaflight is public now but does not yet ship it); CPU SITL (`libcpuflight.so`,
-ctypes + `io_callback(ordered=True)`) is self-contained, works for any fleet size, jits
-but is not vmappable/replayable.
+order + armed u8 [F]; GPU fleet needs n ≥ 3 and, since v0.3.3, the wheel ships its
+in-jit FFI half — the `cudaflight.xla` module + prebuilt XLA handlers
+(`_data/libcudaflight_xla.so`, source fallback compiled on demand). CPU SITL
+(`libcpuflight.so`, ctypes + `io_callback(ordered=True)`) is self-contained, works for
+any fleet size, jits but is not vmappable/replayable.
 
 SkyFlow therefore ships:
 - `types.FirmwareFleet` protocol: `act_dim`, `fresh_firmware_state() -> (blob, fwstate)`,
@@ -276,10 +278,18 @@ SkyFlow therefore ships:
   armed [F] u8)`, `reset(blob, fwstate, mask u8[F]) -> (blob, fwstate)`, `close()`.
 - `firmware.CpuFirmwareFleet` — full implementation via ctypes on the cudaflight wheel
   (`cudaflight.lib.load_cpu`), `io_callback(ordered=True)`, zero-length blob placeholders.
-- `firmware.GpuFirmwareFleet` — raises NotImplementedError pointing at cudaflight's
-  pending FFI absorption; the constructor documents the exact contract it will implement.
-- Injection: `SkyFlowEnv(cfg, firmware_fleet=...)` accepts any FirmwareFleet — nav-train
-  plugs its existing GPU fleet in today.
+- `firmware.GpuFirmwareFleet` — full implementation via `cudaflight.xla` (>= 0.3.3):
+  in-jit pure step/reset custom calls, firmware state GENUINELY value-threaded as
+  donated (blob, fwstate) uint8 buffers copied from the armed-on-ground snapshot;
+  `fleet >= 3`; one handle = one device = `fleet` worlds; requires
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false` before jax touches the GPU (the constructor
+  sets it best-effort and touches the target device first so XLA claims the primary
+  CUDA context).
+- Backend selection (`SimConfig.firmware`): `"cpu"` / `"gpu"` force a backend and fail
+  loudly; `"auto"` (default) picks GPU when `fleet >= 3` and a CUDA device is visible,
+  falling back to CPU with a `warnings.warn` when GPU construction fails.
+- Injection: `SkyFlowEnv(cfg, firmware_fleet=...)` accepts any FirmwareFleet and
+  overrides `cfg.firmware`.
 
 Sticks substep order (normative, from the verified nav-train sequence): synth sensors
 (FLU→FRD flip; baro from z-up altitude, isothermal 101325 Pa / 8434 m — a harness-side
@@ -315,6 +325,8 @@ cudaflight importable → ImportError with install guidance at construction.
   mask ∈ [0,1]; mask_noise: output ∈ [0,1], persistence across held frames,
   disabled ⇒ identity.
 - `test_firmware.py` — skipped unless cudaflight importable; arm→spin-up→hover smoke.
+  GPU-fleet twin marked `gpu` (skipped without a CUDA device): same smoke through
+  `GpuFirmwareFleet`, plus snapshot restore determinism and the `firmware="auto"` pick.
 - `test_jit.py` — one jitted 50-step rollout, no NaN; second call does not retrace
   (jit cache check); vision task jitted rollout smoke.
 - `test_viz.py` — pygame-free half: primitive serde round-trip (bind is live-only);

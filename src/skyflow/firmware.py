@@ -32,6 +32,11 @@ mode, which never touches this module) works without the wheel installed.
 import ctypes
 import os
 
+# Best-effort (§10): the GPU fleet needs XLA's arena capped BEFORE jax touches the
+# GPU, or the firmware instance arrays find no VRAM. Only effective when this module
+# (or the user's launcher) runs before the first jax device use.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -208,12 +213,32 @@ class CpuFirmwareFleet:
 
 class GpuFirmwareFleet:
     """
-    Betaflight CUDA fleet (libcudaflight.so) — NOT YET AVAILABLE from SkyFlow.
+    Betaflight CUDA fleet (libcudaflight.so) — the in-jit sticks backend.
 
-    The in-jit FFI half (XLA custom-call handlers for step/reset) currently lives in
-    nav-train; cudaflight absorbs it on open-sourcing, and this class lands then. Until
-    that release the constructor raises, and nav-train's `FirmwareFleet` — which already
-    satisfies `types.FirmwareFleet` — plugs in via `SkyFlowEnv(cfg, firmware_fleet=...)`.
+    Requires cudaflight >= 0.3.3: the wheel ships the XLA FFI half (`cudaflight.xla`,
+    prebuilt handlers + source fallback), so the firmware kernels launch directly on
+    XLA's compute stream inside the jitted program — zero host round trips per tick.
+    This backend implements the verified nav-train sequence (DESIGN.md §10):
+
+    - `XLA_PYTHON_CLIENT_PREALLOCATE=false` must be set BEFORE jax touches the GPU, or
+      XLA's arena leaves no VRAM for the firmware instance arrays. This module
+      `setdefault`s it at import as a best effort; export it in the launcher to be sure.
+    - XLA claims the primary CUDA context first: the constructor touches the target
+      device (`jnp.zeros(1, device=...)` + block_until_ready) before `cudaflight_create*`,
+      so the firmware kernels share XLA's context instead of racing it for one.
+    - Creates via `cudaflight_create_eeprom_ex(cubin, fleet, device_index, settle_ms,
+      eeprom, with_grad=0)` — no differentiable-rollout scratch, ~1.5x more worlds —
+      falling back to `cudaflight_create_eeprom` on older libraries.
+    - `fleet >= 3`: the runtime relocation table cannot be discovered below 3
+      instances; smaller fleets belong to CpuFirmwareFleet.
+    - Firmware state is GENUINELY value-threaded, unlike the CPU placeholders: blob
+      [F·stride] u8 and fwstate [F·state_size] u8 ride through `jax.ffi.ffi_call`
+      with input_output_aliases (donated in place), copied at construction from the
+      armed-on-ground snapshot buffers; `fresh_firmware_state`/`reset` restore from
+      that snapshot, so this fleet IS replayable, unlike the CPU one.
+    - bfSetBase runs before every step/reset launch: the handler points the global
+      instance base at wherever XLA placed the donated blob and the kernel rebases
+      on entry. One handle = one device = `fleet` worlds.
     """
 
     def __init__(
@@ -226,34 +251,78 @@ class GpuFirmwareFleet:
         cubin: str | os.PathLike[str] | None = None,
         lib: str | os.PathLike[str] | None = None,
     ) -> None:
-        """
-        Raises NotImplementedError. Contract this constructor implements once cudaflight
-        ships its FFI half (the verified nav-train sequence, DESIGN.md §10):
+        if int(fleet) < 3:
+            raise ValueError(
+                f"GpuFirmwareFleet needs fleet >= 3 (the runtime relocation table "
+                f"cannot be discovered below 3 instances), got {fleet}; use "
+                f"CpuFirmwareFleet for smaller fleets"
+            )
+        try:
+            from cudaflight import xla as _cfx
+            from cudaflight.lib import default_fatbin_path, load
+        except ImportError as e:
+            raise ImportError(
+                _INSTALL_GUIDANCE + " GpuFirmwareFleet additionally needs cudaflight "
+                ">= 0.3.3 (the first wheel that ships the cudaflight.xla FFI half)."
+            ) from e
 
-        - `XLA_PYTHON_CLIENT_PREALLOCATE=false` must be exported BEFORE importing jax,
-          or XLA's arena leaves no VRAM for the firmware instance arrays.
-        - XLA claims the primary CUDA context first: touch the target device (e.g.
-          `jnp.zeros(1, device=...)` + block_until_ready) before `cudaflight_create*`,
-          so the firmware kernels share XLA's context instead of racing it for one.
-        - Create via `cudaflight_create_eeprom_ex(cubin, fleet, device_index, settle_ms,
-          eeprom, with_grad=0)` — no differentiable-rollout scratch, ~1.5x more worlds —
-          falling back to `cudaflight_create_eeprom` on older libraries.
-        - `fleet >= 3`: the runtime relocation table cannot be discovered below 3
-          instances; smaller fleets belong to CpuFirmwareFleet.
-        - Firmware state is GENUINELY value-threaded, unlike the CPU placeholders: blob
-          [F·stride] u8 and fwstate [F·state_size] u8 ride through `jax.ffi.ffi_call`
-          with input_output_aliases (donated in place), copied at construction from the
-          armed-on-ground snapshot buffers (`cudaflight_snap_ptr`/`_snap_state_ptr`);
-          `fresh_firmware_state`/`reset` restore from that snapshot.
-        - bfSetBase runs before every step/reset launch: the handler points the global
-          instance base at wherever XLA placed the donated blob and the kernel rebases
-          on entry (a masked reset leaves a stale base; the next step's rebase fixes it).
-          This makes the fleet vmappable-in-principle only per-handle — one handle, one
-          device, `fleet` worlds.
-        """
-        raise NotImplementedError(
-            "GpuFirmwareFleet waits on cudaflight absorbing its XLA FFI half (the in-jit "
-            "step/reset custom calls now living in nav-train). Use CpuFirmwareFleet, or "
-            "inject nav-train's GPU fleet via SkyFlowEnv(cfg, firmware_fleet=...). The "
-            "constructor docstring records the exact contract this class will implement."
+        self.fleet = int(fleet)
+        self.device = jax.devices("gpu")[device_index]
+        # XLA claims the primary CUDA context before the firmware library does.
+        jnp.zeros(1, device=self.device).block_until_ready()
+
+        self._lib = load(lib)
+        cubin_arg = str(cubin or default_fatbin_path())
+        eeprom_arg = str(eeprom).encode() if eeprom else None
+        # Non-differentiable create — no per-instance gradient scratch (~1.5x more
+        # worlds); the differentiable rollout is out of scope here (§7: planned).
+        if hasattr(self._lib, "cudaflight_create_eeprom_ex"):
+            self._h = self._lib.cudaflight_create_eeprom_ex(
+                cubin_arg.encode(), self.fleet, device_index, settle_ms, eeprom_arg, 0
+            )
+        else:
+            self._h = self._lib.cudaflight_create_eeprom(
+                cubin_arg.encode(), self.fleet, device_index, settle_ms, eeprom_arg
+            )
+        if not self._h:
+            raise RuntimeError(
+                f"cudaflight_create failed: {self._lib.cudaflight_error().decode()}"
+            )
+
+        self.act_dim = int(self._lib.cudaflight_act_dim(self._h))
+        self._fw_pure = _cfx.fw_step_pure_call(self._lib, self._h)
+        self._reset_pure = _cfx.reset_pure_call(self._lib, self._h)
+        # the armed-on-ground episode-start snapshot, as fresh JAX buffers
+        self._snap_blob, self._snap_state = _cfx.snapshot_state(
+            self._lib, self._h, device_index
         )
+
+    # -- types.FirmwareFleet ----------------------------------------------------------
+
+    def fresh_firmware_state(self) -> tuple[jax.Array, jax.Array]:
+        """A fresh (blob, fwstate) pair copied from the armed snapshot."""
+        return jnp.copy(self._snap_blob), jnp.copy(self._snap_state)
+
+    def fw_step(
+        self, blob: jax.Array, fwstate: jax.Array, sticks: jax.Array, sensors: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """One 1 kHz firmware tick → (blob, fwstate, motors [F,4] in [0,1], armed u8 [F])."""
+        return self._fw_pure(blob, fwstate, sticks, sensors)
+
+    def reset(
+        self, blob: jax.Array, fwstate: jax.Array, mask: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """Restore the worlds selected by mask (u8 [F]) to the armed snapshot."""
+        return self._reset_pure(blob, fwstate, mask)
+
+    def close(self) -> None:
+        """Destroy the firmware instances; the fleet is unusable afterwards."""
+        if getattr(self, "_h", None):
+            self._lib.cudaflight_destroy(self._h)
+            self._h = None
+
+    def __del__(self) -> None:  # best-effort teardown (interpreter-shutdown safe)
+        try:
+            self.close()
+        except Exception:
+            pass

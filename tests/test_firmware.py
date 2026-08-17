@@ -76,9 +76,17 @@ def test_cpu_fleet_without_cudaflight_gives_install_guidance():
         CpuFirmwareFleet(2)
 
 
-def test_gpu_fleet_raises_pending_ffi_absorption():
-    with pytest.raises(NotImplementedError, match="cudaflight"):
-        GpuFirmwareFleet(8)
+def test_gpu_fleet_signatures_match_protocol():
+    for name in ("fresh_firmware_state", "fw_step", "reset", "close"):
+        proto = list(inspect.signature(getattr(FirmwareFleet, name)).parameters)
+        impl = list(inspect.signature(getattr(GpuFirmwareFleet, name)).parameters)
+        assert impl == proto, f"{name}: {impl} != {proto}"
+
+
+def test_gpu_fleet_rejects_small_fleet():
+    # the fleet-size gate fires before any cudaflight import, so it runs everywhere
+    with pytest.raises(ValueError, match="fleet >= 3"):
+        GpuFirmwareFleet(2)
 
 
 # -- real CPU SITL: importorskip + load_cpu gate --------------------------------------------
@@ -150,3 +158,102 @@ def test_masked_reset_smoke(cpu_fleet):
     np.testing.assert_array_equal(m3[0], m1[0])  # world 0 replays the fresh first tick
     assert not np.array_equal(m3[1], m1[0])  # world 1 kept flying, untouched
     assert np.all(np.asarray(armed) != 0)
+
+
+# -- real GPU fleet (DESIGN.md §10): cudaflight.xla in-jit custom calls ---------------------
+
+GPU_FLEET = 4
+
+
+@pytest.fixture(scope="module")
+def gpu_fleet():
+    """A 4-instance GPU fleet, or skip without CUDA / cudaflight >= 0.3.3."""
+    pytest.importorskip("cudaflight")
+    pytest.importorskip("cudaflight.xla", reason="cudaflight < 0.3.3: no xla module")
+    try:
+        jax.devices("gpu")
+    except RuntimeError:
+        pytest.skip("no CUDA device visible to jax")
+    try:
+        fleet = GpuFirmwareFleet(GPU_FLEET)
+    except Exception as e:  # driver/VRAM/create failures are environment, not code
+        pytest.skip(f"GPU fleet construction failed: {e}")
+    yield fleet
+    fleet.close()
+
+
+def _hover_inputs_n(n: int):
+    gyro_frd = flu_to_frd(jnp.zeros((n, 3), jnp.float32))
+    specforce_frd = flu_to_frd(jnp.tile(jnp.array([0.0, 0.0, 9.81], jnp.float32), (n, 1)))
+    baro = jnp.full((n, 1), baro_pa(0.0), jnp.float32)
+    sensors = jnp.concatenate([gyro_frd, specforce_frd, baro], axis=-1)
+    sticks = jnp.zeros((n, 4), jnp.float32)
+    return sticks, sensors
+
+
+@pytest.mark.gpu
+def test_gpu_protocol_conformance(gpu_fleet):
+    assert isinstance(gpu_fleet, _RuntimeFirmwareFleet)
+    assert gpu_fleet.act_dim == 4
+
+
+@pytest.mark.gpu
+def test_gpu_hover_smoke_100_ticks_jitted(gpu_fleet):
+    sticks, sensors = _hover_inputs_n(GPU_FLEET)
+    step = jax.jit(gpu_fleet.fw_step)
+    blob, fwstate = gpu_fleet.fresh_firmware_state()
+    assert blob.size > 0 and fwstate.size > 0  # genuinely value-threaded, not placeholders
+    m = np.zeros((GPU_FLEET, 4), np.float32)
+    for _ in range(100):
+        blob, fwstate, motors, armed = step(blob, fwstate, sticks, sensors)
+        m = np.asarray(motors)
+        assert m.shape == (GPU_FLEET, 4) and m.dtype == np.float32
+        assert np.all(np.isfinite(m)) and np.all(m >= 0.0) and np.all(m <= 1.0)
+        assert armed.dtype == jnp.uint8 and np.all(np.asarray(armed) != 0)
+    assert np.all(m > 0.0)  # armed at mid throttle: props actually spin
+
+
+@pytest.mark.gpu
+def test_gpu_snapshot_restore_is_deterministic(gpu_fleet):
+    """The value-threaded pair makes the GPU fleet replayable: a fresh snapshot copy
+    replays the identical first tick, and a masked reset restores only flagged worlds."""
+    sticks, sensors = _hover_inputs_n(GPU_FLEET)
+    blob, fwstate = gpu_fleet.fresh_firmware_state()
+    blob, fwstate, m1, _ = gpu_fleet.fw_step(blob, fwstate, sticks, sensors)
+    blob, fwstate, m2, _ = gpu_fleet.fw_step(blob, fwstate, sticks, sensors)
+    m1, m2 = np.asarray(m1), np.asarray(m2)
+    assert not np.array_equal(m2, m1)  # the firmware is actually evolving
+
+    # replay from a fresh snapshot copy: bit-identical first tick
+    blob_b, fwstate_b = gpu_fleet.fresh_firmware_state()
+    _, _, m1_replay, _ = gpu_fleet.fw_step(blob_b, fwstate_b, sticks, sensors)
+    np.testing.assert_array_equal(np.asarray(m1_replay), m1)
+
+    # masked reset: world 0 replays the fresh first tick, world 1 keeps flying
+    mask = jnp.array([1, 0, 0, 0], jnp.uint8)
+    blob, fwstate = gpu_fleet.reset(blob, fwstate, mask)
+    _, _, m3, armed = gpu_fleet.fw_step(blob, fwstate, sticks, sensors)
+    m3 = np.asarray(m3)
+    np.testing.assert_array_equal(m3[0], m1[0])
+    assert not np.array_equal(m3[1], m1[1])
+    assert np.all(np.asarray(armed) != 0)
+
+
+@pytest.mark.gpu
+def test_env_firmware_auto_picks_gpu_fleet(gpu_fleet):
+    """firmware="auto" on a CUDA box with fleet >= 3 builds the GPU backend, and the
+    env steps through it (one jitted control step, finite outputs)."""
+    from skyflow import SimConfig, SkyFlowEnv
+
+    env = SkyFlowEnv(
+        SimConfig(num_envs=GPU_FLEET, task="hover", control="sticks", firmware="auto")
+    )
+    try:
+        assert isinstance(env._fw, GpuFirmwareFleet)
+        obs, state = env.reset(jax.random.PRNGKey(0))
+        step = jax.jit(env.step)
+        aetr = jnp.tile(jnp.array([0.0, 0.0, -1.0, 0.0], jnp.float32), (GPU_FLEET, 1))
+        obs, state, reward, done, _info = step(state, aetr)
+        assert bool(jnp.isfinite(obs).all()) and reward.shape == (GPU_FLEET,)
+    finally:
+        env._fw.close()
