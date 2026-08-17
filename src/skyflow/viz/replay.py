@@ -105,7 +105,7 @@ def replay(
 
     if mp4 is not None:
         try:
-            import imageio.v3 as iio  # soft dep: only the export path needs it
+            import imageio.v3 as iio  # pyright: ignore[reportMissingImports] — soft dep: only the export path needs it
         except ImportError as e:
             raise ImportError("mp4 export needs imageio: pip install 'imageio[ffmpeg]'") from e
         viewer = viewer_for_log(log, pilot=pilot, headless=True, threaded=False)

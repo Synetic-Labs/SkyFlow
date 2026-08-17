@@ -262,7 +262,10 @@ class FlightLog:
         n = len(self._plant)
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        arrays: dict[str, np.ndarray] = {"plant": np.stack(self._plant)}
+        # dict[str, Any]: a typed-ndarray dict trips savez_compressed's kwargs check
+        # (the ** unpack could nominally hit its `allow_pickle` keyword). Collisions are
+        # impossible in practice — channel/bind keys are "ch:"/"bind:"-prefixed.
+        arrays: dict[str, Any] = {"plant": np.stack(self._plant)}
         for name, buf in (("action", self._action), ("done", self._done)):
             if all(b is not None for b in buf):
                 arrays[name] = np.stack(buf)  # type: ignore[arg-type]

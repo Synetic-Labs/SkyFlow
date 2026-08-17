@@ -20,6 +20,7 @@ import os
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -239,7 +240,7 @@ class Viewer:
         task = env.task
         scene = kw.pop("scene", None)
         if scene is None:
-            hook = getattr(task, "viz_scene", None)
+            hook: Callable[[], list[dict]] | None = getattr(task, "viz_scene", None)
             scene = Scene.from_dicts(hook()) if callable(hook) else Scene()
         if not any(isinstance(p, Grid) for p in scene):
             scene.add(Grid())

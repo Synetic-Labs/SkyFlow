@@ -115,7 +115,7 @@ def main() -> None:
 
     viewer = None
     if args.view:
-        from skyflow.viz import Scene, Viewer, ViewFrame  # optional extra
+        from skyflow.viz import Scene, Viewer  # optional extra
 
         viewer = Viewer(
             Scene.from_dicts(task.viz_scene()),
@@ -150,6 +150,8 @@ def main() -> None:
         success = success or bool(ev.success[0])
         state = ev.task_state
         if viewer is not None:
+            from skyflow.viz import ViewFrame  # bound iff --view; cached re-import
+
             viewer.push(ViewFrame(
                 plant=np.asarray(plant), step=i, t=i * args.dt,
                 channels={"reward": np.asarray(ev.reward)},

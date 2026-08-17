@@ -68,7 +68,11 @@ class TestPrimitives:
             Gate(center=(g, 0, 1), lateral=(0, 1, 0), index=g, bind="task_state.active_gate")
             for g in range(4)
         ]
-        styles = [resolve(g, vf).style for g in gates]
+        styles = []
+        for g in gates:
+            r = resolve(g, vf)
+            assert r is not None
+            styles.append(r.style)
         assert styles == ["wire", "wire", "wire", "accent"]  # focus world's row wins
 
     def test_register_primitive_is_public_and_serde_round_trips(self):
@@ -221,10 +225,14 @@ class TestFlightLog:
         log = FlightLog.for_env(env, watch=(0,))
         assert log.header["task"] == "figure_eight" and log.header["dt"] == pytest.approx(0.01)
         assert log.header["scene"], "the task hook should populate the scene"
+        from skyflow.tasks.gate_course import GateCourseTask
+
+        task = env.task
+        assert isinstance(task, GateCourseTask)  # narrows the Task protocol for .gates
         gs = gateset_from_dict(log.header["gateset"])
         np.testing.assert_allclose(
             np.asarray(gs.centers_world),
-            np.asarray(env.task.gates.centers_world),
+            np.asarray(task.gates.centers_world),
             atol=1e-6,
         )
 

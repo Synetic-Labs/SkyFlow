@@ -170,7 +170,10 @@ def main() -> None:
     if args.sticks == "keyboard":
         sticks = KeyboardSticks()
     elif args.sticks == "joystick":
-        sticks = JoystickSticks(pygame, tuple(int(a) for a in args.axes.split(",")))
+        ax = [int(a) for a in args.axes.split(",")]
+        if len(ax) != 4:
+            raise SystemExit(f"--axes needs 4 comma-separated axis ids (AETR), got {args.axes!r}")
+        sticks = JoystickSticks(pygame, (ax[0], ax[1], ax[2], ax[3]))
     elif args.sticks.startswith("udp:"):
         sticks = UdpSticks(int(args.sticks.split(":", 1)[1]))
     else:

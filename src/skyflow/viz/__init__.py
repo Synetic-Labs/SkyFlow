@@ -7,7 +7,16 @@ install guidance if it is missing. Core skyflow modules never import this packag
 """
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # static export surface for type checkers; runtime stays lazy below
+    from skyflow.viz.fpv import PilotCam, compose, obs_mask, upscale
+    from skyflow.viz.frame import ViewFrame, snapshot
+    from skyflow.viz.primitives import Box, Gate, Grid, Marker, Path, Scene, register_primitive
+    from skyflow.viz.projection import Projection
+    from skyflow.viz.record import FlightLog, ReplayLog
+    from skyflow.viz.replay import replay
+    from skyflow.viz.viewer import Viewer
 
 __all__ = [
     "Box",
