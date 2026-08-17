@@ -335,3 +335,45 @@ class GateCourseTask:
             "gate/active_idx": task_state.active_gate.astype(jnp.float32),
             "gate/passes": task_state.passes.astype(jnp.float32),
         }
+
+    @property
+    def camera(self) -> "CameraModel | None":
+        """The vision-mode camera (None in state mode) — read by the optional viewer."""
+        return self._camera
+
+    def viz_scene(self) -> list[dict]:
+        """
+        Default display scene for the OPTIONAL viewer (DESIGN.md §13): every gate as an
+        indexed frame (the viewer accents the active one), a dashed centre line through
+        the course, and a grid sized to it. Plain dicts in the skyflow.viz serde form —
+        the duck-typed hook keeps the core free of viz imports.
+        """
+        import numpy as np  # host-side hook: called at viewer build time, never in-jit
+
+        centers = np.asarray(self._centers, np.float64)
+        laterals = np.asarray(self._laterals, np.float64)
+        verticals = np.asarray(self._verticals, np.float64)
+        outer = np.asarray(self.gates.outer_half, np.float64)
+        hx = float(np.abs(centers[:, 0]).max() + outer[:, 0].max() + 1.0)
+        hy = float(np.abs(centers[:, 1]).max() + outer[:, 0].max() + 1.0)
+        scene: list[dict] = [{"type": "grid", "half": (hx, hy)}]
+        scene += [
+            {
+                "type": "gate",
+                "center": tuple(centers[g]),
+                "lateral": tuple(laterals[g]),
+                "vertical": tuple(verticals[g]),
+                "half_w": float(outer[g, 0]),
+                "half_h": float(outer[g, 1]),
+                "index": g,
+                # THIS task names its own state; the viewer knows no task fields. A Gate
+                # reads a bound value as the active index and turns accent on a match.
+                "bind": "task_state.active_gate",
+            }
+            for g in range(self.num_gates)
+        ]
+        scene.append(
+            {"type": "path", "points": [tuple(c) for c in centers], "closed": True,
+             "dashed": True, "style": "dim"}
+        )
+        return scene

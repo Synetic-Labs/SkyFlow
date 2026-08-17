@@ -44,12 +44,42 @@ inside jit.
 A stick-level policy can fly through Betaflight, `control="sticks"` closes
 the loop through the real firmware (the `cudaflight` SITL, `firmware` extra)
 
+### Viewer
+
+The `viz` extra (pygame only) adds a live viewer — wireframe scene, drone glyphs, an
+honest FPV pane pair, instruments — plus gamepad/keyboard/UDP teleop and flight-log
+replay. The scene is data: five primitives (`Grid`, `Path`, `Gate`, `Box`, `Marker`)
+that any task or user composes, so it draws whatever you are training. Logs store poses,
+never pixels — the camera is a pure analytic function of pose, so a recorded flight
+re-renders at any resolution later, and watching a GPU training run costs one small
+host pull per chunk.
+
+```bash
+uv run python examples/fly_hover.py --seconds 30 --view
+uv run python examples/fly_teleop.py --sticks joystick --record dvr/
+uv run python -m skyflow.viz.replay dvr/lap_00.npz --pilot-cam 384x288
+```
+
+```python
+from skyflow.viz import Viewer, FlightLog, Box, Marker
+
+viewer = Viewer.for_env(env, watch=(0, 1))           # grid + glyphs + the task's scene
+viewer.scene.add(Box(center=(3, -2, 0.5), half=(0.5, 0.5, 0.5)))   # your own props
+...
+viewer.frame(state, obs=obs, action=action, reward=reward, done=done, info=info)
+
+log = FlightLog.for_env(env, watch=range(8), every=2)  # training side: arrays in,
+log.extend(plant_buf, action=action_buf)               # one host pull per chunk
+log.save("runs/042/flight.npz")
+```
+
 ## Install
 
 ```bash
 uv sync                     # CPU
 uv sync --extra cuda        # CUDA 13 wheels for JAX
 uv sync --extra firmware    # + cudaflight for control="sticks"
+uv sync --extra viz         # + pygame for the viewer / teleop / replay
 ```
 
 Runtime dependencies: `jax`, `numpy`, `skyflow-dynamics[jax]`.

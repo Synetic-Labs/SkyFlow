@@ -234,3 +234,16 @@ class HoverTask:
             "hover/dist": task_state.dist,
             "hover/goal_hold": task_state.hold.astype(jnp.float32),
         }
+
+    def viz_scene(self) -> list[dict]:
+        """
+        Default display scene for the OPTIONAL viewer (DESIGN.md §13): the safe box and a
+        live goal marker. Plain dicts in the skyflow.viz serde form — the duck-typed hook
+        keeps the core free of viz imports; display geometry never feeds observations.
+        """
+        r, hz = self.safe_xy_m, self.safe_z_m / 2.0
+        return [
+            {"type": "grid", "half": (r + 1.0, r + 1.0)},
+            {"type": "box", "center": (0.0, 0.0, hz), "half": (r, r, hz), "style": "wire"},
+            {"type": "marker", "bind": "task_state.goal", "style": "accent"},
+        ]

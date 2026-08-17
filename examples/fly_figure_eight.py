@@ -14,12 +14,14 @@ Run from the repo root:
 
     uv run python examples/fly_figure_eight.py
     uv run python examples/fly_figure_eight.py --save-masks 6 --outdir masks
+    uv run python examples/fly_figure_eight.py --view      # live viewer (skyflow[viz])
 
 Examples are demos, not package code (DESIGN.md §2).
 """
 
 import argparse
 import math
+import time
 from pathlib import Path
 
 import jax
@@ -98,6 +100,11 @@ def main() -> None:
                     help="directory for --save-masks output")
     ap.add_argument("--gates-per-lobe", type=int, default=3,
                     help="k gates per lemniscate lobe (course has 2k gates)")
+    ap.add_argument("--view", action="store_true",
+                    help="open the live viewer, wall-clock paced (needs skyflow[viz])")
+    ap.add_argument("--headless", action="store_true", help="viewer on the SDL dummy driver")
+    ap.add_argument("--frames", type=int, default=None, help="close the viewer after N frames")
+    ap.add_argument("--shot", default=None, help="screenshot path saved when --frames ends")
     args = ap.parse_args()
 
     gates = figure_eight(args.gates_per_lobe)
@@ -106,6 +113,20 @@ def main() -> None:
     print(f"course: {len(gates)} gates, tour of {path.shape[0]} steps "
           f"at {args.speed:.1f} m/s ({args.dt * 1e3:.0f} ms steps)")
 
+    viewer = None
+    if args.view:
+        from skyflow.viz import Scene, Viewer, ViewFrame  # optional extra
+
+        viewer = Viewer(
+            Scene.from_dicts(task.viz_scene()),
+            gates=gates,
+            watch=(0,),
+            control="motors",
+            dt=args.dt,
+            title="SkyFlow Viz — figure_eight · tracer",
+            headless=args.headless, frames=args.frames, shot=args.shot,
+        )
+
     evaluate = jax.jit(task.evaluate)
     state = GateTaskState(
         active_gate=jnp.zeros((1,), jnp.int32), passes=jnp.zeros((1,), jnp.int32)
@@ -113,11 +134,13 @@ def main() -> None:
     crashes = 0
     success = False
     for i in range(1, path.shape[0]):
+        t0 = time.perf_counter()
         seg = (path[i] - path[i - 1]) / args.dt
         yaw = math.atan2(float(seg[1]), float(seg[0]))
+        plant = plant_rows(path[i], seg.astype(np.float32), yaw)
         ev = evaluate(
             plant_rows(path[i - 1], seg.astype(np.float32), yaw),
-            plant_rows(path[i], seg.astype(np.float32), yaw),
+            plant,
             state,
         )
         if float(ev.info["gate_passed"][0]) > 0.0:
@@ -126,6 +149,17 @@ def main() -> None:
         crashes += int(bool(ev.crash[0]))
         success = success or bool(ev.success[0])
         state = ev.task_state
+        if viewer is not None:
+            viewer.push(ViewFrame(
+                plant=np.asarray(plant), step=i, t=i * args.dt,
+                channels={"reward": np.asarray(ev.reward)},
+                task_state=jax.device_get(state),
+            ))
+            while viewer.paused and viewer.open:
+                viewer.idle()
+            if not viewer.open:
+                break
+            time.sleep(max(0.0, args.dt - (time.perf_counter() - t0)))
 
     print(f"gates passed: {int(state.passes[0])}/{len(gates)}"
           f" — success={success}, miss/frame-hit steps={crashes}")

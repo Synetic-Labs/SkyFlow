@@ -1,4 +1,4 @@
-# SkyFlow — design of record
+tt# SkyFlow — design of record
 
 Status: implementation contract for the v0.2 rewrite. Interfaces here are FROZEN for the
 build; change requires editing this file first. Style: this document is normative — "must"
@@ -48,15 +48,29 @@ src/skyflow/
     renderer.py         # analytic ray-cast coverage masks (gates, floor)
     mask_noise.py       # persistent mask corruption families
   firmware.py           # control="sticks" seam against cudaflight (§10)
+  viz/                  # OPTIONAL viewer, extra "viz" (§13). Core never imports it.
+    __init__.py         # lazy re-exports: Viewer, FlightLog, Scene + the five primitives
+    palette.py          # shared colors (dark ground, mask-orange accent)
+    primitives.py       # Scene + Grid/Path/Gate/Box/Marker — pure data + serde, no pygame
+    frame.py            # ViewFrame: host-side numpy snapshot of the watched worlds
+    projection.py       # iso/top/profile projection, fitted once from the scene AABB
+    fpv.py              # mask+floor composite (pure numpy) + PilotCam pose re-renderer
+    scenepane.py        # scene + drone-glyph drawing onto a pygame surface
+    hud.py              # instrument strip drawing
+    viewer.py           # the live pygame host: pacing, keys, panes, screenshots
+    record.py           # FlightLog — pose logs → self-describing flight.npz
+    replay.py           # python -m skyflow.viz.replay: scrub/replay host + mp4 export
 examples/
   fly_hover.py          # tiny PD hover demo (examples are demos, not package code)
   fly_figure_eight.py   # scripted course fly-through + optional mask dump
+  fly_teleop.py         # hand-fly control="sticks": keyboard / joystick / UDP + viewer
 tests/                  # pytest; §11 lists the required suites
 ```
 
-Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: editable path
-`../SkyFlow-Dynamics` until published, then git). Extras: `cuda` → `jax[cuda13]`;
-`firmware` → `cudaflight` (public GitHub release-wheel URL source). Dev group: `pytest>=9`,
+Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: the public git
+URL; was an editable sibling path before publication). Extras: `cuda` → `jax[cuda13]`;
+`firmware` → `cudaflight` (public GitHub release-wheel URL source); `viz` → nothing but
+`pygame-ce>=2.5` (§13; the maintained fork, imports as `pygame`). Dev group: `pytest>=9`,
 `ruff>=0.16`. License MIT. Version 0.2.0.
 
 ## 3. Conventions (one frame inside)
@@ -184,6 +198,7 @@ class SimConfig:
 reset(key) -> (obs [F,obs_dim] f32, SimState)
 step(state, action [F,4] in [-1,1]) -> (obs, state', reward [F], done [F], info: StepInfo)
 metrics(state) -> dict[str, Array]   # scalar means: outcome fractions, ep stats
+task_state(state) -> Any             # the task's OWN pytree (unwraps the §10 sticks carry)
 ```
 
 Pure functions; the caller jits. **Step pipeline (order is normative):**
@@ -242,7 +257,7 @@ Reward constants live in task kwargs with the shipped defaults; no reward code i
 ## 10. firmware.py — control="sticks"
 
 cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration; Python API
-unchanged through v0.3.1): package
+unchanged through v0.3.2): package
 `cudaflight`, no core deps; sensor input per 1 kHz tick = f32 [F,7] NED/FRD
 `[gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)]` (level hover ⇒
 az = -9.81); sticks f32 [F,4] AETR in [-1,1]; output motors f32 [F,4] in [0,1] QUADX
@@ -298,10 +313,77 @@ cudaflight importable → ImportError with install guidance at construction.
 - `test_firmware.py` — skipped unless cudaflight importable; arm→spin-up→hover smoke.
 - `test_jit.py` — one jitted 50-step rollout, no NaN; second call does not retrace
   (jit cache check); vision task jitted rollout smoke.
+- `test_viz.py` — pygame-free half: primitive serde round-trip (bind is live-only);
+  projection invariants (z-up maps screen-up, AABB fits the rect); FPV composite colors
+  and dtype; FlightLog npz round-trip; core-must-not-import-viz import scan.
+- `test_viz_panes.py` — pygame half (skipped unless pygame importable; SDL dummy video
+  driver): scene/HUD builders draw onto a plain surface; headless Viewer smoke over a real
+  hover rollout with a screenshot; headless replay smoke from a saved flight.npz.
 
 ## 12. Deferred (roadmap, do not build now)
 
 nav-train identified-physics intake (owner decision pending); differentiability claim +
 BPTT tests; Dryden/von Kármán wind drivers (spec terms exist); battery/voltage sag;
 sensor staleness/sample-hold DR; obs frame stacking; renderer supersampling knobs beyond
-the port; FunctionalToStateful adapter; multi-vehicle interaction (downwash candidates).
+the port; FunctionalToStateful adapter; multi-vehicle interaction (downwash candidates);
+viz: a rerun sink over the same builders; analytic camera primitives beyond gates.
+
+## 13. viz — the optional viewer (extra "viz")
+
+Everything under `src/skyflow/viz/`, installed by the `viz` extra (pygame, nothing else).
+Boundary: viz SHOWS what the vehicle did and sensed — it never decides it. Normative rules:
+
+- **No core module imports `skyflow.viz`** (test-enforced). Display-only geometry — the
+  floor composite behind the mask, the pilot camera, scene props — never enters an
+  observation.
+- **The policy FPV pane shows the observation verbatim**: the mask block sliced from the
+  obs vector the policy received, corruption included. A fresh render there would flatter
+  the policy.
+- **Builders draw, hosts own windows.** Panel builders are windowless (surface/array in,
+  pixels out); the live viewer, the replay host and any export share them, so all hosts
+  look identical.
+
+Four layers, strict about what each may know:
+
+1. **Vehicle truth — always drawn.** Pose, attitude, rotor speeds, trails, glyphs, the
+   fixed HUD instruments (sticks/action, motors, attitude, speed/altitude). All from
+   `plant` and the step outputs. No task knowledge.
+2. **World geometry — always data.** Scene primitives. Tasks and users contribute them;
+   the pane only draws. Extension is public: `register_primitive(cls, draw_fn)` — the
+   same registry idiom as `register_task`/`register_airframe`.
+3. **Sensor truth — follows `vision/`.** The pilot cam renders what the sim camera
+   defines; the policy pane shows the obs image block verbatim (`image_term` names the
+   block, default "mask"). Viz never invents a sensor.
+4. **Channels — named scalars, caller-selected.** Anything from step returns, `info` or
+   `metrics` can be traced (`viewer.frame(..., channels={...})`); the HUD draws one graph
+   per name. Reward is a channel, not a viz concept.
+
+Conventions degrade to nothing: `viz_scene()`, `camera`, `gates` are optional duck-typed
+hooks; a task without them still gets layers 1, 3 and 4.
+
+Scene model: the scene pane draws a `Scene` — a flat list of primitive dataclasses
+(shipped: `Grid`, `Path`, `Gate`, `Box`, `Marker`), each one dataclass plus one registered
+draw function, JSON round-trippable. `bind` (a dotted ViewFrame attribute path, or any
+callable of the ViewFrame) makes a primitive track live state; the PRIMITIVE interprets
+the bound value (`_apply_bind`): Marker/Box move their centre, Path replaces its points,
+Gate reads an active index and turns accent on matching its own `index` — so the gate
+task declares `bind="task_state.active_gate"` itself and no task field names appear in
+generic code. Callable binds are live-only and drop from serialization. Drone glyphs come
+from `plant`, never from primitives. Tasks contribute defaults through the OPTIONAL
+duck-typed hook `viz_scene() -> list[dict]` (serde-form dicts, so tasks stay
+viz-import-free); `hover` and `figure_eight` ship hooks.
+
+FlightLog: pose logs, never pixels — the camera is a pure function of pose, so poses
+reproduce any view at any resolution forever. `flight.npz` is self-describing (JSON
+header: serialized scene, camera, gate geometry, airframe, config fields; arrays: plant,
+action, done, channel traces `ch:<name>`, and `bind:<path>` values for the scene's string
+binds — replay resolves the same binds and plots the same channels with no task code, all
+`[T, W, ...]`). Live capture slices watch rows per control step; training capture takes
+whole `[T, W, ...]` chunks (`extend`) so the fused scan is never stalled. Replay
+(`python -m skyflow.viz.replay`) re-renders FPV from poses; mp4 export through imageio
+when importable (soft dep, like matplotlib in the examples).
+
+Teleop is an example, not package code: `examples/fly_teleop.py` drives control="sticks"
+through the CPU firmware fleet, paced to the wall clock, sticks from the keyboard, a local
+pygame joystick, or UDP datagrams (20-byte little-endian `<ffffI` = roll, pitch, yaw,
+throttle in [-1,1] + button bitmask, latest-wins, any sender).

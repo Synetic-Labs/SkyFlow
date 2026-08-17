@@ -12,9 +12,11 @@ Run from the repo root:
 
     uv run python examples/fly_hover.py
     uv run python examples/fly_hover.py --seconds 5 --fleet 8
+    uv run python examples/fly_hover.py --seconds 30 --view   # live viewer (skyflow[viz])
 """
 
 import argparse
+import time
 
 import jax
 import jax.numpy as jnp
@@ -81,6 +83,11 @@ def main() -> None:
     ap.add_argument("--seconds", type=float, default=3.0, help="flight time, s")
     ap.add_argument("--fleet", type=int, default=4, help="number of worlds")
     ap.add_argument("--seed", type=int, default=0, help="reset PRNG seed")
+    ap.add_argument("--view", action="store_true",
+                    help="open the live viewer, wall-clock paced (needs skyflow[viz])")
+    ap.add_argument("--headless", action="store_true", help="viewer on the SDL dummy driver")
+    ap.add_argument("--frames", type=int, default=None, help="close the viewer after N frames")
+    ap.add_argument("--shot", default=None, help="screenshot path saved when --frames ends")
     args = ap.parse_args()
 
     cfg = SimConfig(
@@ -99,14 +106,34 @@ def main() -> None:
     print(f"fleet of {args.fleet}: pad → goal, {args.seconds:.1f} s at {cfg.control_hz:.0f} Hz")
     print(f"  goal[0] = {goal[0].round(2)}, initial error {np.linalg.norm(np.asarray(obs)[:, 0:3], axis=-1).mean():.2f} m")
 
+    viewer = None
+    if args.view:
+        from skyflow.viz import Viewer  # optional extra — imported only on request
+
+        viewer = Viewer.for_env(
+            env, watch=tuple(range(min(4, args.fleet))),
+            headless=args.headless, frames=args.frames, shot=args.shot,
+        )
+
     jstep = jax.jit(env.step)
     n_steps = round(args.seconds * cfg.control_hz)
     for t in range(1, n_steps + 1):
+        t0 = time.perf_counter()
         action = pd_action(
             np.asarray(obs), np.asarray(state.plant[:, 10:13]), u_hover, g
         )
-        obs, state, _reward, done, _info = jstep(state, jnp.asarray(action))
-        if bool(done.any()):
+        obs, state, reward, done, info = jstep(state, jnp.asarray(action))
+        if viewer is not None:
+            viewer.frame(state, obs=obs, action=action, reward=reward, done=done, info=info)
+            if viewer.take_reset():
+                obs, state = env.reset(jax.random.PRNGKey(args.seed + t))
+            while viewer.paused and viewer.open:
+                viewer.idle()
+            if not viewer.open:
+                break
+            # the demo runs faster than real time; pace it so the flight reads naturally
+            time.sleep(max(0.0, 1.0 / cfg.control_hz - (time.perf_counter() - t0)))
+        elif bool(done.any()):
             raise SystemExit(f"episode ended early at step {t} — controller diverged")
         if t % int(cfg.control_hz / 2) == 0:
             err = np.linalg.norm(np.asarray(obs)[:, 0:3], axis=-1)

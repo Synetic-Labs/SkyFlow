@@ -578,6 +578,15 @@ class SkyFlowEnv:
         )
         return obs_out, state_out, reward, done, info
 
+    def task_state(self, state: SimState) -> Any:
+        """
+        The task's OWN pytree for this state. In sticks mode `SimState.task_state` is
+        the firmware carry (§10) with the task's pytree inside it; every consumer that
+        wants task fields (metrics, viewers, recorders) must read through this accessor
+        instead of unwrapping the carry itself.
+        """
+        return state.task_state.task if self._fw is not None else state.task_state
+
     def metrics(self, state: SimState) -> dict[str, Array]:
         """
         Scalar means for logging (DESIGN.md §7): outcome fractions and episode stats as
@@ -588,7 +597,7 @@ class SkyFlowEnv:
         and the task's own diagnostics. All values are 0-d f32 — cheap to device-get at
         any cadence.
         """
-        ts = state.task_state.task if self._fw is not None else state.task_state
+        ts = self.task_state(state)
         out = {
             "crash_frac": state.crash_frac,
             "success_frac": state.success_frac,

@@ -25,18 +25,22 @@ dependencies = [
 cuda = ["jax[cuda13]>=0.11"]
 # Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. Floor = current public
 # release; the CPU SITL backend it needs (libcpuflight + aux API) exists since 0.2.1.
-firmware = ["cudaflight>=0.3.1"]
+firmware = ["cudaflight>=0.3.2"]
+# The optional viewer (DESIGN.md §13): live scene/FPV/instruments + flight-log replay.
+# pygame-ce is the maintained fork (imports as `pygame`); upstream pygame has no
+# wheels for current CPython.
+viz = ["pygame-ce>=2.5"]
 
 [dependency-groups]
 dev = ["pytest>=9", "ruff>=0.16"]
 
 [tool.uv.sources]
-# Local sibling checkout until published; switch to a git URL on release.
+# Published git source; the editable sibling path is handy for local dynamics work:
 # skyflow-dynamics = { path = "../SkyFlow-Dynamics", editable = true }
 skyflow-dynamics = { git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics" }
 # Public release wheel (binaries are generated artifacts — cudaflight is not
 # pip-installable from source, and is not on PyPI). Bump the URL to move versions.
-cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.1/cudaflight-0.3.1-py3-none-linux_x86_64.whl" }
+cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.2/cudaflight-0.3.2-py3-none-manylinux_2_39_x86_64.whl" }
 
 [project.urls]
 Homepage = "https://github.com/Synetic-Labs/SkyFlow"
