@@ -243,9 +243,13 @@ last_action(4)]` = 19, with optional uniform obs noise; reward per control step:
 success `d < 0.1 m` (does not terminate); task crash: leaving the safe box.
 
 **figure_eight** — the registered name of the generic `GateCourseTask`; course = `GateSet`
-from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder (lemniscate
-of Bernoulli through 2·k gates, alternating crossing directions at the
-center). Spawn: podium behind gate 1 or spread across gates (curriculum knob). Active-gate
+from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder: the
+research-canonical figure-8 — a GERONO lemniscate (x = a·sin t, y = ½a·sin 2t, 2:1
+footprint, round lobes) through 2·k gates, alternating crossing directions at the center.
+The 6-gate default (k = 3) reproduces the standard layout — one apex gate per lobe plus
+four gates on the crossover diagonals (cf. the 6-gate Figure-8 of Xing et al., RA-L 2025;
+same curve as crazyflow's figure-eight trajectory). Spawn: podium behind gate 1 or spread
+across gates (curriculum knob). Active-gate
 progress: `r = w_prog·(d_prev - d)` toward the pre-gate point + pass credit
 `w_gate·centering` on crossing (from `classify_crossings`; miss/frame-hit = task crash),
 minus rate penalty. Obs (state mode): `[gate_rel(3), gate_normal(3), next_gate_rel(3),

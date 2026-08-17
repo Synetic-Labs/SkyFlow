@@ -395,20 +395,26 @@ def figure_eight(
     depth: float = 0.0,
 ) -> GateSet:
     """
-    Figure-eight course on a lemniscate of Bernoulli: 2·k gates yawed tangent to the
-    path, all at ``alt_m`` (DESIGN.md §9).
+    Figure-eight course on a lemniscate of Gerono — the research-canonical figure-8 —
+    with 2·k gates yawed tangent to the path, all at ``alt_m`` (DESIGN.md §9).
 
     Path (z-up world, centre crossover at the origin, main axis along x):
 
-        x(t) = a·cos t / (1 + sin²t),   y(t) = a·sin t·cos t / (1 + sin²t)
+        x(t) = a·sin t,   y(t) = ½·a·sin 2t
 
-    with a = 2·``lobe_radius_m`` (each lobe spans 2·lobe_radius_m along ±x from the
-    crossover). Flight order follows t from -π/2: the right lobe counter-clockwise, then
-    the left lobe clockwise — the ∞ shape — so consecutive transits of the crossover run
-    along the two DIFFERENT diagonals (alternating crossing directions at the centre, the
-    property the gate task's alternating-normals test pins). Gates sit at k evenly spaced
-    parameter values per lobe, offset half a slot so none lands on the crossover; each is
-    yawed along the path tangent (direction of travel, analytic derivative) and upright.
+    with a = 2·``lobe_radius_m``: each lobe spans 2·lobe_radius_m along ±x from the
+    crossover, the full footprint is 4·lobe_radius_m x 2·lobe_radius_m (2:1, round
+    lobes — the proportions of the standard research figure-8; the Bernoulli lemniscate,
+    by contrast, is pinched to ~4:1). Flight order follows t from 0: the right lobe
+    clockwise, then the left lobe counter-clockwise — the ∞ shape — so consecutive
+    transits of the crossover run along the two DIFFERENT diagonals (alternating crossing
+    directions at the centre, the property the gate task's alternating-normals test
+    pins). Gates sit at k evenly spaced parameter values per lobe, offset half a slot so
+    none lands on the crossover; each is yawed along the path tangent (direction of
+    travel, analytic derivative) and upright. The 6-gate default (k = 3) lands one gate
+    on each lobe apex and four on the crossover diagonals — the canonical 6-gate layout
+    (cf. the Figure-8 track of Xing et al., RA-L 2025; crazyflow's figure-eight
+    trajectory rides the same curve).
 
     ``outer_half`` defaults to inner + DEFAULT_FRAME_WIDTH per side; ``depth`` is the
     frame thickness along the normal (0 = flat plane). Returns the gates in flight order;
@@ -421,15 +427,11 @@ def figure_eight(
     centers: list[tuple[float, float, float]] = []
     yaws: list[float] = []
     for i in range(2 * k):
-        t = -0.5 * math.pi + (i + 0.5) * math.pi / k
-        s, c = math.sin(t), math.cos(t)
-        d = 1.0 + s * s
-        centers.append((a * c / d, a * s * c / d, float(alt_m)))
-        # tangent = (dx/dt, dy/dt); the parametrization runs in flight direction, so no
-        # sign fix-up: dx/dt = -a·s·(3 - s²)/d², dy/dt = a·(c⁴ - s² - s⁴)/d²
-        dx = -a * s * (3.0 - s * s) / (d * d)
-        dy = a * (c**4 - s**2 - s**4) / (d * d)
-        yaws.append(math.atan2(dy, dx))
+        t = (i + 0.5) * math.pi / k
+        centers.append((a * math.sin(t), 0.5 * a * math.sin(2.0 * t), float(alt_m)))
+        # tangent = (dx/dt, dy/dt) = (a·cos t, a·cos 2t); the parametrization runs in
+        # flight direction, so no sign fix-up
+        yaws.append(math.atan2(math.cos(2.0 * t), math.cos(t)))
     iw, ih = float(inner_half[0]), float(inner_half[1])
     ow, oh = (outer_half if outer_half is not None
               else (iw + GateSet.DEFAULT_FRAME_WIDTH, ih + GateSet.DEFAULT_FRAME_WIDTH))
