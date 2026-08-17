@@ -138,7 +138,7 @@ class TestViewer:
                 break
             obs, state, reward, done, info = step(state, action)
             viewer.frame(state, obs=obs, action=action, reward=reward, done=done, info=info)
-        assert not viewer.open, "frames budget should have closed the viewer"
+        assert viewer.wait_closed(10.0), "frames budget should have closed the viewer"
         assert shot.exists() and shot.stat().st_size > 1000
 
     def test_policy_pane_vision_task(self, tmp_path, key):
@@ -167,7 +167,27 @@ class TestViewer:
                 break
             obs, state, reward, done, info = step(state, action)
             viewer.frame(state, obs=obs, action=action, reward=reward, done=done, info=info)
-        assert not viewer.open and shot.exists()
+        assert viewer.wait_closed(10.0) and shot.exists()
+
+    def test_render_thread_owns_drawing(self, tmp_path):
+        """A threaded viewer draws, screenshots, and closes with NO further pushes:
+        the render thread keeps the last frame alive and burns the frames budget."""
+        from skyflow.viz.primitives import Grid, Scene
+
+        shot = tmp_path / "threaded.png"
+        viewer = Viewer(
+            Scene(Grid()), headless=True, frames=5, shot=str(shot), display_hz=1000.0
+        )
+        assert viewer._thread is not None and viewer._thread.is_alive()
+        viewer.push(_frame())
+        assert viewer.wait_closed(10.0), "render thread should exhaust the budget alone"
+        assert shot.exists() and shot.stat().st_size > 1000
+        v2 = Viewer(Scene(Grid()), headless=True)
+        try:
+            with pytest.raises(RuntimeError, match="threaded=False"):
+                v2.grab()
+        finally:
+            v2.close()
 
 
 class TestReplay:

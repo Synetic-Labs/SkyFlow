@@ -5,13 +5,19 @@ The live pygame host (DESIGN.md §13).
 from the shared builders (scenepane/hud/fpv), data arrives as ViewFrames. It never steps
 the env and never owns the loop; `frame(state, ...)` is non-blocking and drops to the
 display rate, so a sim running faster than the screen costs one small host pull per
-DISPLAYED frame, not per step. The same push path serves live flight, replay and export.
+DISPLAYED frame, not per step.
+
+By default a background RENDER THREAD owns the window and does all drawing: the feeding
+thread only snapshots watch rows and posts them to a latest-wins mailbox, so the sim loop
+never pays draw time. Replay and export run synchronous (`threaded=False`) — scrubbing and
+video need frame-exact draws in the caller's thread.
 
 Keys: Space pause · ←/→ step/scrub (replay) · [ ] speed · Tab focus world · V pilot-cam
 res · T iso/top/profile · G fleet scatter · S screenshot · R reset request · Esc quit.
 """
 
 import os
+import threading
 import time
 from collections import deque
 from typing import Any
@@ -41,6 +47,34 @@ _TOP_H, _HUD_H, _FPV_W = 30, 150, 336
 _TRAIL_LEN = 300
 
 
+class _Mailbox:
+    """
+    Latest-wins single-slot handoff to the render thread; old frames drop by design.
+    Carries either a prebuilt ViewFrame (push) or a raw (state, ...) tuple whose
+    snapshot the render thread takes itself (frame).
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._new = threading.Event()
+        self._item: Any = None
+        self._seq = 0
+
+    def put(self, item: Any) -> int:
+        with self._lock:
+            self._item = item
+            self._seq += 1
+            self._new.set()
+            return self._seq
+
+    def take(self, timeout: float) -> tuple[Any, int]:
+        if not self._new.wait(timeout):
+            return None, 0
+        with self._lock:
+            self._new.clear()
+            return self._item, self._seq
+
+
 class Viewer:
     """One window: scene pane, FPV column (pilot + policy), instrument strip."""
 
@@ -64,6 +98,7 @@ class Viewer:
         headless: bool = False,
         frames: int | None = None,
         shot: str | None = None,
+        threaded: bool = True,
     ) -> None:
         """
         Args:
@@ -83,22 +118,10 @@ class Viewer:
           headless: force the SDL dummy video driver (CI, screenshots, export).
           frames: auto-close after this many drawn frames (with `shot`, save it first).
           shot: screenshot path written when `frames` runs out.
+          threaded: True (default) runs a render thread that owns the window — feeding
+            calls never pay draw time. False draws in the caller's thread (replay,
+            export, and anything that needs frame-exact draws).
         """
-        if headless:
-            os.environ["SDL_VIDEODRIVER"] = "dummy"
-        pygame.display.init()
-        pygame.font.init()
-        try:
-            self._screen = pygame.display.set_mode(size)
-        except pygame.error:  # no video device: fall back to the dummy driver
-            os.environ["SDL_VIDEODRIVER"] = "dummy"
-            pygame.display.quit()
-            pygame.display.init()
-            self._screen = pygame.display.set_mode(size)
-        pygame.display.set_caption(title)
-        self._font = pygame.font.SysFont("dejavusansmono,consolas,menlo,monospace", 14)
-        self._small = pygame.font.SysFont("dejavusansmono,consolas,menlo,monospace", 11)
-
         self.scene = scene
         self.watch = tuple(int(w) for w in watch)
         self.title = title
@@ -120,6 +143,7 @@ class Viewer:
         )
 
         self._size = size
+        self._headless = headless
         self._display_dt = 1.0 / float(display_hz)
         self._frames_left = frames
         self._shot = shot
@@ -133,10 +157,72 @@ class Viewer:
         self._projs: dict[str, Projection] = {}
         self._focus = 0
         self._last_draw = 0.0
+        self._last_submit = 0.0
         self._last_fleet: tuple[float, np.ndarray | None] = (0.0, None)
         self._last_vf: ViewFrame | None = None
         self._trails: dict[int, deque] = {i: deque(maxlen=_TRAIL_LEN) for i in range(len(self.watch))}
         self._hists: dict[str, deque] = {}  # one trace per channel, focused world
+
+        # render thread: owns the window and every pygame call after this point
+        self._running = True
+        self._thread: threading.Thread | None = None
+        self._init_error: Exception | None = None
+        self._shot_req: tuple[str, threading.Event] | None = None
+        if threaded:
+            self._mail = _Mailbox()
+            self._cond = threading.Condition()
+            self._drawn = 0
+            self._ready = threading.Event()
+            self._thread = threading.Thread(target=self._run, name="skyflow-viz", daemon=True)
+            self._thread.start()
+            self._ready.wait(timeout=10.0)
+            if self._init_error is not None:
+                raise self._init_error
+        else:
+            self._init_display()
+
+    def _init_display(self) -> None:
+        """Window + fonts — called exactly once, in whichever thread owns pygame."""
+        if self._headless:
+            os.environ["SDL_VIDEODRIVER"] = "dummy"
+        pygame.display.init()
+        pygame.font.init()
+        try:
+            self._screen = pygame.display.set_mode(self._size)
+        except pygame.error:  # no video device: fall back to the dummy driver
+            os.environ["SDL_VIDEODRIVER"] = "dummy"
+            pygame.display.quit()
+            pygame.display.init()
+            self._screen = pygame.display.set_mode(self._size)
+        pygame.display.set_caption(self.title)
+        self._font = pygame.font.SysFont("dejavusansmono,consolas,menlo,monospace", 14)
+        self._small = pygame.font.SysFont("dejavusansmono,consolas,menlo,monospace", 11)
+
+    def _run(self) -> None:
+        """Render-thread main: draw fresh frames; redraw the last one for liveness."""
+        try:
+            self._init_display()
+        except Exception as e:  # propagate to the constructor
+            self._init_error = e
+            self._ready.set()
+            return
+        self._ready.set()
+        while self._running:
+            item, seq = self._mail.take(0.05)
+            if not self._running:
+                break
+            if item is not None:
+                vf = item if isinstance(item, ViewFrame) else self._snap(*item)
+                if vf is not None:
+                    self._process(vf, force=True)
+                with self._cond:
+                    self._drawn = seq
+                    self._cond.notify_all()
+            elif self._last_vf is not None:
+                # no fresh frame: keep keys, the PAUSED overlay and the frames budget
+                # alive by redrawing the last one (self-throttled to ~20 fps)
+                self._process(self._last_vf)
+        pygame.display.quit()
 
     # -- construction --------------------------------------------------------------
 
@@ -186,7 +272,15 @@ class Viewer:
 
     def close(self) -> None:
         self._open = False
-        pygame.display.quit()
+        self._running = False
+        if self._thread is not None:
+            with self._cond:
+                self._cond.notify_all()  # unblock forced pushes
+            if threading.current_thread() is not self._thread:
+                self._thread.join(timeout=2.0)
+            # the render thread quits the display itself on exit
+        else:
+            pygame.display.quit()
 
     # -- feeding ----------------------------------------------------------------------
 
@@ -201,44 +295,95 @@ class Viewer:
         done: Any = None,
         info: dict[str, Any] | None = None,
     ) -> None:
-        """Show a live SimState. Non-blocking: skips work entirely between display frames."""
+        """
+        Show a live SimState. Non-blocking: between display frames it returns
+        immediately; on a threaded viewer even the host transfer happens on the render
+        thread (jax arrays are immutable, so the snapshot is safe there — but a step
+        jitted with donated buffers may free them, in which case that frame drops).
+        """
         if not self._open:
             return
         now = time.perf_counter()
-        if now - self._last_draw < self._display_dt:
+        if now - self._last_submit < self._display_dt:
             return
-        want_fleet = False
-        if self.show_fleet:
-            t_fleet, _ = self._last_fleet
-            want_fleet = now - t_fleet > 0.5
-        vf = snapshot(
-            state,
-            self.watch,
-            dt=self.dt,
-            obs=obs,
-            action=action,
-            reward=reward,
-            channels=channels,
-            done=done,
-            info=info,
-            task_state=None if self._task_state_of is None else self._task_state_of(state),
-            focus=self._focus,
-            fleet_positions=want_fleet,
-        )
+        self._last_submit = now
+        if self._thread is not None:
+            self._mail.put((state, obs, action, reward, channels, done, info))
+            return
+        vf = self._snap(state, obs, action, reward, channels, done, info)
+        if vf is not None:
+            self._process(vf)
+
+    def _snap(self, state, obs, action, reward, channels, done, info) -> ViewFrame | None:
+        """Snapshot + fleet-pull bookkeeping — runs in whichever thread draws."""
+        now = time.perf_counter()
+        want_fleet = self.show_fleet and now - self._last_fleet[0] > 0.5
+        try:
+            vf = snapshot(
+                state,
+                self.watch,
+                dt=self.dt,
+                obs=obs,
+                action=action,
+                reward=reward,
+                channels=channels,
+                done=done,
+                info=info,
+                task_state=(
+                    None if self._task_state_of is None else self._task_state_of(state)
+                ),
+                focus=self._focus,
+                fleet_positions=want_fleet,
+            )
+        except Exception:  # donated/freed buffers: the frame is gone; drop it
+            return None
         if want_fleet:
             self._last_fleet = (now, vf.positions)
         elif self.show_fleet:
             vf.positions = self._last_fleet[1]
-        self.push(vf)
+        return vf
 
     def idle(self) -> None:
         """Keep the window live while the hosting loop is paused."""
-        if self._last_vf is not None:
-            self.push(self._last_vf, force=False)
+        if self._thread is None and self._last_vf is not None:
+            self._process(self._last_vf)  # the render thread does this by itself
         time.sleep(0.01)
 
+    def wait_closed(self, timeout: float = 10.0) -> bool:
+        """Block until the viewer closes (frames budget, Esc); True if it did."""
+        deadline = time.perf_counter() + timeout
+        while self._open and time.perf_counter() < deadline:
+            time.sleep(0.01)
+        return not self._open
+
+    def screenshot(self, path: str, timeout: float = 5.0) -> bool:
+        """Save the next drawn frame to `path` (thread-safe); True when written."""
+        done = threading.Event()
+        self._shot_req = (str(path), done)
+        if self._thread is None and self._last_vf is not None:
+            self._process(self._last_vf, force=True)
+        return done.wait(timeout)
+
     def push(self, vf: ViewFrame, force: bool = False) -> None:
-        """Draw a prebuilt ViewFrame (replay/export enter here). Throttled unless forced."""
+        """
+        Show a prebuilt ViewFrame (replay/export enter here). Threaded viewers post it to
+        the render thread (latest wins; `force` waits until it is drawn); synchronous
+        viewers draw it in place.
+        """
+        if not self._open:
+            return
+        if self._thread is not None:
+            seq = self._mail.put(vf)
+            if force:
+                with self._cond:
+                    self._cond.wait_for(
+                        lambda: self._drawn >= seq or not self._open, timeout=5.0
+                    )
+            return
+        self._process(vf, force)
+
+    def _process(self, vf: ViewFrame, force: bool = False) -> None:
+        """Draw one frame — runs only in the thread that owns pygame."""
         if not self._open:
             return
         now = time.perf_counter()
@@ -254,6 +399,10 @@ class Viewer:
         self._last_vf = vf
         self._draw(vf)
         pygame.display.flip()
+        req, self._shot_req = self._shot_req, None
+        if req is not None:
+            pygame.image.save(self._screen, req[0])
+            req[1].set()
         if self._frames_left is not None:
             self._frames_left -= 1
             if self._frames_left <= 0:
@@ -262,7 +411,9 @@ class Viewer:
                 self.close()
 
     def grab(self) -> np.ndarray:
-        """The current window as [H,W,3] uint8 (export hosts read this after push)."""
+        """The current window as [H,W,3] uint8 — synchronous viewers only (export)."""
+        if self._thread is not None:
+            raise RuntimeError("grab() needs a synchronous viewer: pass threaded=False")
         return np.transpose(pygame.surfarray.array3d(self._screen), (1, 0, 2))
 
     # -- internals ---------------------------------------------------------------------

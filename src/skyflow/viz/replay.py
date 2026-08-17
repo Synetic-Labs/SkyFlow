@@ -108,7 +108,7 @@ def replay(
             import imageio.v3 as iio  # soft dep: only the export path needs it
         except ImportError as e:
             raise ImportError("mp4 export needs imageio: pip install 'imageio[ffmpeg]'") from e
-        viewer = viewer_for_log(log, pilot=pilot, headless=True)
+        viewer = viewer_for_log(log, pilot=pilot, headless=True, threaded=False)
         grabs = []
         for i in range(total):
             viewer.push(_frame_at(log, i), force=True)
@@ -120,7 +120,10 @@ def replay(
         print(f"wrote {mp4}: {len(grabs)} frames at {round(1.0 / log.dt)} fps")
         return
 
-    viewer = viewer_for_log(log, pilot=pilot, headless=headless, frames=frames, shot=shot)
+    # synchronous: the scrub cursor needs every push drawn exactly once, in this thread
+    viewer = viewer_for_log(
+        log, pilot=pilot, headless=headless, frames=frames, shot=shot, threaded=False
+    )
     viewer.speed = float(speed)
     i = int(np.clip(start, 0, total - 1))
     while viewer.open:

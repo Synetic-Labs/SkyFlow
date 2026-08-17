@@ -57,7 +57,7 @@ src/skyflow/
     fpv.py              # mask+floor composite (pure numpy) + PilotCam pose re-renderer
     scenepane.py        # scene + drone-glyph drawing onto a pygame surface
     hud.py              # instrument strip drawing
-    viewer.py           # the live pygame host: pacing, keys, panes, screenshots
+    viewer.py           # the live pygame host: render thread, pacing, keys, panes, shots
     record.py           # FlightLog — pose logs → self-describing flight.npz
     replay.py           # python -m skyflow.viz.replay: scrub/replay host + mp4 export
 examples/
@@ -341,7 +341,10 @@ Boundary: viz SHOWS what the vehicle did and sensed — it never decides it. Nor
   the policy.
 - **Builders draw, hosts own windows.** Panel builders are windowless (surface/array in,
   pixels out); the live viewer, the replay host and any export share them, so all hosts
-  look identical.
+  look identical. The live host draws on a background RENDER THREAD that owns the window
+  (latest-wins mailbox; feeding calls only snapshot watch rows, so the sim loop never
+  pays draw time); replay and export run synchronous (`threaded=False`) for frame-exact
+  draws.
 
 Four layers, strict about what each may know:
 
