@@ -32,11 +32,6 @@ mode, which never touches this module) works without the wheel installed.
 import ctypes
 import os
 
-# Best-effort (§10): the GPU fleet needs XLA's arena capped BEFORE jax touches the
-# GPU, or the firmware instance arrays find no VRAM. Only effective when this module
-# (or the user's launcher) runs before the first jax device use.
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -221,8 +216,8 @@ class GpuFirmwareFleet:
     This backend implements the verified nav-train sequence (DESIGN.md §10):
 
     - `XLA_PYTHON_CLIENT_PREALLOCATE=false` must be set BEFORE jax touches the GPU, or
-      XLA's arena leaves no VRAM for the firmware instance arrays. This module
-      `setdefault`s it at import as a best effort; export it in the launcher to be sure.
+      XLA's arena leaves no VRAM for the firmware instance arrays. Export it in the
+      LAUNCHER (the library never mutates the environment).
     - XLA claims the primary CUDA context first: the constructor touches the target
       device (`jnp.zeros(1, device=...)` + block_until_ready) before `cudaflight_create*`,
       so the firmware kernels share XLA's context instead of racing it for one.

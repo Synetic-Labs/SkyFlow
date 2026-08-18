@@ -282,9 +282,9 @@ SkyFlow therefore ships:
   in-jit pure step/reset custom calls, firmware state GENUINELY value-threaded as
   donated (blob, fwstate) uint8 buffers copied from the armed-on-ground snapshot;
   `fleet >= 3`; one handle = one device = `fleet` worlds; requires
-  `XLA_PYTHON_CLIENT_PREALLOCATE=false` before jax touches the GPU (the constructor
-  sets it best-effort and touches the target device first so XLA claims the primary
-  CUDA context).
+  `XLA_PYTHON_CLIENT_PREALLOCATE=false` before jax touches the GPU — the LAUNCHER
+  exports it; the library never mutates the environment. The constructor touches the
+  target device first so XLA claims the primary CUDA context.
 - Backend selection (`SimConfig.firmware`): `"cpu"` / `"gpu"` force a backend and fail
   loudly; `"auto"` (default) picks GPU when `fleet >= 3` and a CUDA device is visible,
   falling back to CPU with a `warnings.warn` when GPU construction fails.
