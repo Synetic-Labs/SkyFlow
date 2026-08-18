@@ -101,7 +101,7 @@ class CpuFirmwareFleet:
     Never pass a committed `.bin` as `eeprom`: an image one parameter-group version
     behind the wheel's firmware makes Betaflight factory-reset the whole config at
     boot, silently. Render the image from CLI dump text at use time with
-    `cudaflight.render_eeprom()` (cudaflight >= 0.3.5) — it fails loudly on any
+    `cudaflight.render_eeprom()` (cudaflight >= 0.4.0) — it fails loudly on any
     setting the firmware rejects. See examples/configs/ for the pattern.
     """
 
@@ -243,7 +243,7 @@ class GpuFirmwareFleet:
     - `eeprom` is a boot-ready config image (None boots stock defaults). Never pass
       a committed `.bin`: one parameter-group version of drift makes the firmware
       factory-reset the whole config at boot, silently. Render the image from CLI
-      dump text with `cudaflight.render_eeprom()` (cudaflight >= 0.3.5); it fails
+      dump text with `cudaflight.render_eeprom()` (cudaflight >= 0.4.0); it fails
       loudly on rejected settings. See examples/configs/.
     """
 
