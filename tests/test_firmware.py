@@ -240,6 +240,21 @@ def test_gpu_snapshot_restore_is_deterministic(gpu_fleet):
 
 
 @pytest.mark.gpu
+def test_gpu_snapshot_rides_as_jax_buffers(gpu_fleet):
+    """cudaflight >= 0.3.4: the reset call receives the snapshot as JAX buffer
+    arguments and the library-side snapshot copies are freed at construction."""
+    from cudaflight import xla as cfx
+
+    if not getattr(cfx, "SUPPORTS_SNAPSHOT_ARGS", False):
+        pytest.skip("cudaflight < 0.3.4: snapshot rides as baked pointers")
+    assert gpu_fleet._snapshot_args
+    # the library copies are gone; the JAX-side snapshot is the only one left
+    assert int(gpu_fleet._lib.cudaflight_snap_ptr(gpu_fleet._h)) == 0
+    assert int(gpu_fleet._lib.cudaflight_snap_state_ptr(gpu_fleet._h)) == 0
+    assert gpu_fleet._snap_blob.size > 0 and gpu_fleet._snap_state.size > 0
+
+
+@pytest.mark.gpu
 def test_env_firmware_auto_picks_gpu_fleet(gpu_fleet):
     """firmware="auto" on a CUDA box with fleet >= 3 builds the GPU backend, and the
     env steps through it (one jitted control step, finite outputs)."""

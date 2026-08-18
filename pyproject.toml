@@ -41,7 +41,7 @@ dev = ["pytest>=9", "ruff>=0.16"]
 skyflow-dynamics = { git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics" }
 # Public release wheel (binaries are generated artifacts — cudaflight is not
 # pip-installable from source, and is not on PyPI). Bump the URL to move versions.
-cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.3/cudaflight-0.3.3-py3-none-manylinux_2_39_x86_64.whl" }
+cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.4/cudaflight-0.3.4-py3-none-manylinux_2_39_x86_64.whl" }
 
 [project.urls]
 Homepage = "https://github.com/Synetic-Labs/SkyFlow"

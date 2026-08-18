@@ -262,7 +262,7 @@ Reward constants live in task kwargs with the shipped defaults; no reward code i
 ## 10. firmware.py — control="sticks"
 
 cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration; Python API
-additive through v0.3.3): package
+additive through v0.3.4): package
 `cudaflight`, no core deps; sensor input per 1 kHz tick = f32 [F,7] NED/FRD
 `[gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)]` (level hover ⇒
 az = -9.81); sticks f32 [F,4] AETR in [-1,1]; output motors f32 [F,4] in [0,1] QUADX
@@ -280,7 +280,12 @@ SkyFlow therefore ships:
   (`cudaflight.lib.load_cpu`), `io_callback(ordered=True)`, zero-length blob placeholders.
 - `firmware.GpuFirmwareFleet` — full implementation via `cudaflight.xla` (>= 0.3.3):
   in-jit pure step/reset custom calls, firmware state GENUINELY value-threaded as
-  donated (blob, fwstate) uint8 buffers copied from the armed-on-ground snapshot;
+  donated (blob, fwstate) uint8 buffers copied from the armed-on-ground snapshot.
+  With cudaflight >= 0.3.4 the snapshot ALSO rides as read-only JAX buffer arguments
+  into the reset call and the library-side snapshot copies are freed after
+  construction — every firmware DATUM then lives in XLA buffers (checkpointable,
+  swappable); the library keeps only kernels, context, and launch configuration.
+  On a 0.3.3 wheel the reset falls back to the library-side snapshot pointers.
   `fleet >= 3`; one handle = one device = `fleet` worlds; requires
   `XLA_PYTHON_CLIENT_PREALLOCATE=false` before jax touches the GPU — the LAUNCHER
   exports it; the library never mutates the environment. The constructor touches the

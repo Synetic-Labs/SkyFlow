@@ -286,11 +286,25 @@ class GpuFirmwareFleet:
 
         self.act_dim = int(self._lib.cudaflight_act_dim(self._h))
         self._fw_pure = _cfx.fw_step_pure_call(self._lib, self._h)
-        self._reset_pure = _cfx.reset_pure_call(self._lib, self._h)
         # the armed-on-ground episode-start snapshot, as fresh JAX buffers
         self._snap_blob, self._snap_state = _cfx.snapshot_state(
             self._lib, self._h, device_index
         )
+        # cudaflight >= 0.3.4: the snapshot rides into the reset call as read-only
+        # JAX buffer arguments, and the library-side copies are freed — every
+        # firmware datum then lives in XLA buffers. Older wheels fall back to the
+        # library-side snapshot pointers (baked device addresses).
+        self._snapshot_args = bool(
+            getattr(_cfx, "SUPPORTS_SNAPSHOT_ARGS", False)
+            and hasattr(self._lib, "cudaflight_release_snapshots")
+        )
+        if self._snapshot_args:
+            self._reset_pure = _cfx.reset_pure_call(
+                self._lib, self._h, snapshot=(self._snap_blob, self._snap_state)
+            )
+            self._lib.cudaflight_release_snapshots(self._h)
+        else:
+            self._reset_pure = _cfx.reset_pure_call(self._lib, self._h)
 
     # -- types.FirmwareFleet ----------------------------------------------------------
 
