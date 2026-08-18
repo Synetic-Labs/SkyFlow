@@ -94,9 +94,15 @@ class CpuFirmwareFleet:
 
     Construction boots `fleet` firmware instances, lets them settle `settle_ms` virtual
     milliseconds, arms, and snapshots — `fresh_firmware_state()` and `reset()` restore
-    that armed-on-ground snapshot. `eeprom` is a boot-ready Betaflight config image from
-    the cudaflight `--cli-dump` converter (None boots stock defaults); `lib` overrides
-    the wheel's packaged libcpuflight.so path.
+    that armed-on-ground snapshot. `eeprom` is a boot-ready Betaflight config image
+    (None boots stock defaults); `lib` overrides the wheel's packaged libcpuflight.so
+    path.
+
+    Never pass a committed `.bin` as `eeprom`: an image one parameter-group version
+    behind the wheel's firmware makes Betaflight factory-reset the whole config at
+    boot, silently. Render the image from CLI dump text at use time with
+    `cudaflight.render_eeprom()` (cudaflight >= 0.3.5) — it fails loudly on any
+    setting the firmware rejects. See examples/configs/ for the pattern.
     """
 
     def __init__(
@@ -234,6 +240,11 @@ class GpuFirmwareFleet:
     - bfSetBase runs before every step/reset launch: the handler points the global
       instance base at wherever XLA placed the donated blob and the kernel rebases
       on entry. One handle = one device = `fleet` worlds.
+    - `eeprom` is a boot-ready config image (None boots stock defaults). Never pass
+      a committed `.bin`: one parameter-group version of drift makes the firmware
+      factory-reset the whole config at boot, silently. Render the image from CLI
+      dump text with `cudaflight.render_eeprom()` (cudaflight >= 0.3.5); it fails
+      loudly on rejected settings. See examples/configs/.
     """
 
     def __init__(

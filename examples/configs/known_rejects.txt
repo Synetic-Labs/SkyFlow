@@ -1,0 +1,193 @@
+# Settings from air75_dump.txt (+ sim_overrides.txt) that this firmware
+# build rejects: target gaps (compiled out of SITL — serialrx_*/adc_*/
+# dshot_*, whole commands like 'resource') plus upstream renames and
+# removals, triaged when this snapshot was made. render_eeprom() fails
+# when the actual reject list differs from this file in either direction,
+# so a firmware bump that changes the schema stops the render until a
+# human re-triages and updates this file or sim_overrides.txt.
+# Regenerate candidates with: python -m cudaflight.config air75_dump.txt sim_overrides.txt
+ERROR IN serial: PARSING FAILED
+ERROR IN set: INVALID VALUE
+ERR_CMD_NA: beacon
+ERR_CMD_NA: beeper
+ERR_CMD_NA: color
+ERR_CMD_NA: dma
+ERR_CMD_NA: led
+ERR_CMD_NA: mode_color
+ERR_CMD_NA: resource
+ERR_CMD_NA: timer
+ERR_CMD_NA: vtx
+ERR_CMD_NA: vtxtable
+abs_control_cutoff
+abs_control_error_limit
+abs_control_limit
+acro_trainer_angle_limit
+acro_trainer_debug_axis
+acro_trainer_gain
+acro_trainer_lookahead_ms
+adc_device
+adc_tempsensor_calibration110
+adc_tempsensor_calibration30
+adc_vrefint_calibration
+beeper_dshot_beacon_tone
+beeper_frequency
+beeper_od
+cpu_late_limit_permille
+cpu_overclock
+crashflip_expo
+crsf_use_negotiated_baud
+d_min_pitch
+d_min_roll
+d_min_yaw
+displayport_max7456_blk
+displayport_max7456_col_adjust
+displayport_max7456_inv
+displayport_max7456_row_adjust
+displayport_max7456_wht
+displayport_msp_col_adjust
+displayport_msp_fonts
+displayport_msp_row_adjust
+displayport_msp_use_device_blink
+dshot_bidir
+dshot_bitbang
+dshot_bitbang_timer
+dshot_burst
+dshot_edt
+dshot_idle_value
+dyn_idle_d_gain
+dyn_idle_i_gain
+dyn_idle_max_increase
+dyn_idle_min_rpm
+dyn_idle_p_gain
+dyn_idle_start_increase
+esc_sensor_current_offset
+esc_sensor_halfduplex
+flash_spi_bus
+gps_rescue_disarm_threshold
+gps_rescue_imu_yaw_gain
+gps_rescue_landing_alt
+gps_rescue_pitch_cutoff
+gps_rescue_roll_mix
+gps_rescue_throttle_d
+gps_rescue_throttle_hover
+gps_rescue_throttle_i
+gps_rescue_throttle_max
+gps_rescue_throttle_min
+gps_rescue_throttle_p
+gps_rescue_velocity_d
+gps_rescue_velocity_i
+gps_rescue_velocity_p
+gyro_1_align_pitch
+gyro_1_align_roll
+gyro_1_align_yaw
+gyro_1_sensor_align
+gyro_2_align_pitch
+gyro_2_align_roll
+gyro_2_align_yaw
+gyro_2_bustype
+gyro_2_i2cBus
+gyro_2_i2c_address
+gyro_2_sensor_align
+gyro_2_spibus
+hott_alarm_int
+i2c1_clockspeed_khz
+i2c1_pullup
+i2c2_clockspeed_khz
+i2c2_pullup
+i2c3_clockspeed_khz
+i2c3_pullup
+i2c4_clockspeed_khz
+i2c4_pullup
+integrated_yaw_relax
+led_inversion
+ledstrip_beacon_armed_only
+ledstrip_beacon_color
+ledstrip_beacon_percent
+ledstrip_beacon_period_ms
+ledstrip_brightness
+ledstrip_grb_rgb
+ledstrip_profile
+ledstrip_race_color
+ledstrip_rainbow_delta
+ledstrip_rainbow_freq
+ledstrip_visual_beeper
+ledstrip_visual_beeper_color
+max7456_clock
+max7456_preinit_opu
+max7456_spi_bus
+mco_divider
+mco_on_pa8
+mco_source
+min_throttle
+osd_canvas_height
+osd_core_temp_alarm
+osd_profile
+osd_profile_1_name
+osd_profile_2_name
+osd_profile_3_name
+osd_profile_name_pos
+osd_rssi_dbm_alarm
+osd_stick_overlay_left_pos
+osd_stick_overlay_radio_mode
+osd_stick_overlay_right_pos
+osd_sys_bitrate_pos
+osd_sys_delay_pos
+osd_sys_distance_pos
+osd_sys_fan_speed_pos
+osd_sys_goggle_dvr_pos
+osd_sys_goggle_voltage_pos
+osd_sys_lq_pos
+osd_sys_vtx_dvr_pos
+osd_sys_vtx_temp_pos
+osd_sys_vtx_voltage_pos
+osd_sys_warnings_pos
+pid_in_tlm
+pinio_box
+pinio_config
+report_cell_voltage
+rpm_filter_fade_range_hz
+rpm_filter_harmonics
+rpm_filter_lpf_hz
+rpm_filter_min_hz
+rpm_filter_q
+rpm_filter_weights
+serialrx_inverted
+serialrx_provider
+simplified_dmax_gain
+system_hse_mhz
+telemetry_disabled_acc_x
+telemetry_disabled_acc_y
+telemetry_disabled_acc_z
+telemetry_disabled_altitude
+telemetry_disabled_cap_used
+telemetry_disabled_current
+telemetry_disabled_distance
+telemetry_disabled_esc_current
+telemetry_disabled_esc_rpm
+telemetry_disabled_esc_temperature
+telemetry_disabled_esc_voltage
+telemetry_disabled_fuel
+telemetry_disabled_ground_speed
+telemetry_disabled_heading
+telemetry_disabled_lat_long
+telemetry_disabled_mode
+telemetry_disabled_pitch
+telemetry_disabled_roll
+telemetry_disabled_temperature
+telemetry_disabled_vario
+telemetry_disabled_voltage
+tlm_halfduplex
+usb_hid_cdc
+usb_msc_pin_pullup
+use_integrated_yaw
+vcd_h_offset
+vcd_v_offset
+vcd_video_system
+vtx_band
+vtx_channel
+vtx_freq
+vtx_halfduplex
+vtx_low_power_disarm
+vtx_pit_mode_freq
+vtx_power
+vtx_softserial_alt

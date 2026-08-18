@@ -1,0 +1,5 @@
+# --- SITL_LOCKSTEP overrides (sim has no DSHOT transport) ---
+set motor_pwm_protocol = PWM
+set dshot_bidir = OFF
+# rename repair: this dump's firmware (4.5.0) called it dshot_idle_value
+set motor_idle = 550
