@@ -18,10 +18,10 @@ wheels = [
 
 [[package]]
 name = "cudaflight"
-version = "0.3.4"
-source = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.4/cudaflight-0.3.4-py3-none-manylinux_2_39_x86_64.whl" }
+version = "0.4.0"
+source = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.4.0/cudaflight-0.4.0-py3-none-manylinux_2_39_x86_64.whl" }
 wheels = [
-    { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.4/cudaflight-0.3.4-py3-none-manylinux_2_39_x86_64.whl", hash = "sha256:d850def9ade4a1df94856a1a7a9b30a8a9f3dbb09906cf0e0033ad68e3d28333" },
+    { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.4.0/cudaflight-0.4.0-py3-none-manylinux_2_39_x86_64.whl", hash = "sha256:774e13ce4bf7d90ee4fdea7ae0c977ac87614955096a4ff23652aa201ca2cabb" },
 ]
 
 [package.metadata]
@@ -615,7 +615,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "cudaflight", marker = "extra == 'firmware'", url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.4/cudaflight-0.3.4-py3-none-manylinux_2_39_x86_64.whl" },
+    { name = "cudaflight", marker = "extra == 'firmware'", url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.4.0/cudaflight-0.4.0-py3-none-manylinux_2_39_x86_64.whl" },
     { name = "jax", specifier = ">=0.11" },
     { name = "jax", extras = ["cuda13"], marker = "extra == 'cuda'", specifier = ">=0.11" },
     { name = "numpy", specifier = ">=2" },

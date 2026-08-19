@@ -23,10 +23,10 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = ["jax[cuda13]>=0.11"]
-# Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. Floor = the first
-# wheel that ships the cudaflight.xla FFI half (GpuFirmwareFleet); the CPU SITL
-# backend exists since 0.2.1.
-firmware = ["cudaflight>=0.3.3"]
+# Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. Floor = the 0.4.0
+# reset: firmware pinned to Betaflight release 2026.6.1, strict eeprom render
+# (cudaflight.render_eeprom), cudaflight.xla FFI half included.
+firmware = ["cudaflight>=0.4.0"]
 # The optional viewer (DESIGN.md §13): live scene/FPV/instruments + flight-log replay.
 # pygame-ce is the maintained fork (imports as `pygame`); upstream pygame has no
 # wheels for current CPython.
@@ -41,7 +41,7 @@ dev = ["pytest>=9", "ruff>=0.16"]
 skyflow-dynamics = { git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics" }
 # Public release wheel (binaries are generated artifacts — cudaflight is not
 # pip-installable from source, and is not on PyPI). Bump the URL to move versions.
-cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.3.4/cudaflight-0.3.4-py3-none-manylinux_2_39_x86_64.whl" }
+cudaflight = { url = "https://github.com/Synetic-Labs/cudaflight/releases/download/cudaflight-v0.4.0/cudaflight-0.4.0-py3-none-manylinux_2_39_x86_64.whl" }
 
 [project.urls]
 Homepage = "https://github.com/Synetic-Labs/SkyFlow"
