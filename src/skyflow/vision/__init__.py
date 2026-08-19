@@ -8,7 +8,7 @@ perfect render look like a real HSV pipeline's output, persistently per world.
 
 Frame contract (DESIGN.md §3): every public entry point speaks world z-up FLU — poses are
 (pos [F, 3], quat [F, 4] wxyz body→world) and gate definitions are z-up world coordinates.
-The ported NED/FRD renderer math stays behind these entry points (§3a).
+The NED/FRD renderer internals stay behind these entry points (§3a).
 """
 
 from skyflow.vision.camera import CameraModel

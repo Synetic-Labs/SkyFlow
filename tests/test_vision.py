@@ -2,10 +2,10 @@
 Vision suite (DESIGN.md §11): camera ray invariants, renderer behavior at the z-up FLU
 boundary, mask-noise range/persistence/identity, and figure_eight course geometry.
 
-CPU, deterministic keys. The ray-cast math itself was validated upstream against MuJoCo
+CPU, deterministic keys. The analytic ray-cast geometry is cross-checked against MuJoCo
 segmentation renders; what these tests pin is the SkyFlow surface — the frame conversion
 at every public entry point (world z-up FLU in, DESIGN.md §3), shapes and dtypes, and the
-figure-eight builder that is new here (DESIGN.md §9).
+figure-eight builder (DESIGN.md §9).
 """
 
 import math

@@ -10,13 +10,12 @@ along the normal (0 = flat plane).
 Frame contract (DESIGN.md §3): every public surface speaks world z-up FLU — builders take
 z-up centres (z = altitude), yaw about world +z (0 = +x, 90° = +y), pitch up-positive;
 :func:`classify_crossings` takes z-up positions; the ``*_world`` properties read the
-geometry back in z-up. The DATACLASS FIELDS are the ported renderer's internal NED arrays
+geometry back in z-up. The DATACLASS FIELDS are the renderer's internal NED arrays
 (§3a) — construct through the builders, not the raw constructor, unless you are inside
 vision/. The z-up→NED conversion happens exactly once, in :func:`_gateset_from_world`.
 
-Provenance: geometry and crossing classification ported unchanged from the nav-train gate
-renderer (validated there against MuJoCo segmentation renders); :func:`figure_eight` is
-new to SkyFlow (DESIGN.md §9).
+Geometry and crossing classification are validated against MuJoCo segmentation renders;
+:func:`figure_eight` is specific to SkyFlow (DESIGN.md §9).
 """
 
 import math
@@ -40,7 +39,7 @@ class GateSet:
     (lateral, vertical) of the opening, ``outer_half[g]`` likewise of the outer edge.
 
     FIELDS ARE INTERNAL NED (DESIGN.md §3a): centres NED, yaws about world down, plane
-    axes NED vectors — the frame the ported renderer math runs in. Public access goes
+    axes NED vectors — the frame the renderer math runs in. Public access goes
     through the builders (:meth:`build`, :meth:`single`, the course functions), which take
     world z-up FLU definitions, and the ``*_world`` properties, which read z-up back.
 
@@ -62,7 +61,7 @@ class GateSet:
     laterals: jax.Array = field(default=None)    # type: ignore[assignment]
     verticals: jax.Array = field(default=None)   # type: ignore[assignment]
 
-    # Defaults are the reference orange racing gate: ~0.55 m square opening, ~0.225 m
+    # Defaults are a typical orange racing gate: ~0.55 m square opening, ~0.225 m
     # frame band per side (outer ~1.0 m square). The mitred corners of the physical gate
     # are approximated as a square-cornered band — a small difference at the four
     # corners; refine if sim-to-real keys on it.

@@ -1,5 +1,5 @@
 """
-DESIGN.md §11, suite 3 — disturbances: OU wind stationary statistics, poke rate, and the
+DESIGN.md §11 — disturbances: OU wind stationary statistics, poke rate, and the
 proof that wind reaches the aerodynamics through the backend's exogenous inputs (and is
 exactly zero when disabled).
 

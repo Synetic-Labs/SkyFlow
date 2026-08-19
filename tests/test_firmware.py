@@ -5,7 +5,7 @@ The sensor helpers and protocol/signature conformance run everywhere. Everything
 touches the real CPU SITL sits behind `pytest.importorskip("cudaflight")` plus a further
 skip when `load_cpu()` cannot produce a library (missing/blocked libcpuflight.so):
 arm → spin-up → hover smoke at the 1 kHz tick, under jit, plus a masked-reset smoke.
-Expected values come from the probed wheel v0.2.1 behavior: instances arm during create
+Expected values follow the cudaflight CPU SITL behavior: instances arm during create
 and snapshot, so armed is truthy from the first tick and a masked reset replays the
 fresh-snapshot trajectory deterministically.
 """

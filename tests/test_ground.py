@@ -1,5 +1,5 @@
 """
-DESIGN.md §11, suite 4 — ground contact (§8): the clamp never lets the vehicle
+DESIGN.md §11 — ground contact (§8): the clamp never lets the vehicle
 penetrate, a resting vehicle genuinely rests (no creep, no spurious dones), a hard fall
 registers as a ground crash, and the spawned-on-pad hover task takes off under full
 throttle. physics_dr_scale is 0 throughout: symmetric rotors keep open-loop full

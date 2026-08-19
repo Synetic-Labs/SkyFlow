@@ -2,14 +2,14 @@
 
 - `stock_dump.txt` — the stock `dump all` of the pinned cudaflight
   firmware build (Betaflight 2026.6.1 SITL defaults). A placeholder
-  example: real per-drone configs live with the trainer that owns the
-  drone (nav-train `drones/`), not here.
+  example: keep real per-drone configs with the trainer that owns the
+  drone, not in this repo.
 
 Config source of truth is CLI text. The eeprom `.bin` is a derived
 artifact: render it at use time and never commit it. Rendering is strict
 — any line the firmware rejects fails the render and is named.
 
-Render and boot a fleet (needs cudaflight >= 0.4.0):
+Render and boot a fleet (needs cudaflight >= 0.5.0):
 
 ```python
 from pathlib import Path

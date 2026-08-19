@@ -1,4 +1,4 @@
-tt# SkyFlow — design of record
+# SkyFlow — design of record
 
 Status: implementation contract for the v0.2 rewrite. Interfaces here are FROZEN for the
 build; change requires editing this file first. Style: this document is normative — "must"
@@ -16,7 +16,7 @@ SkyFlow is a fleet-batched quadrotor **simulator** in pure JAX. It is only the s
   import SkyFlow and own all of that.
 - **Tasks are examples.** SkyFlow ships the Task protocol plus two reference tasks
   (`hover`, `figure_eight`). Real research tasks live in the
-  consuming repo and register against the protocol.
+  downstream project and register against the protocol.
 - Differentiability is **not claimed** in docs or API. The design avoids blockers
   (pure functions, no in-place host state on the motors path), and a `differentiable`
   flag exists but must raise `NotImplementedError("planned")` for now.
@@ -68,7 +68,7 @@ tests/                  # pytest; §11 lists the required suites
 ```
 
 Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: the public git
-URL; was an editable sibling path before publication). Extras: `cuda` → `jax[cuda13]`;
+URL). Extras: `cuda` → `jax[cuda13]`;
 `firmware` → `cudaflight>=0.3.3` (public GitHub release-wheel URL source); `viz` → nothing but
 `pygame-ce>=2.5` (§13; the maintained fork, imports as `pygame`). Dev group: `pytest>=9`,
 `ruff>=0.16`. License MIT. Version 0.2.0.
@@ -79,7 +79,7 @@ URL; was an editable sibling path before publication). Extras: `cuda` → `jax[c
   **Quaternion**: wxyz scalar-first, Hamilton, body→world. **Units**: SI, rad/s rotor
   speeds. Identical to SkyFlow-Dynamics — states pass through untranslated.
 - NED/FRD exists in exactly two contained places: (a) inside `vision/` internals (the
-  ported renderer math; conversion at its public entry points), (b) at the firmware
+  renderer's internal math; conversion at its public entry points), (b) at the firmware
   boundary (Betaflight wants FRD sensors). Public APIs speak z-up FLU only.
 - dtype: float32 on every array the env creates. Precision of the dynamics follows the
   ambient JAX config (tests may enable x64 for tolerance checks of adapters only).
@@ -261,8 +261,7 @@ Reward constants live in task kwargs with the shipped defaults; no reward code i
 
 ## 10. firmware.py — control="sticks"
 
-cudaflight facts (mapped from the wheel v0.2.1 + nav-train integration; Python API
-additive through v0.3.4): package
+cudaflight facts (Python API additive through v0.3.4): package
 `cudaflight`, no core deps; sensor input per 1 kHz tick = f32 [F,7] NED/FRD
 `[gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)]` (level hover ⇒
 az = -9.81); sticks f32 [F,4] AETR in [-1,1]; output motors f32 [F,4] in [0,1] QUADX
@@ -296,7 +295,7 @@ SkyFlow therefore ships:
 - Injection: `SkyFlowEnv(cfg, firmware_fleet=...)` accepts any FirmwareFleet and
   overrides `cfg.firmware`.
 
-Sticks substep order (normative, from the verified nav-train sequence): synth sensors
+Sticks substep order (normative): synth sensors
 (FLU→FRD flip; baro from z-up altitude, isothermal 101325 Pa / 8434 m — a harness-side
 sensor model, documented as such) → optional inverse board-align yaw rotation →
 `fw_step` → motors [0,1] reordered by `motor_perm` → motor duties feed the throttle map
@@ -321,7 +320,7 @@ cudaflight importable → ImportError with install guidance at construction.
   c_D > 0), zeros when disabled.
 - `test_ground.py` — no penetration; resting vehicle stays; spawned-on-pad hover task
   takes off under full throttle.
-- `test_tasks.py` — hover: spawn/obs/reward shapes, reward increases as distance falls;
+- `test_task_hover.py` / `test_task_gate.py` — hover: spawn/obs/reward shapes, reward increases as distance falls;
   figure_eight (GateCourseTask): scripted straight-line fly-through registers pass exactly once, centering
   ∈ (0,1]; miss trajectory → crash; figure-eight builder: 2k gates, closed loop, gate
   normals alternate through the crossover.
@@ -343,7 +342,8 @@ cudaflight importable → ImportError with install guidance at construction.
 
 ## 12. Deferred (roadmap, do not build now)
 
-nav-train identified-physics intake (owner decision pending); differentiability claim +
+identified-physics intake for measured airframes (through the SkyFlow-Dynamics INTAKE
+protocol); differentiability claim +
 BPTT tests; Dryden/von Kármán wind drivers (spec terms exist); battery/voltage sag;
 sensor staleness/sample-hold DR; obs frame stacking; renderer supersampling knobs beyond
 the port; FunctionalToStateful adapter; multi-vehicle interaction (downwash candidates);
@@ -370,7 +370,7 @@ Boundary: viz SHOWS what the vehicle did and sensed — it never decides it. Nor
 Four layers, strict about what each may know:
 
 1. **Vehicle truth — always drawn.** Pose, attitude, rotor speeds, trails, glyphs, the
-   fixed HUD instruments (sticks/action, motors, attitude, speed/altitude). All from
+   fixed HUD instruments (sticks/action, motors, attitude, heading, speed/altitude). All from
    `plant` and the step outputs. No task knowledge.
 2. **World geometry — always data.** Scene primitives. Tasks and users contribute them;
    the pane only draws. Extension is public: `register_primitive(cls, draw_fn)` — the

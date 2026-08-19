@@ -1,8 +1,8 @@
 """
-DESIGN.md §11, suite 5 (hover part) — HoverTask spawn/obs/reward logic on
+DESIGN.md §11 (task tests, hover part) — HoverTask spawn/obs/reward logic on
 dynamics-free synthetic plant states: plant rows [F,17] are built directly, so nothing
 here depends on env.py or the dynamics backend. The task is imported directly (not via
-the tasks/ registry, which is integrated separately).
+the tasks/ registry, which test_registry.py covers).
 """
 
 from itertools import pairwise

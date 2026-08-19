@@ -1,11 +1,11 @@
 """
-DESIGN.md §11, suite 2 — the SkyFlowEnv platform contract: shapes/dtypes/finiteness,
+DESIGN.md §11 — the SkyFlowEnv platform contract: shapes/dtypes/finiteness,
 determinism, done semantics, final_obs, auto-reset isolation, delay buffer, ZOH. The
-jitted 50-step rollout + no-retrace smoke (suite 8's env half) lives here too, since
-env.py is the unit under test.
+jitted 50-step rollout + no-retrace smoke (the env half of the jit checks) lives here
+too, since env.py is the unit under test.
 
 All tests run the hover task injected directly (`SkyFlowEnv(cfg, task=...)`) so the
-suite does not depend on the tasks/ registry, which is integrated separately. Fleets are
+suite does not depend on the tasks/ registry, which test_registry.py covers. Fleets are
 small and keys fixed; physics_dr_scale defaults to 0 here so thresholds are exact.
 """
 

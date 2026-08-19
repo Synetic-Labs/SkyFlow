@@ -3,8 +3,7 @@ Betaflight-in-the-loop seam for control="sticks" (DESIGN.md §10).
 
 SkyFlow's public frames are world z-up / body FLU, but Betaflight wants NED/FRD sensors;
 this module is one of the two places NED/FRD is allowed to exist (DESIGN.md §3). The
-boundary layout is fixed by the cudaflight wheel (v0.2.1, verified through the nav-train
-integration):
+boundary layout is fixed by the cudaflight wheel:
 
     sensors [F, 7] f32 = gyro_FRD rad/s (3), specific force FRD m/s² (3), baro Pa (1)
                          (level hover ⇒ az = -9.81)
@@ -17,9 +16,9 @@ call. `CpuFirmwareFleet` (libcpuflight.so, ctypes) is complete and self-containe
 fleet size, no CUDA, jits via ordered `io_callback`, but is NOT vmappable or replayable
 because the real firmware state mutates host-side and the threaded pair is a zero-length
 placeholder. `GpuFirmwareFleet` (libcudaflight.so, in-jit XLA FFI, genuinely donated
-buffers) raises NotImplementedError until cudaflight absorbs its FFI half; its constructor
-documents the exact contract it will implement. nav-train's existing GPU fleet satisfies
-the protocol and can be injected today via `SkyFlowEnv(cfg, firmware_fleet=...)`.
+buffers) requires cudaflight >= 0.3.3, which ships its `cudaflight.xla` FFI half. Any
+external fleet that satisfies the protocol can be injected via
+`SkyFlowEnv(cfg, firmware_fleet=...)`.
 
 The two sensor helpers below are the ONLY sensor packaging DESIGN.md §10 authorizes in
 this module: a frame flip and an isothermal barometer. Anything that models physics
@@ -46,7 +45,7 @@ _INSTALL_GUIDANCE = (
     "add the cudaflight wheel to the environment directly."
 )
 
-# Isothermal barometer constants, matching the verified nav-train sensor packaging:
+# Isothermal barometer constants for the firmware sensor boundary:
 # P = 101325 Pa at sea level, scale height 8434 m.
 _SEA_LEVEL_PA = 101325.0
 _BARO_SCALE_M = 8434.0
@@ -70,7 +69,7 @@ def baro_pa(alt_m: ArrayLike) -> jax.Array:
     Barometric pressure Pa from z-up altitude m: 101325·exp(-alt/8434).
 
     Harness-side sensor MODEL for the firmware boundary, not spec physics — an isothermal
-    atmosphere (the verified nav-train packaging), good to ~0.1% over indoor flight
+    atmosphere, good to ~0.1% over indoor flight
     envelopes; Betaflight only differentiates it for altitude hold. Sea level ⇒ 101325 Pa.
     DESIGN.md §10 authorizes exactly this barometer here; a physical atmosphere model
     would go through the SkyFlow-Dynamics INTAKE protocol instead.
@@ -219,7 +218,7 @@ class GpuFirmwareFleet:
     Requires cudaflight >= 0.3.3: the wheel ships the XLA FFI half (`cudaflight.xla`,
     prebuilt handlers + source fallback), so the firmware kernels launch directly on
     XLA's compute stream inside the jitted program — zero host round trips per tick.
-    This backend implements the verified nav-train sequence (DESIGN.md §10):
+    This backend implements the construction sequence DESIGN.md §10 fixes:
 
     - `XLA_PYTHON_CLIENT_PREALLOCATE=false` must be set BEFORE jax touches the GPU, or
       XLA's arena leaves no VRAM for the firmware instance arrays. Export it in the

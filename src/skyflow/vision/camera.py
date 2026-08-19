@@ -2,19 +2,18 @@
 Pinhole camera model for the analytic mask renderer (DESIGN.md §2).
 
 Public frame contract (DESIGN.md §3): the mount is stated in body FLU — x forward, y left,
-z up. The ray-cast internals are ported NED/FRD math and consume the private
+z up. The ray-cast internals are NED/FRD math and consume the private
 ``_R_frd_from_cam`` / ``_offset_frd`` twins, both derived from the same FLU fields by the
 (x, -y, -z) flip, so a mount is authored in exactly one frame. The camera's own image
 frame is the standard pinhole convention — x right, y down, z forward along the optical
 axis — which is camera-frame, not NED/FRD, and appears in public docstrings unchanged.
 
-Defaults model the BetaFPV C03 as flown: 64x64 policy view; 99° x 79.8° fields of view
+Defaults model the BetaFPV C03: 64x64 policy view; 99° x 79.8° fields of view
 (the real sensor undistorted then squashed to a square frame has fx ≠ fy, so the focal
 lengths are tracked separately); 25° up-tilt (``mount_pitch_deg = -25``); lens 2 cm
 forward and 2 cm above the body origin.
 
-Ported from the nav-train gate renderer (validated there against MuJoCo segmentation
-renders); the intrinsics and ray-grid math are unchanged.
+The intrinsics and ray-grid math are validated against MuJoCo segmentation renders.
 """
 
 import math
@@ -65,14 +64,14 @@ class CameraModel:
 
     @property
     def _offset_frd(self) -> tuple[float, float, float]:
-        """``offset_body`` re-expressed in body FRD — the ported renderer's frame."""
+        """``offset_body`` re-expressed in body FRD — the renderer's internal frame."""
         x, y, z = self.offset_body
         return (x, -y, -z)
 
     @property
     def _R_frd_from_cam(self) -> jax.Array:
         """
-        3x3 rotation mapping a camera-frame vector into body FRD — the ported internal
+        3x3 rotation mapping a camera-frame vector into body FRD — the internal
         mount math (DESIGN.md §3a). Camera axes expressed in FRD, with downward pitch θ:
 
           right   (cam +x) = body +y                  = [0, 1, 0]
@@ -97,7 +96,7 @@ class CameraModel:
     def R_body_from_cam(self) -> jax.Array:
         """
         3x3 rotation mapping a camera-frame vector (x right, y down, z forward) into body
-        FLU — the public statement of the mount. Derived from the ported FRD matrix by the
+        FLU — the public statement of the mount. Derived from the internal FRD matrix by the
         (x, -y, -z) row flip, so both frames read one definition. At zero pitch the
         optical axis is exactly body +x; the default -25° pitch gives (cos 25°, 0, sin 25°).
         """

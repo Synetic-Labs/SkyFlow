@@ -2,7 +2,7 @@
 Task registry (DESIGN.md §2): the name → builder map behind `SimConfig.task`.
 
 SkyFlow ships two reference tasks — `hover` and `figure_eight` — registered here at
-import; research tasks live in consuming repos and register against the same protocol
+import; research tasks live in downstream projects and register against the same protocol
 (`skyflow.types.Task`), which makes them first-class: the env reaches every task through
 `build_task`, and nothing special-cases the built-ins. Builders receive
 `SimConfig.task_kwargs` unmodified; on top of those the env forwards the env-owned

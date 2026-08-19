@@ -105,8 +105,8 @@ class UdpSticks:
                 break
         if packet is not None and len(packet) >= struct.calcsize(_UDP_FMT):
             roll, pitch, yaw, throttle, buttons = struct.unpack_from(_UDP_FMT, packet)
-            # senders transmit the raw SDL pitch axis (stick forward = negative);
-            # the receiver negates — the established wire convention
+            # wire convention: senders transmit the raw SDL pitch axis (stick
+            # forward = negative); the receiver negates
             self._last = np.array([[roll, -pitch, throttle, yaw]], np.float32)
             self._buttons = int(buttons)
         return self._last, self._buttons

@@ -1,8 +1,8 @@
 """
-DESIGN.md §11, suite 8 (vision half) — the vision task rolls out jitted, rendering its
-coverage masks in-trace, with finite float32 observations and masks in [0, 1].
+DESIGN.md §11 (jit checks, vision half) — the vision task rolls out jitted, rendering
+its coverage masks in-trace, with finite float32 observations and masks in [0, 1].
 
-The env half of suite 8 — the jitted 50-step rollout with the NaN and retrace checks —
+The env half of the jit checks — the jitted 50-step rollout with the NaN and retrace checks —
 lives with the platform contract in
 test_env_contract.py::test_jitted_50_step_rollout_no_nan_no_retrace. This file also
 builds its env through the SimConfig(task=..., task_kwargs=...) registry path, so the

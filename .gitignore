@@ -16,6 +16,7 @@ htmlcov/
 
 # JAX / local artifacts
 benchmark/data/
+dvr/
 *.npz
 *.orbax
 runs/

@@ -41,8 +41,8 @@ pure JAX, static shapes, branchless (Bernoulli gates are ``where`` masks), so it
 runs inside a training scan at negligible cost next to the ray-cast render. Outward glow
 widening of the band is handled geometrically in ``render_masks(..., outer_grow=...)``,
 not here — tasks that persist it draw the width from the extra :data:`GROW_FAMILY` key
-slot (:func:`grow_from_keys`). Defaults were tuned by eye against real captures of the
-reference HSV pipeline.
+slot (:func:`grow_from_keys`). Defaults were tuned by eye against real captures from a
+classical HSV gate-mask pipeline.
 
 :func:`erasure_at` answers the INVERSE question — "is this pixel under a hole or an
 occluder" — at arbitrary coordinates, without rendering. It exists so a consumer that
@@ -52,9 +52,6 @@ mask also hides it from that consumer. The occluder shapes therefore have ONE de
 each (:func:`_stick_at`, :func:`_pillar_at`, called with grid coordinates by the renderer
 and point coordinates by the sampler) and the erasing families' defaults are module
 constants, so the two cannot drift apart.
-
-Provenance: ported from the nav-train mask-corruption module with the algorithms, family
-set and tuned defaults unchanged.
 """
 
 import jax

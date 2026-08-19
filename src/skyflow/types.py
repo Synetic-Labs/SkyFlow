@@ -6,8 +6,8 @@ body FLU, quaternions wxyz scalar-first Hamilton body→world, SI units with rot
 rad/s. Every batched array leads with the fleet axis [F, ...]. The env creates float32
 leaves only; precision inside the dynamics follows the ambient JAX config.
 
-This module holds structure, not behavior: Task and FirmwareFleet are the seams consuming
-repos implement against, and SimState is the single pytree the env scans.
+This module holds structure, not behavior: Task and FirmwareFleet are the seams
+downstream projects implement against, and SimState is the single pytree the env scans.
 """
 
 import dataclasses
@@ -77,8 +77,8 @@ class StepInfo(TypedDict):
 class Task(Protocol):
     """
     A task decides what the vehicle attempts and senses (DESIGN.md §4, §9). SkyFlow ships
-    `hover` and `figure_eight` as examples; research tasks live in consuming repos and
-    register against this protocol. All methods are pure and jit/vmap-safe.
+    `hover` and `figure_eight` as examples; research tasks live in downstream projects
+    and register against this protocol. All methods are pure and jit/vmap-safe.
     """
 
     obs_spec: ObsSpec

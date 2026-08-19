@@ -10,13 +10,12 @@ Touching any gate's frame solid (frame hit) or carrying the active gate's forwar
 crossing outside its opening (miss — wide fly-arounds included) is a task crash; passing
 the last gate is success and terminates the episode.
 
-Ported, simplified, from nav-train's gate task (nav/envs/functional/crazyflow/tasks/gate/
-env.py) and its SkyDreamer reward port (nav/envs/functional/skyflow/reward.py, Diermayr
-et al. 2025, arXiv 2510.14783). The centering measure is SkyDreamer's Chebyshev miss at
-the centre-plane crossing point — here normalized per axis so rectangular openings score
-the same as square ones — giving centering ∈ (0, 1] on every clean pass. The depth
-ratchet, back-half cash-out, and slow-speed gain of the full SkyDreamer shape are
-training-repo refinements and stay out of the shipped reward (DESIGN.md §9).
+The reward shape follows SkyDreamer (Diermayr et al. 2025, arXiv 2510.14783),
+simplified. The centering measure is SkyDreamer's Chebyshev miss at the centre-plane
+crossing point — here normalized per axis so rectangular openings score the same as
+square ones — giving centering ∈ (0, 1] on every clean pass. The depth ratchet,
+back-half cash-out, and slow-speed gain of the full SkyDreamer shape are deliberately
+out of the shipped reward (DESIGN.md §9).
 
 Frames: world z-up, body FLU, quaternion wxyz Hamilton body→world (DESIGN.md §3). The
 vision modules convert to their internal NED at their own public boundaries, so every
@@ -223,8 +222,7 @@ class GateCourseTask:
         `imu`, `key` and `fresh_spawn` are unused: this task observes exact state (the
         IMU packaging stays in sensors.py), and the persistent mask-corruption families
         for vision obs are deferred work (DESIGN.md §12). rot_matrix flattens row-major
-        (tasks.base.quat_to_rot) — the same nine numbers, in the same order, nav-train's
-        `_orientation` feeds its policies.
+        (tasks.base.quat_to_rot).
         """
         del imu, key, fresh_spawn
         pos = plant[:, 0:3]
@@ -260,9 +258,8 @@ class GateCourseTask:
                - w_rate·‖ω‖.
         Crash: the segment touched ANY gate's frame solid (frame hit, from
         `classify_crossings`), or crossed the active gate's centre plane forward
-        without a clean pass (miss — the nav-train event, which also catches wide
-        fly-arounds beyond the outer edge; pass and miss partition every forward
-        transit). Success: clean pass of the last gate. On a pass the active gate
+        without a clean pass (miss — which also catches wide fly-arounds beyond the
+        outer edge; pass and miss partition every forward transit). Success: clean pass of the last gate. On a pass the active gate
         advances (clipping at the last); progress this step is measured against the
         pre-advance gate for both endpoints, so the term stays telescoping.
         """
@@ -302,7 +299,7 @@ class GateCourseTask:
         # Miss: forward crossing of the active centre plane that is not a clean pass —
         # the same crossing predicate classify_crossings applies, so pass and miss
         # partition every forward transit. Catches wide fly-arounds beyond the outer
-        # edge, which touch no solid but end the attempt (the nav-train miss event).
+        # edge, which touch no solid but end the attempt.
         missed = (prev_sd * sd < 0.0) & (prev_sd < 0.0) & ~passed
         crash = jnp.any(hit, axis=-1) | missed
 

@@ -1,13 +1,10 @@
 """
-DESIGN.md §11, suite 5 (gate part) — GateCourseTask pass/crash/progress logic on
+DESIGN.md §11 (task tests, gate part) — GateCourseTask pass/crash/progress logic on
 dynamics-free synthetic plant states: plant rows [F,17] are built directly, so nothing
 here depends on env.py or the dynamics backend.
 
 The shipped `skyflow.vision` modules (DESIGN.md §2: gates/camera/renderer/mask_noise)
-are used as-is. This suite once carried a mock fallback for not-yet-integrated vision
-modules; it was unreachable by construction (`import skyflow` pulls in
-`skyflow.vision.gates` through the tasks registry before any mock could install) and
-vision ships complete, so it was removed rather than made real.
+are used as-is.
 """
 
 import math
@@ -123,7 +120,7 @@ def test_offset_trajectory_through_frame_crashes():
 def test_wide_flyaround_of_active_gate_is_a_miss_crash():
     """Crossing the active plane beyond the outer edge touches no solid but is a miss.
 
-    The nav-train miss event (DESIGN.md §9 "miss/frame-hit = task crash"): pass and miss
+    The miss event (DESIGN.md §9 "miss/frame-hit = task crash"): pass and miss
     partition every forward transit of the active centre plane, so flying around the
     gate ends the attempt exactly like hitting the frame does.
     """

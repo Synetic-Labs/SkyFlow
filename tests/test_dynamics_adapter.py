@@ -1,5 +1,5 @@
 """
-DESIGN.md §11, suite 1 — the dynamics adapter is a pure re-batching of the generated
+DESIGN.md §11 — the dynamics adapter is a pure re-batching of the generated
 backend. Runs under x64 (module-scoped, restored on teardown) so comparisons hold at the
 golden 1e-9 tolerances. This is the one suite that imports skyflow_dynamics directly: its
 whole point is composing the backend by hand against skyflow.dynamics.
