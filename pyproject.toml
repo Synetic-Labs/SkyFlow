@@ -16,13 +16,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Physics",
 ]
 dependencies = [
-    "jax>=0.11",
+    # >=0.11.1: the cudaflight wheel's XLA shim is built against jax 0.11.1
+    # headers; an older runtime rejects its handlers (CUDA does so silently).
+    "jax>=0.11.1",
     "numpy>=2",
     "skyflow-dynamics[jax]",
 ]
 
 [project.optional-dependencies]
-cuda = ["jax[cuda13]>=0.11"]
+cuda = ["jax[cuda13]>=0.11.1"]
 # Betaflight-in-the-loop (control="sticks"); see DESIGN.md §10. Floor = the 0.4.0
 # reset: firmware pinned to Betaflight release 2026.6.1, strict eeprom render
 # (cudaflight.render_eeprom), cudaflight.xla FFI half included.
