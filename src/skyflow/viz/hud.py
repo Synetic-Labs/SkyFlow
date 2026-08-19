@@ -2,8 +2,8 @@
 Instrument-strip builder (DESIGN.md §13) — vehicle truth plus user-selected channels.
 
 Left to right: stick crosses (AETR in sticks mode, four action bars in motors mode), rotor
-speed bars from plant[13:17], an attitude horizon from the quaternion, a telemetry text
-block, then one small graph per named channel. The fixed instruments are vehicle truth —
+speed bars from plant[13:17], an attitude horizon and a heading compass from the
+quaternion, a telemetry text block, then one small graph per named channel. The fixed instruments are vehicle truth —
 valid for any quadrotor use case. Channels are whatever the caller traces (reward, goal
 distance, estimator error, ...); this module knows no channel names and no task fields.
 A builder, not a host: draws onto the given surface, owns no window.
@@ -64,6 +64,28 @@ def _horizon(surface, cx: int, cy: int, r: int, quat: np.ndarray) -> None:
     p1 = (cx + dxr * span, cy + dy + dyr * span)
     pygame.draw.aaline(surface, palette.BRIGHT, p0, p1)
     pygame.draw.aaline(surface, palette.MUTED, (cx, cy - r), (cx, cy - r + 5))
+
+
+def _compass(surface, cx: int, cy: int, r: int, quat: np.ndarray, font=None) -> None:
+    """Heading dial, north-up (north = world +x): needle is the body x-axis from above."""
+    pygame.draw.circle(surface, palette.DIM, (cx, cy), r, 1)
+    for i in range(4):  # cardinal ticks; north gets the horizon's reference treatment
+        tx, ty = math.sin(i * math.pi / 2.0), -math.cos(i * math.pi / 2.0)
+        color = palette.MUTED if i == 0 else palette.DIM
+        pygame.draw.aaline(
+            surface, color, (cx + tx * (r - 5), cy + ty * (r - 5)), (cx + tx * r, cy + ty * r)
+        )
+    fwd = quat_to_rot(quat)[:, 0]
+    n = math.hypot(float(fwd[0]), float(fwd[1]))
+    if n >= 1e-6:  # nose straight up/down leaves heading undefined: dial only
+        # north-up top view of the z-up world: +x up, +y left on screen (right-handed)
+        dx, dy = -float(fwd[1]) / n, -float(fwd[0]) / n
+        p0 = (cx - dx * r * 0.35, cy - dy * r * 0.35)
+        p1 = (cx + dx * r * 0.8, cy + dy * r * 0.8)
+        pygame.draw.aaline(surface, palette.ACCENT, p0, p1)
+    if font:
+        img = font.render("N", True, palette.dim(palette.MUTED, 0.8))
+        surface.blit(img, (cx - img.get_width() / 2, cy - r + 6))
 
 
 def _graph(surface, x: int, top: int, w: int, h: int, name: str, values: Sequence[float],
@@ -128,6 +150,10 @@ def draw_hud(
     r = box // 2
     _horizon(surface, x + r, top + r, r, frame.quat[f])
     caption(x, "ATTITUDE")
+    x += 2 * r + 26
+
+    _compass(surface, x + r, top + r, r, frame.quat[f], font=small)
+    caption(x, "HEADING")
     x += 2 * r + 26
 
     if font:

@@ -108,6 +108,18 @@ class TestBuilders:
         draw_scene(surface, (0, 0, 100, 80), proj, scene, _frame())
         assert proj.ppm * 0.35 < 12.0  # confirms the LOD branch actually ran
 
+    def test_hud_compass_turns_with_yaw(self):
+        # pure yaw changes no other instrument, so any pixel delta comes from the compass
+        renders = []
+        for half_yaw in (0.0, np.pi / 4):
+            f = _frame()
+            f.plant[:, 6] = np.cos(half_yaw)
+            f.plant[:, 9] = np.sin(half_yaw)
+            surface = pygame.Surface((900, 150))
+            draw_hud(surface, (0, 0, 900, 150), f, omega_max=2500.0)
+            renders.append(pygame.surfarray.array3d(surface))
+        assert (renders[0] != renders[1]).any()
+
     def test_hud_draws_both_control_modes(self):
         pygame.font.init()
         font = pygame.font.Font(None, 14)
