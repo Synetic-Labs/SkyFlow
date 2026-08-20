@@ -342,12 +342,9 @@ cudaflight importable → ImportError with install guidance at construction.
 
 ## 12. Deferred (roadmap, do not build now)
 
-identified-physics intake for measured airframes (through the SkyFlow-Dynamics INTAKE
-protocol); differentiability claim +
-BPTT tests; Dryden/von Kármán wind drivers (spec terms exist); battery/voltage sag;
-sensor staleness/sample-hold DR; obs frame stacking; renderer supersampling knobs beyond
-the port; FunctionalToStateful adapter; multi-vehicle interaction (downwash candidates);
-viz: a rerun sink over the same builders; analytic camera primitives beyond gates.
+The roadmap lives in ROADMAP.md: a backlog list plus one section per researched idea,
+with the evidence kept. Nothing there is part of the design until it is promoted into
+this document.
 
 ## 13. viz — the optional viewer (extra "viz")
 
