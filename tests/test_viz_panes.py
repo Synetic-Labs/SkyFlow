@@ -217,3 +217,26 @@ class TestReplay:
         shot = tmp_path / "replay.png"
         replay(path, pilot=(48, 64), headless=True, frames=10, shot=str(shot), speed=8.0)
         assert shot.exists() and shot.stat().st_size > 1000
+
+    def test_mp4_export_plays_realtime(self, tmp_path, key):
+        """The mp4 is resampled onto the mp4_fps clock: a 100 Hz log exported at 30 fps
+        keeps its wall-clock duration (rows drop), never its row count."""
+        iio = pytest.importorskip("imageio.v3")
+        env = SkyFlowEnv(SimConfig(num_envs=2, task="figure_eight"))
+        log = FlightLog.for_env(env, watch=(0,))
+        _obs, state = env.reset(key)
+        step = jax.jit(env.step)
+        action = jnp.zeros((env.fleet, env.act_dim))
+        for _ in range(50):  # 0.5 s at the 100 Hz control default
+            _obs, state, reward, done, _info = step(state, action)
+            log.capture(state, action=action, reward=reward, done=done)
+        path = log.save(tmp_path / "flight.npz")
+
+        mp4 = tmp_path / "flight.mp4"
+        replay(path, headless=True, mp4=str(mp4), mp4_fps=30.0)
+        assert mp4.exists()
+        vid = iio.imread(str(mp4))
+        n_expected = round(50 * 0.01 * 30.0)  # duration x playback fps, not 50 rows
+        assert abs(vid.shape[0] - n_expected) <= 1
+        meta = iio.immeta(str(mp4))
+        assert round(meta["fps"]) == 30
