@@ -50,10 +50,10 @@ class HoverTask:
     image_shape: tuple[int, int, int] | None = None
     obs_spec = ObsSpec(
         (
-            ObsTerm("rel_pos", 3),
-            ObsTerm("vel", 3),
-            ObsTerm("rot_matrix", 9),
-            ObsTerm("last_action", 4),
+            ObsTerm("rel_pos", 3, "m world z-up (goal - x)"),
+            ObsTerm("vel", 3, "m/s world z-up"),
+            ObsTerm("rot_matrix", 9, "R body FLU -> world z-up row-major"),
+            ObsTerm("last_action", 4, "[-1,1]"),
         )
     )
 
@@ -70,7 +70,6 @@ class HoverTask:
         safe_xy_m: float = 4.0,
         safe_z_m: float = 4.0,
         success_radius_m: float = 0.1,
-        obs_noise: float = 0.0,
         w_pos: float = 1.0,
         w_hold: float = 0.5,
         w_vel: float = 0.05,
@@ -90,8 +89,9 @@ class HoverTask:
             SimConfig.control_hz when building this task from the registry).
           safe_xy_m / safe_z_m: safe box — leaving it is the task crash.
           success_radius_m: |goal - x| below this is success (never terminates).
-          obs_noise: half-width of additive uniform observation noise; 0 disables.
           w_pos / w_hold / w_vel / w_rate / w_prog: reward weights (module docstring).
+          Observation corruption is not a task concern: the env applies
+          DomainRand.obs_noise after `observe` (DESIGN.md §7).
         """
         if goal_z_min_m <= 0.0 or goal_z_max_m < goal_z_min_m:
             raise ValueError(
@@ -116,7 +116,6 @@ class HoverTask:
         self.safe_xy_m = float(safe_xy_m)
         self.safe_z_m = float(safe_z_m)
         self.success_radius_m = float(success_radius_m)
-        self.obs_noise = float(obs_noise)
         self.w_pos = float(w_pos)
         self.w_hold = float(w_hold)
         self.w_vel = float(w_vel)
@@ -176,20 +175,15 @@ class HoverTask:
         this task observes exact state (IMU packaging stays in sensors.py).
         """
         del imu
-        k_goal, k_noise = jax.random.split(key)
         goal, hold = task_state.goal, task_state.hold
         if not fresh_spawn:
             hold = hold + 1
             renew = hold >= self.hold_steps
-            goal = jnp.where(renew[:, None], self._draw_goal(k_goal, plant.shape[0]), goal)
+            goal = jnp.where(renew[:, None], self._draw_goal(key, plant.shape[0]), goal)
             hold = jnp.where(renew, 0, hold)
 
         rot = quat_to_rot(plant[:, 6:10]).reshape(-1, 9)
         obs = jnp.concatenate([goal - plant[:, 0:3], plant[:, 3:6], rot, last_action], axis=-1)
-        if self.obs_noise > 0.0:
-            obs = obs + jax.random.uniform(
-                k_noise, obs.shape, obs.dtype, -self.obs_noise, self.obs_noise
-            )
         return finalize_obs(obs), HoverTaskState(goal=goal, hold=hold, dist=task_state.dist)
 
     def evaluate(

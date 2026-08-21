@@ -142,7 +142,11 @@ class GateCourseTask:
         self._inner = self.gates.inner_half  # [G, 2] (lateral, vertical) half-extents
 
         self.vision = bool(vision)
-        tail = (ObsTerm("vel_body", 3), ObsTerm("rot_matrix", 9), ObsTerm("last_action", 4))
+        tail = (
+            ObsTerm("vel_body", 3, "m/s body FLU"),
+            ObsTerm("rot_matrix", 9, "R body FLU -> world z-up row-major"),
+            ObsTerm("last_action", 4, "[-1,1]"),
+        )
         if self.vision:
             # Imported here, not at module top: the state-only variant has no reason to
             # pull the ray-cast machinery in, and stays usable without it.
@@ -153,15 +157,15 @@ class GateCourseTask:
             self._render_masks = render_masks
             h, w = int(self._camera.height), int(self._camera.width)
             self.image_shape: tuple[int, int, int] | None = (h, w, 1)
-            self.obs_spec = ObsSpec((ObsTerm("mask", h * w), *tail))
+            self.obs_spec = ObsSpec((ObsTerm("mask", h * w, "{0,1} HxW row-major"), *tail))
         else:
             self._camera = None
             self.image_shape = None
             self.obs_spec = ObsSpec(
                 (
-                    ObsTerm("gate_rel", 3),
-                    ObsTerm("gate_normal", 3),
-                    ObsTerm("next_gate_rel", 3),
+                    ObsTerm("gate_rel", 3, "m body FLU"),
+                    ObsTerm("gate_normal", 3, "unit body FLU"),
+                    ObsTerm("next_gate_rel", 3, "m body FLU"),
                     *tail,
                 )
             )
