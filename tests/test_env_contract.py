@@ -6,7 +6,7 @@ too, since env.py is the unit under test.
 
 All tests run the hover task injected directly (`SkyFlowEnv(cfg, task=...)`) so the
 suite does not depend on the tasks/ registry, which test_registry.py covers. Fleets are
-small and keys fixed; body DR defaults to off here so thresholds are exact.
+small and keys fixed; physics_dr_scale defaults to 0 here so thresholds are exact.
 """
 
 import importlib.util
@@ -17,22 +17,15 @@ import numpy as np
 import pytest
 
 from skyflow import dynamics
-from skyflow.env import _METRICS_EMA_DECAY, DomainRand, SimConfig, SkyFlowEnv
+from skyflow.env import _METRICS_EMA_DECAY, SimConfig, SkyFlowEnv
 from skyflow.tasks.hover import HoverTask
 
 FLEET = 5
 
 
-def dr0(**dr_kwargs) -> DomainRand:
-    """DomainRand with body jitter off (thresholds stay exact) plus the given knobs."""
-    return DomainRand(body_scale=0.0, **dr_kwargs)
-
-
-def make_env(
-    fleet: int = FLEET, task_kwargs: dict | None = None,
-    dr: DomainRand | None = None, **cfg_kwargs,
-) -> SkyFlowEnv:
-    cfg = SimConfig(num_envs=fleet, dr=dr if dr is not None else dr0(), **cfg_kwargs)
+def make_env(fleet: int = FLEET, task_kwargs: dict | None = None, **cfg_kwargs) -> SkyFlowEnv:
+    cfg_kwargs.setdefault("physics_dr_scale", 0.0)
+    cfg = SimConfig(num_envs=fleet, **cfg_kwargs)
     return SkyFlowEnv(cfg, task=HoverTask(**(task_kwargs or {})))
 
 
@@ -79,7 +72,7 @@ def test_reset_shapes_dtypes_finiteness(key):
     ]:
         assert leaf.dtype == dtype and leaf.shape[0] == FLEET
     assert state.airborne.dtype == jnp.bool_ and not bool(state.airborne.any())
-    assert state.act_buf.shape == (FLEET, 1, 4)  # delay_steps=(0,0) ⇒ ring depth 1
+    assert state.act_buf.shape == (FLEET, 1, 4)  # act_delay_max=0 ⇒ ring depth 1
     assert bool(jnp.all(state.steps == 0)) and bool(jnp.all(state.ep_len == 0))
 
 
@@ -118,7 +111,7 @@ def test_metrics_are_scalars_with_the_exact_documented_keys(key):
 
 
 def test_same_key_same_rollout_bit_identical(key):
-    env = make_env(dr=dr0(wind_gust_mps=1.0, poke_prob=0.2, poke_force_n=0.05, delay_steps=(0, 1)))
+    env = make_env(wind_std_mps=1.0, poke_prob=0.2, poke_force_n=0.05, act_delay_max=1)
     acts = _actions(jax.random.PRNGKey(9), 15, FLEET)
 
     def rollout():
@@ -185,7 +178,7 @@ def test_action_takes_effect_exactly_k_steps_late(key, k):
     """Idle-filled ring, then full throttle from call 0: with Ω_c = 0 the rotor speeds
     stay exactly zero (first-order motor, zero state, zero command), so the first step
     whose state shows spinning rotors is exactly the k-delayed one."""
-    env = make_env(fleet=3, dr=dr0(delay_steps=(k, k)))
+    env = make_env(fleet=3, act_delay_min=k, act_delay_max=k)
     _, state = env.reset(key)
     assert bool(jnp.all(state.delay_idx == k))
     state = state.replace(act_buf=jnp.full_like(state.act_buf, -1.0))  # idle-stick fill
@@ -296,8 +289,8 @@ def test_final_obs_is_the_pre_reset_observation(key):
     """Twin envs differing only in max_episode_steps consume identical RNG streams, so
     the long env's observation at the truncating step IS the short env's final_obs."""
     task = HoverTask()
-    env_a = SkyFlowEnv(SimConfig(num_envs=FLEET, dr=dr0(), max_episode_steps=4), task=task)
-    env_b = SkyFlowEnv(SimConfig(num_envs=FLEET, dr=dr0(), max_episode_steps=1000), task=task)
+    env_a = SkyFlowEnv(SimConfig(num_envs=FLEET, physics_dr_scale=0.0, max_episode_steps=4), task=task)
+    env_b = SkyFlowEnv(SimConfig(num_envs=FLEET, physics_dr_scale=0.0, max_episode_steps=1000), task=task)
     acts = _actions(jax.random.PRNGKey(11), 4, FLEET)
 
     obs_a, state_a = env_a.reset(key)
@@ -325,7 +318,7 @@ def test_final_obs_is_the_pre_reset_observation(key):
 def test_auto_reset_leaves_live_worlds_bit_identical(key):
     """World 0 forced out of bounds; every other world's next state must be bit-identical
     to the run where world 0 stayed healthy (auto-reset is fully world-local)."""
-    env = make_env(dr=dr0(wind_gust_mps=1.0, poke_prob=0.3, poke_force_n=0.02))
+    env = make_env(wind_std_mps=1.0, poke_prob=0.3, poke_force_n=0.02)
     _, state = env.reset(key)
     a = jnp.zeros((FLEET, 4), jnp.float32)
     for _ in range(2):
@@ -349,9 +342,8 @@ def test_auto_reset_leaves_live_worlds_bit_identical(key):
 
 def test_jitted_50_step_rollout_no_nan_no_retrace(key):
     env = make_env(
-        fleet=8, dr=DomainRand(
-            wind_gust_mps=0.5, poke_prob=0.05, poke_force_n=0.02, delay_steps=(0, 1)
-        ),
+        fleet=8, physics_dr_scale=1.0, wind_std_mps=0.5,
+        poke_prob=0.05, poke_force_n=0.02, act_delay_max=1,
     )
     traces = []
 
@@ -382,9 +374,9 @@ def test_bad_config_raises():
         SkyFlowEnv(SimConfig(num_envs=2, control="wands"), task=HoverTask())
     with pytest.raises(ValueError, match="airframe"):
         SkyFlowEnv(SimConfig(num_envs=2, airframe="voliro"), task=HoverTask())
-    with pytest.raises(ValueError, match="delay"):
+    with pytest.raises(ValueError, match="act_delay"):
         SkyFlowEnv(
-            SimConfig(num_envs=2, dr=DomainRand(delay_steps=(3, 1))), task=HoverTask()
+            SimConfig(num_envs=2, act_delay_min=3, act_delay_max=1), task=HoverTask()
         )
     with pytest.raises(ValueError, match="physics_hz"):
         SkyFlowEnv(
@@ -445,7 +437,7 @@ def test_sticks_requires_1khz_physics(hz):
 def test_sticks_pipeline_with_injected_fleet(key):
     fleet = 3
     env = SkyFlowEnv(
-        SimConfig(num_envs=fleet, control="sticks", dr=dr0()),
+        SimConfig(num_envs=fleet, control="sticks", physics_dr_scale=0.0),
         task=HoverTask(),
         firmware_fleet=_FakeFleet(fleet),
     )
