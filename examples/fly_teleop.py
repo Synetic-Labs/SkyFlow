@@ -38,7 +38,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from skyflow import SimConfig, SkyFlowEnv
+from skyflow import DomainRand, SimConfig, SkyFlowEnv
 
 _UDP_FMT = "<ffffI"  # roll, pitch, yaw, throttle, buttons
 _BTN_RESET, _BTN_SAVE = 1, 2
@@ -139,7 +139,7 @@ def main() -> None:
         control="sticks",  # SkyFlowEnv raises with install guidance if cudaflight is absent
         control_hz=args.control_hz,
         physics_hz=1000.0,
-        physics_dr_scale=0.0,
+        dr=DomainRand().off(),
         # hand flying wanders more than a policy: hold the goal still and give room
         task_kwargs={"goal_hold_s": 3600.0} if args.task == "hover" else {},
     )

@@ -57,6 +57,17 @@ class ObsSpec(tuple[ObsTerm, ...]):
         return out
 
 
+class DRState(NamedTuple):
+    """
+    Per-world trait draws of the DomainRand block (DESIGN.md §7): quantities drawn once
+    per episode and constant within it, redrawn for done worlds at the auto-reset
+    respawn. New per-episode traits are added here, never as new SimState leaves.
+    """
+
+    wind_mean: Array  # [F,3] f32 steady wind velocity, world frame (z component is 0)
+    imu_bias: Array  # [F,6] f32 additive IMU bias: accel(3) m/s², gyro(3) rad/s
+
+
 class TaskEval(NamedTuple):
     """Task verdict on one transition (prev_plant → plant); all arrays [F]."""
 
@@ -160,7 +171,8 @@ class SimState:
     plant: Array  # [F,17] spec layout: x(3) v(3) q_wxyz(4) ω(3) Ω(4) rad/s
     params: Array  # [F,P] per-world randomized flat spec params (pack_params order)
     key: Array  # jax PRNG key (env-owned; split every step)
-    wind_vel: Array  # [F,3] OU wind velocity state, world frame (statedot's v_wind)
+    wind_vel: Array  # [F,3] OU gust velocity state, world frame, zero-mean deviation
+    dr_state: "DRState"  # per-episode trait draws (steady wind, IMU bias)
     act_buf: Array  # [F,D+1,4] transport-delay ring, newest first
     delay_idx: Array  # [F] int32 per-world delay draw
     last_action: Array  # [F,4]

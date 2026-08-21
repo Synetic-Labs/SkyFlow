@@ -12,7 +12,7 @@ smoke covers the full §7 construction surface, not just an injected task.
 import jax
 import jax.numpy as jnp
 
-from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.env import DomainRand, SimConfig, SkyFlowEnv
 
 FLEET = 2
 STEPS = 10
@@ -24,7 +24,7 @@ def test_vision_task_jitted_rollout_smoke():
             num_envs=FLEET,
             task="figure_eight",
             task_kwargs={"vision": True},
-            physics_dr_scale=0.0,
+            dr=DomainRand(body_scale=0.0),
         )
     )
     assert env.image_shape is not None and env.image_shape[2] == 1

@@ -102,34 +102,59 @@ DR_BRACKETS: dict[str, float] = {
 }
 
 
-@lru_cache(maxsize=1)
-def _jitter_brackets() -> np.ndarray:
+@lru_cache(maxsize=8)
+def _jitter_brackets(overrides: tuple[tuple[str, float], ...] = ()) -> np.ndarray:
     """
     Per-entry bracket vector b [P] in pack_params order: DR_BRACKETS spread through
     param_slices, with the NEVER_JITTER keys hard-masked to zero. Layout is derived, never
-    hardcoded, so it survives spec parameter additions.
+    hardcoded, so it survives spec parameter additions. `overrides` replaces individual
+    half-widths (sorted (key, b) pairs — the hashable form of DomainRand.brackets);
+    unknown or structural keys are rejected loudly.
     """
     slices = param_slices(N_ROTORS)
     dim = 1 + max(int(idx.max()) for idx in slices.values())
     b = np.zeros(dim, np.float32)
     for name, idx in slices.items():
         b[idx] = DR_BRACKETS.get(name, 0.0)
+    for name, half_width in overrides:
+        if name in NEVER_JITTER:
+            raise ValueError(f"bracket override for structural key {name!r} (never jittered)")
+        if name not in slices:
+            raise ValueError(f"bracket override for unknown SCHEMA key {name!r}")
+        if half_width < 0.0:
+            raise ValueError(f"bracket override {name!r} must be >= 0, got {half_width}")
+        b[slices[name]] = half_width
     for name in NEVER_JITTER:
         b[slices[name]] = 0.0
     return b
 
 
-def sample_params(key, airframe: Airframe, fleet: int, scale: float):
+def max_bracket(brackets=None) -> float:
+    """
+    Largest effective half-width after merging `brackets` overrides. The env validates
+    scale·max_bracket < 1 at construction, so multiplicative factors stay positive
+    (a factor <= 0 would flip or zero a physical parameter).
+    """
+    overrides = () if not brackets else tuple(sorted(brackets.items()))
+    return float(_jitter_brackets(overrides).max())
+
+
+def sample_params(key, airframe: Airframe, fleet: int, scale: float, brackets=None):
     """
     Per-world randomized flat parameter rows [fleet, P] float32 (pack_params order).
 
     Each stored entry gets an independent multiplicative factor 1 + scale·U(-b, +b) with
-    b from DR_BRACKETS (log-uniform-style: symmetric relative jitter about the nominal).
-    Consequences of the multiplicative form: zero nominals stay exactly zero, scale=0
-    returns the nominal row bit-exactly, and spin/axis/grav are never jittered (masked
-    through param_slices). Callers keep scale·max(b) < 1 so factors stay positive.
+    b from DR_BRACKETS (log-uniform-style: symmetric relative jitter about the nominal);
+    per-rotor entries (ct*/cq*, rotor geometry) draw independently, so motor-to-motor
+    asymmetry is included. `brackets` (a {SCHEMA key: half-width} mapping, e.g.
+    DomainRand.brackets) replaces individual half-widths — measured airframes shrink
+    them. Consequences of the multiplicative form: zero nominals stay exactly zero,
+    scale=0 returns the nominal row bit-exactly, and spin/axis/grav are never jittered
+    (masked through param_slices). Callers keep scale·max(b) < 1 so factors stay
+    positive.
     """
     nominal = jnp.asarray(pack_params(airframe.values), jnp.float32)
-    b = _jitter_brackets()
+    overrides = () if not brackets else tuple(sorted(brackets.items()))
+    b = _jitter_brackets(overrides)
     u = jax.random.uniform(key, (fleet, nominal.shape[0]), jnp.float32, -1.0, 1.0)
     return nominal * (1.0 + scale * b * u)

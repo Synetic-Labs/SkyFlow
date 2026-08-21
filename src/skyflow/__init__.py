@@ -8,11 +8,12 @@ surface is the platform (`SkyFlowEnv` + `SimConfig`), the two registries (`regis
 (DESIGN.md §2).
 """
 
-from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.env import DomainRand, SimConfig, SkyFlowEnv
 from skyflow.params import Airframe, register_airframe
 from skyflow.tasks import build_task, register_task
 from skyflow.types import (
     Array,
+    DRState,
     FirmwareFleet,
     ObsSpec,
     ObsTerm,
@@ -28,6 +29,8 @@ __version__ = "0.2.0"
 __all__ = [
     "Airframe",
     "Array",
+    "DRState",
+    "DomainRand",
     "FirmwareFleet",
     "ObsSpec",
     "ObsTerm",

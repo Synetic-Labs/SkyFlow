@@ -16,16 +16,19 @@ Step pipeline (order is normative, DESIGN.md §7):
 
  1. split the key; push the action into the delay ring, read the delayed action per world
  2. command map (motors mode: u = (a+1)/2 → verified throttle curve → Ω_c)
- 3. OU wind velocity advance (exact discretization: decay exp(-dt/τ) + matched kick)
+ 3. OU gust advance (exact discretization: decay exp(-dt/τ) + matched kick); the wind
+    every consumer sees is the per-episode steady mean (DomainRand trait) + the gust
  4. poke sampling (world-frame F_ext, body τ_ext through the backend's exogenous inputs —
     velocity state is never written directly)
  5. `decimation` x [generated substep + ground contact §8], all inputs zero-order-held
-    (sticks mode re-derives Ω_c from the firmware every 1 kHz substep, §10)
+    (sticks mode re-derives Ω_c from the firmware every 1 kHz substep, feeding it
+    DomainRand-corrupted sensor rows, §10)
  6. airborne latch; env crash set; task `evaluate` on the transition
  7. terminated / truncated / done
- 8. IMU measurement + task `observe`
- 9. in-jit auto-reset of done worlds via `tree_where` blending; the pre-reset observation
-    goes to info["final_obs"], the pre-reset flags to info["terminated"/"truncated"]
+ 8. IMU measurement (DomainRand bias + noise) + task `observe` + DomainRand obs noise
+ 9. in-jit auto-reset of done worlds via `tree_where` blending (fresh params, traits,
+    delay draw); the pre-reset observation goes to info["final_obs"], the pre-reset
+    flags to info["terminated"/"truncated"]
 10. episode bookkeeping EMAs for `metrics`: the SimState EMA leaves (outcome fractions,
     completed-episode return/length) update from the pre-reset done rows, decayed
     `_METRICS_EMA_DECAY` per completed episode; no-op when nothing finished
@@ -35,17 +38,17 @@ import inspect
 import math
 import warnings
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
 
 from skyflow import dynamics, sensors
-from skyflow.params import AIRFRAMES, sample_params
-from skyflow.types import Array, FirmwareFleet, SimState, StepInfo, Task
+from skyflow.params import AIRFRAMES, max_bracket, sample_params
+from skyflow.types import Array, DRState, FirmwareFleet, SimState, StepInfo, Task
 
-__all__ = ["SimConfig", "SkyFlowEnv", "tree_where"]
+__all__ = ["DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
 
 #: Near-ground band, metres: below it a descending/tilted airborne vehicle is a ground
 #: crash; above it the airborne latch sets (DESIGN.md §7 step 6 uses 0.05 for both).
@@ -60,12 +63,86 @@ _METRICS_EMA_DECAY = 0.99
 
 
 @dataclass(frozen=True)
+class DomainRand:
+    """
+    All training-robustness randomization in one object (DESIGN.md §7). One instance is
+    one robustness setting: a curriculum or an outer controller produces DomainRand
+    values, the env consumes them. Every magnitude is in physical units. Randomness
+    enters only at loop boundaries — the params row, exogenous forces, the delay ring,
+    the sensor rows, the observation vector; the ODE and the firmware stay exact.
+
+    Draw classes: traits (once per episode, constant within it — body params, steady
+    wind, IMU bias, transport delay), processes (every sample — gusts, sensor noise,
+    obs noise) and events (pokes). Spawn spread is task variety, not model error.
+
+    `scale` multiplies every continuous magnitude; it never touches time constants
+    (`wind_tau_s`), event rates (`poke_prob`), integer delays (`delay_steps`) or the
+    spawn spread (`spawn_scale`). scale=0 with delay_steps=(0,0) is bit-exact nominal —
+    `off()` returns that setting. Defaults reproduce a plain SimConfig(): body DR on,
+    everything else off.
+    """
+
+    scale: float = 1.0  # master dial over every continuous magnitude
+
+    # -- body: the vehicle (trait, §6 sample_params) --------------------------------
+    body_scale: float = 1.0  # multiplies the DR_BRACKETS half-widths
+    brackets: dict | None = None  # per-key half-width overrides of DR_BRACKETS (§6)
+
+    # -- world: wind and shocks ------------------------------------------------------
+    wind_mean_mps: float = 0.0  # trait: steady horizontal wind, magnitude ceiling, m/s
+    wind_gust_mps: float = 0.0  # process: OU gust stationary std per axis, m/s
+    wind_tau_s: float = 0.5  # OU gust correlation time, s (a clock — never scaled)
+    poke_prob: float = 0.0  # event rate per control step per world (never scaled)
+    poke_force_n: float = 0.0  # world-frame poke force magnitude ceiling, N
+    poke_torque_nm: float = 0.0  # body-frame poke torque magnitude ceiling, N·m
+
+    # -- actuation: command transport (trait) ----------------------------------------
+    delay_steps: tuple[int, int] = (0, 0)  # (min, max) control steps (never scaled)
+
+    # -- sensing: the IMU/baro rows the firmware and IMU-observing tasks consume ------
+    gyro_noise_rps: float = 0.0  # process: white per-sample std, rad/s
+    accel_noise_mps2: float = 0.0  # process: white per-sample std, m/s²
+    gyro_bias_rps: float = 0.0  # trait: constant per-axis bias half-width, rad/s
+    accel_bias_mps2: float = 0.0  # trait: constant per-axis bias half-width, m/s²
+    baro_noise_pa: float = 0.0  # process: white per-sample std on the baro row, Pa
+
+    # -- observation: the policy vector (applied by the env after task.observe) -------
+    obs_noise: float = 0.0  # process: additive uniform half-width
+
+    # -- initial state: task variety, forwarded to builders as spawn_dr_scale ---------
+    spawn_scale: float = 1.0
+
+    def off(self) -> "DomainRand":
+        """This setting with all model error and corruption off: bit-exact nominal."""
+        return replace(self, scale=0.0, delay_steps=(0, 0))
+
+    def effective(self) -> "DomainRand":
+        """This setting with `scale` folded into every continuous magnitude (scale=1)."""
+        s = self.scale
+        return replace(
+            self,
+            scale=1.0,
+            body_scale=s * self.body_scale,
+            wind_mean_mps=s * self.wind_mean_mps,
+            wind_gust_mps=s * self.wind_gust_mps,
+            poke_force_n=s * self.poke_force_n,
+            poke_torque_nm=s * self.poke_torque_nm,
+            gyro_noise_rps=s * self.gyro_noise_rps,
+            accel_noise_mps2=s * self.accel_noise_mps2,
+            gyro_bias_rps=s * self.gyro_bias_rps,
+            accel_bias_mps2=s * self.accel_bias_mps2,
+            baro_noise_pa=s * self.baro_noise_pa,
+            obs_noise=s * self.obs_noise,
+        )
+
+
+@dataclass(frozen=True)
 class SimConfig:
     """
     Platform configuration (DESIGN.md §7). Frozen and plain — no omegaconf/hydra; build
     variants with `dataclasses.replace`. Physics advances at `physics_hz`; the policy
     acts at `control_hz`; `decimation = round(physics_hz / control_hz)` substeps run per
-    control step with all inputs zero-order-held.
+    control step with all inputs zero-order-held. All randomization lives in `dr`.
     """
 
     num_envs: int = 1024
@@ -77,16 +154,8 @@ class SimConfig:
     control_hz: float = 100.0
     physics_hz: float = 1000.0  # sticks mode requires exactly 1000 (§10: 1 kHz fw tick)
     differentiable: bool = False  # raises NotImplementedError("planned") if True
-    # randomization / disturbance
-    physics_dr_scale: float = 1.0
-    wind_std_mps: float = 0.0  # OU wind stationary std per world axis, m/s
-    wind_tau_s: float = 0.5  # OU wind correlation time, s
-    poke_prob: float = 0.0  # per control step, per world
-    poke_force_n: float = 0.0  # world-frame poke force magnitude ceiling, N
-    poke_torque_nm: float = 0.0  # body-frame poke torque magnitude ceiling, N·m
-    act_delay_min: int = 0  # command transport delay bounds, control steps
-    act_delay_max: int = 0
-    spawn_dr_scale: float = 1.0
+    # randomization / disturbance — the DomainRand block, one object = one setting
+    dr: DomainRand = field(default_factory=DomainRand)
     # episode / safety
     max_episode_steps: int = 1000
     stuck_steps: int = 200  # never-airborne worlds truncate after this many steps
@@ -222,13 +291,27 @@ class SkyFlowEnv:
             )
         if cfg.num_envs < 1:
             raise ValueError(f"num_envs must be >= 1, got {cfg.num_envs}")
-        if not 0 <= cfg.act_delay_min <= cfg.act_delay_max:
+        dr = cfg.dr.effective()  # fold the master scale once; the env reads only this
+        d_min, d_max = (int(d) for d in dr.delay_steps)
+        if not 0 <= d_min <= d_max:
+            raise ValueError(f"need 0 <= delay min <= max, got dr.delay_steps={dr.delay_steps}")
+        if dr.wind_tau_s <= 0.0:
+            raise ValueError(f"dr.wind_tau_s must be > 0, got {dr.wind_tau_s}")
+        if not 0.0 <= dr.poke_prob <= 1.0:
+            raise ValueError(f"dr.poke_prob must be in [0,1], got {dr.poke_prob}")
+        for name in (
+            "scale", "body_scale", "wind_mean_mps", "wind_gust_mps", "poke_force_n",
+            "poke_torque_nm", "gyro_noise_rps", "accel_noise_mps2", "gyro_bias_rps",
+            "accel_bias_mps2", "baro_noise_pa", "obs_noise", "spawn_scale",
+        ):
+            if getattr(cfg.dr, name) < 0.0:
+                raise ValueError(f"dr.{name} must be >= 0, got {getattr(cfg.dr, name)}")
+        b_max = max_bracket(dr.brackets)  # loud key validation happens in here too
+        if dr.body_scale * b_max >= 1.0:
             raise ValueError(
-                f"need 0 <= act_delay_min <= act_delay_max, got "
-                f"({cfg.act_delay_min}, {cfg.act_delay_max})"
+                f"dr.scale·dr.body_scale·max bracket = {dr.body_scale * b_max:.3f} >= 1: "
+                "a multiplicative factor could reach zero or flip a physical parameter"
             )
-        if cfg.wind_tau_s <= 0.0:
-            raise ValueError(f"wind_tau_s must be > 0, got {cfg.wind_tau_s}")
         decimation = round(cfg.physics_hz / cfg.control_hz)
         if decimation < 1:
             raise ValueError(
@@ -236,6 +319,10 @@ class SkyFlowEnv:
             )
 
         self.cfg = cfg
+        self.dr = dr  # effective DomainRand: master scale already folded in
+        self._delay_min, self._delay_max = d_min, d_max
+        self._imu_noise_on = dr.gyro_noise_rps > 0.0 or dr.accel_noise_mps2 > 0.0
+        self._imu_bias_on = dr.gyro_bias_rps > 0.0 or dr.accel_bias_mps2 > 0.0
         self.fleet = int(cfg.num_envs)
         self.airframe = AIRFRAMES[cfg.airframe]
         self.decimation = int(decimation)
@@ -310,7 +397,7 @@ class SkyFlowEnv:
         pulls in every shipped task, and injected-task callers never need it).
 
         Two quantities the env owns are forwarded to builders that NAME them —
-        `spawn_dr_scale` (the §6/§7 spawn-jitter scale) and `control_hz` (the Task
+        `spawn_dr_scale` (= cfg.dr.spawn_scale, the §7 spawn-jitter scale) and `control_hz` (the Task
         protocol carries no clock, and a task counting seconds must count them at the
         platform's rate). Explicit `task_kwargs` entries always win, and builders that
         do not name a quantity are built untouched (GateCourseTask names neither).
@@ -324,41 +411,92 @@ class SkyFlowEnv:
             accepted = {}
         kwargs = dict(cfg.task_kwargs)
         for name, value in (
-            ("spawn_dr_scale", cfg.spawn_dr_scale),
+            ("spawn_dr_scale", cfg.dr.spawn_scale),
             ("control_hz", cfg.control_hz),
         ):
             if name in accepted and name not in kwargs:
                 kwargs[name] = value
         return task_registry.build_task(cfg.task, **kwargs)
 
+    # -- DomainRand draws (all read self.dr — the effective, master-scaled setting) ------
+
+    def _draw_traits(self, key: Array, f: int) -> DRState:
+        """Fresh per-episode trait rows (types.DRState) — used at reset and respawn.
+
+        Steady wind: horizontal direction uniform on the circle, magnitude
+        U(0, wind_mean_mps). IMU bias: per-axis U(-half_width, +half_width). Zero
+        ceilings give exactly-zero rows, so the leaves always exist and stay inert."""
+        dr = self.dr
+        k_dir, k_mag, k_bias = jax.random.split(key, 3)
+        theta = jax.random.uniform(k_dir, (f,), jnp.float32, 0.0, 2.0 * math.pi)
+        mag = jax.random.uniform(k_mag, (f,), jnp.float32, 0.0, dr.wind_mean_mps)
+        wind_mean = jnp.stack(
+            [mag * jnp.cos(theta), mag * jnp.sin(theta), jnp.zeros((f,), jnp.float32)],
+            axis=-1,
+        )
+        half = jnp.asarray(
+            [dr.accel_bias_mps2] * 3 + [dr.gyro_bias_rps] * 3, jnp.float32
+        )
+        imu_bias = half * jax.random.uniform(k_bias, (f, 6), jnp.float32, -1.0, 1.0)
+        return DRState(wind_mean=wind_mean, imu_bias=imu_bias)
+
+    def _measure(
+        self, plant: Array, omega: Array, wind: Array, params: Array,
+        dr_state: DRState, key: Array,
+    ) -> tuple[Array, Array]:
+        """sensors.measure with this env's DomainRand corruption. The static gates keep
+        the nominal path key-free and bit-exact (sensors.py charter)."""
+        dr = self.dr
+        return sensors.measure(
+            plant, omega, wind, params,
+            key=key if self._imu_noise_on else None,
+            accel_noise_std=dr.accel_noise_mps2,
+            gyro_noise_std=dr.gyro_noise_rps,
+            imu_bias=dr_state.imu_bias if self._imu_bias_on else None,
+        )
+
+    def _corrupt_obs(self, obs: Array, key: Array) -> Array:
+        """DomainRand.obs_noise on the finalized task observation (uniform half-width);
+        applied by the env so tasks keep semantics and the env keeps corruption."""
+        if self.dr.obs_noise <= 0.0:
+            return obs
+        return obs + jax.random.uniform(
+            key, obs.shape, obs.dtype, -self.dr.obs_noise, self.dr.obs_noise
+        )
+
     # -- public API --------------------------------------------------------------------
 
     def reset(self, key: Array) -> tuple[Array, SimState]:
         """
-        Fresh fleet → (obs [F,obs_dim] f32, SimState). Per-world randomized params
-        (physics_dr_scale), task spawn, per-world delay draw; wind, delay ring and
-        episode accumulators cleared. Pure — same key, same fleet, bit for bit.
+        Fresh fleet → (obs [F,obs_dim] f32, SimState). Per-world DomainRand draws
+        (params, traits, delay), task spawn; gust state, delay ring and episode
+        accumulators cleared. Pure — same key, same fleet, bit for bit.
         """
-        cfg = self.cfg
+        dr = self.dr
         f = self.fleet
-        k_params, k_spawn, k_delay, k_obs, k_carry = jax.random.split(key, 5)
+        k_params, k_spawn, k_traits, k_delay, k_imu, k_obs, k_carry = jax.random.split(
+            key, 7
+        )
 
-        params = sample_params(k_params, self.airframe, f, cfg.physics_dr_scale)
+        params = sample_params(k_params, self.airframe, f, dr.body_scale, dr.brackets)
         plant, task_state = self.task.spawn(k_spawn, f, params)
         plant = plant.astype(jnp.float32)
+        dr_state = self._draw_traits(k_traits, f)
         delay_idx = jax.random.randint(
-            k_delay, (f,), cfg.act_delay_min, cfg.act_delay_max + 1, dtype=jnp.int32
+            k_delay, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
         )
-        wind_vel = jnp.zeros((f, 3), jnp.float32)
-        act_buf = jnp.zeros((f, cfg.act_delay_max + 1, 4), jnp.float32)
+        wind_vel = jnp.zeros((f, 3), jnp.float32)  # gust deviation; total adds the mean
+        act_buf = jnp.zeros((f, self._delay_max + 1, 4), jnp.float32)
         last_action = jnp.zeros((f, 4), jnp.float32)
 
-        # First observation: exact IMU with the rotors held at their spawn speeds (no
-        # command has been issued yet, so hold is the only self-consistent input).
-        imu = sensors.measure(plant, plant[:, 13:17], wind_vel, params)
+        # First observation: IMU with the rotors held at their spawn speeds (no command
+        # has been issued yet, so hold is the only self-consistent input).
+        k_obs_task, k_obs_dr = jax.random.split(k_obs)
+        imu = self._measure(plant, plant[:, 13:17], dr_state.wind_mean, params, dr_state, k_imu)
         obs, task_state = self.task.observe(
-            plant, task_state, imu, last_action, k_obs, fresh_spawn=True
+            plant, task_state, imu, last_action, k_obs_task, fresh_spawn=True
         )
+        obs = self._corrupt_obs(obs, k_obs_dr)
 
         if self._fw is not None:
             blob, fwstate = self._fw.fresh_firmware_state()
@@ -369,6 +507,7 @@ class SkyFlowEnv:
             params=params,
             key=k_carry,
             wind_vel=wind_vel,
+            dr_state=dr_state,
             act_buf=act_buf,
             delay_idx=delay_idx,
             last_action=last_action,
@@ -395,6 +534,7 @@ class SkyFlowEnv:
         pre-reset flags in info["terminated"] / info["truncated"].
         """
         cfg = self.cfg
+        dr = self.dr
         f = self.fleet
         af = self.airframe
         w_min, w_max, k_thr = af.rotor_speed_min, af.rotor_speed_max, af.throttle_k
@@ -407,27 +547,29 @@ class SkyFlowEnv:
             blob = fwstate = None  # never read in motors mode
 
         # 1. Keys; delay ring (newest first) and the per-world delayed command.
-        k_carry, k_wind, k_gate, k_poke_f, k_poke_tau, k_obs, k_reset = jax.random.split(
-            state.key, 7
-        )
+        (
+            k_carry, k_wind, k_gate, k_poke_f, k_poke_tau, k_sub, k_imu, k_obs, k_reset,
+        ) = jax.random.split(state.key, 9)
         action = jnp.clip(jnp.asarray(action, jnp.float32), -1.0, 1.0)
         act_buf = jnp.concatenate([action[:, None, :], state.act_buf[:, :-1, :]], axis=1)
         delayed = act_buf[jnp.arange(f), state.delay_idx]
 
-        # 3. OU wind velocity, exact discretization over dt_control: stationary std is
-        # exactly wind_std_mps per axis for any step size (decay + variance-matched kick).
-        alpha = math.exp(-self.dt_control / cfg.wind_tau_s)
-        kick = cfg.wind_std_mps * math.sqrt(1.0 - alpha * alpha)
+        # 3. OU gust deviation, exact discretization over dt_control: stationary std is
+        # exactly wind_gust_mps per axis for any step size (decay + variance-matched
+        # kick). Every consumer sees the total wind: per-episode steady mean + gust.
+        alpha = math.exp(-self.dt_control / dr.wind_tau_s)
+        kick = dr.wind_gust_mps * math.sqrt(1.0 - alpha * alpha)
         wind_vel = alpha * state.wind_vel + kick * jax.random.normal(
             k_wind, (f, 3), jnp.float32
         )
+        wind_total = state.dr_state.wind_mean + wind_vel
 
         # 4. Pokes: exogenous inputs only — the backend integrates them, velocity state
         # is never written. Uniform-ball direction · configured magnitude ceiling.
-        poke = jax.random.bernoulli(k_gate, cfg.poke_prob, (f,))
-        f_ext = jnp.where(poke[:, None], cfg.poke_force_n * _uniform_ball(k_poke_f, f), 0.0)
+        poke = jax.random.bernoulli(k_gate, dr.poke_prob, (f,))
+        f_ext = jnp.where(poke[:, None], dr.poke_force_n * _uniform_ball(k_poke_f, f), 0.0)
         tau_ext = jnp.where(
-            poke[:, None], cfg.poke_torque_nm * _uniform_ball(k_poke_tau, f), 0.0
+            poke[:, None], dr.poke_torque_nm * _uniform_ball(k_poke_tau, f), 0.0
         )
 
         # 2 + 5. Command map, then `decimation` substeps with every input zero-order-held
@@ -442,7 +584,7 @@ class SkyFlowEnv:
             def substep_motors(carry, _):
                 plant, impact = carry
                 raw = dynamics.substep(
-                    plant, omega_cmd, wind_vel, f_ext, tau_ext, state.params,
+                    plant, omega_cmd, wind_total, f_ext, tau_ext, state.params,
                     self.dt_physics, w_min, w_max,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
@@ -454,20 +596,27 @@ class SkyFlowEnv:
             omega_last = omega_cmd
         else:
             # Sticks (§10, normative substep order): synth FRD sensors from the generated
-            # IMU + isothermal baro → firmware tick → QUADX motors reordered by
-            # motor_perm → duties feed the throttle map as u, ZOH for this 1 ms substep.
+            # IMU + isothermal baro, corrupted per DomainRand (bias + per-sample noise —
+            # the firmware filters what the real one filters) → firmware tick → QUADX
+            # motors reordered by motor_perm → duties feed the throttle map as u, ZOH
+            # for this 1 ms substep.
             fw = self._fw
+            baro_on = dr.baro_noise_pa > 0.0
+            sub_keys = jax.random.split(k_sub, self.decimation)
 
-            def substep_sticks(carry, _):
+            def substep_sticks(carry, k_t):
                 plant, blob, fwstate, omega_prev, impact = carry
-                accel, gyro = sensors.measure(plant, omega_prev, wind_vel, state.params)
+                k_imu_t, k_baro_t = jax.random.split(k_t)
+                accel, gyro = self._measure(
+                    plant, omega_prev, wind_total, state.params, state.dr_state, k_imu_t
+                )
+                baro = self._baro_pa(plant[:, 2:3]).astype(jnp.float32)
+                if baro_on:
+                    baro = baro + dr.baro_noise_pa * jax.random.normal(
+                        k_baro_t, baro.shape, jnp.float32
+                    )
                 rows = jnp.concatenate(
-                    [
-                        self._flu_to_frd(gyro),
-                        self._flu_to_frd(accel),
-                        self._baro_pa(plant[:, 2:3]).astype(jnp.float32),
-                    ],
-                    axis=-1,
+                    [self._flu_to_frd(gyro), self._flu_to_frd(accel), baro], axis=-1
                 )
                 blob, fwstate, motors, _armed = fw.fw_step(blob, fwstate, delayed, rows)
                 u = motors[:, self._motor_perm]
@@ -475,7 +624,7 @@ class SkyFlowEnv:
                     jnp.float32
                 )
                 raw = dynamics.substep(
-                    plant, omega_cmd, wind_vel, f_ext, tau_ext, state.params,
+                    plant, omega_cmd, wind_total, f_ext, tau_ext, state.params,
                     self.dt_physics, w_min, w_max,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
@@ -483,7 +632,7 @@ class SkyFlowEnv:
 
             init = (state.plant, blob, fwstate, state.plant[:, 13:17], jnp.zeros(f, bool))
             (plant, blob, fwstate, omega_last, impact), _ = jax.lax.scan(
-                substep_sticks, init, None, length=self.decimation
+                substep_sticks, init, sub_keys
             )
 
         # 6. Airborne latch; env crash set; task verdict on the transition.
@@ -511,8 +660,12 @@ class SkyFlowEnv:
         done = terminated | truncated
 
         # 8. Observe the post-transition state (pre-reset: this is final_obs on done rows).
-        imu = sensors.measure(plant, omega_last, wind_vel, state.params)
-        obs, ts_out = self.task.observe(plant, ev.task_state, imu, action, k_obs, fresh_spawn=False)
+        k_obs_task, k_obs_dr = jax.random.split(k_obs)
+        imu = self._measure(plant, omega_last, wind_total, state.params, state.dr_state, k_imu)
+        obs, ts_out = self.task.observe(
+            plant, ev.task_state, imu, action, k_obs_task, fresh_spawn=False
+        )
+        obs = self._corrupt_obs(obs, k_obs_dr)
 
         # 10 (accumulated before the blend so done rows report full-episode stats in
         # info and feed the EMAs below).
@@ -537,26 +690,32 @@ class SkyFlowEnv:
         ep_return_ema = ema(state.ep_return_ema, ep_return)
         ep_len_ema = ema(state.ep_len_ema, ep_len)
 
-        # 9. Auto-reset: fresh spawn + fresh DR params + fresh delay draw + cleared
-        # buffers/wind for done worlds, blended leaf-wise; live worlds pass through
-        # untouched (bit-identical).
-        k_rp, k_rs, k_rd, k_ro = jax.random.split(k_reset, 4)
-        params_new = sample_params(k_rp, af, f, cfg.physics_dr_scale)
+        # 9. Auto-reset: fresh spawn + fresh DomainRand draws (params, traits, delay) +
+        # cleared buffers/gust for done worlds, blended leaf-wise; live worlds pass
+        # through untouched (bit-identical).
+        k_rp, k_rs, k_rt, k_rd, k_ri, k_ro = jax.random.split(k_reset, 6)
+        params_new = sample_params(k_rp, af, f, dr.body_scale, dr.brackets)
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
+        dr_new = self._draw_traits(k_rt, f)
         la_new = jnp.zeros((f, 4), jnp.float32)
         wind_new = jnp.zeros((f, 3), jnp.float32)
-        imu_new = sensors.measure(plant_new, plant_new[:, 13:17], wind_new, params_new)
-        obs_new, ts_fresh = self.task.observe(
-            plant_new, ts_fresh, imu_new, la_new, k_ro, fresh_spawn=True
+        k_ro_task, k_ro_dr = jax.random.split(k_ro)
+        imu_new = self._measure(
+            plant_new, plant_new[:, 13:17], dr_new.wind_mean, params_new, dr_new, k_ri
         )
+        obs_new, ts_fresh = self.task.observe(
+            plant_new, ts_fresh, imu_new, la_new, k_ro_task, fresh_spawn=True
+        )
+        obs_new = self._corrupt_obs(obs_new, k_ro_dr)
         fresh = dict(
             plant=plant_new,
             params=params_new,
             wind_vel=wind_new,
-            act_buf=jnp.zeros((f, cfg.act_delay_max + 1, 4), jnp.float32),
+            dr_state=dr_new,
+            act_buf=jnp.zeros((f, self._delay_max + 1, 4), jnp.float32),
             delay_idx=jax.random.randint(
-                k_rd, (f,), cfg.act_delay_min, cfg.act_delay_max + 1, dtype=jnp.int32
+                k_rd, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
             ),
             last_action=la_new,
             steps=jnp.zeros(f, jnp.int32),
@@ -569,6 +728,7 @@ class SkyFlowEnv:
             plant=plant,
             params=state.params,
             wind_vel=wind_vel,
+            dr_state=state.dr_state,
             act_buf=act_buf,
             delay_idx=state.delay_idx,
             last_action=action,
@@ -642,7 +802,9 @@ class SkyFlowEnv:
             "ep_return_mean": jnp.mean(state.ep_return),
             "ep_len_mean": jnp.mean(state.ep_len.astype(jnp.float32)),
             "airborne_frac": jnp.mean(state.airborne.astype(jnp.float32)),
-            "wind_speed_mean": jnp.mean(jnp.linalg.norm(state.wind_vel, axis=-1)),
+            "wind_speed_mean": jnp.mean(
+                jnp.linalg.norm(state.dr_state.wind_mean + state.wind_vel, axis=-1)
+            ),
         }
         for name, value in self.task.metrics(ts).items():
             out[name] = jnp.mean(value.astype(jnp.float32))

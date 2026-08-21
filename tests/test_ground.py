@@ -2,7 +2,7 @@
 DESIGN.md §11 — ground contact (§8): the clamp never lets the vehicle
 penetrate, a resting vehicle genuinely rests (no creep, no spurious dones), a hard fall
 registers as a ground crash, and the spawned-on-pad hover task takes off under full
-throttle. physics_dr_scale is 0 throughout: symmetric rotors keep open-loop full
+throttle. Body DR is off throughout: symmetric rotors keep open-loop full
 throttle torque-free, so thresholds are exact.
 """
 
@@ -10,14 +10,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.env import DomainRand, SimConfig, SkyFlowEnv
 from skyflow.tasks.hover import HoverTask
 
 FLEET = 4
 
 
 def make_env(**cfg_kwargs) -> SkyFlowEnv:
-    cfg_kwargs.setdefault("physics_dr_scale", 0.0)
+    cfg_kwargs.setdefault("dr", DomainRand(body_scale=0.0))
     cfg_kwargs.setdefault("stuck_steps", 10**6)
     cfg_kwargs.setdefault("max_episode_steps", 10**6)
     cfg = SimConfig(num_envs=FLEET, **cfg_kwargs)

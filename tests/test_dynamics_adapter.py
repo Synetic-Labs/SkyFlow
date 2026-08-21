@@ -15,7 +15,7 @@ from skyflow_dynamics.backends import jax as sfd
 
 from skyflow import dynamics, sensors
 from skyflow.params import NEVER_JITTER, sample_params
-from skyflow.types import SimState
+from skyflow.types import DRState, SimState
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -196,6 +196,10 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         params=nominal_params,
         key=key,
         wind_vel=jnp.zeros((f, 3), jnp.float32),
+        dr_state=DRState(
+            wind_mean=jnp.zeros((f, 3), jnp.float32),
+            imu_bias=jnp.zeros((f, 6), jnp.float32),
+        ),
         act_buf=jnp.zeros((f, 3, 4), jnp.float32),
         delay_idx=jnp.zeros(f, jnp.int32),
         last_action=jnp.zeros((f, 4), jnp.float32),
