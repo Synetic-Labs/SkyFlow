@@ -24,8 +24,8 @@ env = SkyFlowEnv(SimConfig(
 print(env.eeprom_image)  # the rendered boot image (temp file), for run logs
 ```
 
-Both fleet backends receive the same image; `examples/fly_drone_config.py`
-is the end-to-end demo. `eeprom_overrides` holds sim-only pins a real
+Both fleet backends receive the same image; `examples/fly_figure_eight.py`
+(default mode) is the end-to-end demo. `eeprom_overrides` holds sim-only pins a real
 drone's dump needs on the SITL build (for example `set blackbox_device =
 NONE` — the sim has no SPI flash chip). The stock dump needs none.
 
