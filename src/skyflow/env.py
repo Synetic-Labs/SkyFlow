@@ -36,9 +36,11 @@ Step pipeline (order is normative, DESIGN.md §7):
 
 import inspect
 import math
+import tempfile
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, NamedTuple, cast
 
 import jax
@@ -151,6 +153,15 @@ class SimConfig:
     airframe: str = "crazyflie"
     control: str = "motors"  # "motors" | "sticks" (DESIGN.md §10)
     firmware: str = "auto"  # sticks backend: "auto" | "cpu" | "gpu" (DESIGN.md §10)
+    # sticks firmware config: path to a drone's Betaflight CLI `dump all` file. The env
+    # renders it into the boot eeprom at construction (cudaflight.render_eeprom — a
+    # version-gated strict round-trip, so a dump from another firmware release or a
+    # line that does not hold raises here, at construction). None boots the wheel's
+    # stock defaults. CLI text is the config source of truth; the rendered image is a
+    # derived artifact (examples/configs/README.md). `eeprom_overrides` is an optional
+    # file of sim-only CLI lines appended after the dump (e.g. blackbox_device = NONE).
+    eeprom: str | None = None
+    eeprom_overrides: str | None = None
     control_hz: float = 100.0
     physics_hz: float = 1000.0  # sticks mode requires exactly 1000 (§10: 1 kHz fw tick)
     differentiable: bool = False  # raises NotImplementedError("planned") if True
@@ -285,6 +296,13 @@ class SkyFlowEnv:
             raise NotImplementedError("planned")
         if cfg.control not in ("motors", "sticks"):
             raise ValueError(f'cfg.control must be "motors" or "sticks", got {cfg.control!r}')
+        if cfg.eeprom is None and cfg.eeprom_overrides is not None:
+            raise ValueError(
+                "cfg.eeprom_overrides is set without cfg.eeprom — overrides are "
+                "sim-only CLI lines appended to a dump, not a config by themselves"
+            )
+        if cfg.eeprom is not None and cfg.control != "sticks":
+            raise ValueError('cfg.eeprom requires control="sticks": motors mode boots no firmware')
         if cfg.airframe not in AIRFRAMES:
             raise ValueError(
                 f"unknown airframe {cfg.airframe!r}; registered: {sorted(AIRFRAMES)}"
@@ -336,6 +354,8 @@ class SkyFlowEnv:
         self.image_shape = self.task.image_shape
 
         self._fw: FirmwareFleet | None = None
+        # boot-image temp file path when cfg.eeprom rendered (logs/provenance), else None
+        self.eeprom_image: str | None = None
         if cfg.control == "sticks":
             if cfg.physics_hz != 1000.0:
                 raise ValueError(
@@ -349,6 +369,11 @@ class SkyFlowEnv:
 
             self._flu_to_frd = _firmware.flu_to_frd
             self._baro_pa = _firmware.baro_pa
+            if firmware_fleet is not None and cfg.eeprom is not None:
+                raise ValueError(
+                    "cfg.eeprom and firmware_fleet= are exclusive — an injected "
+                    "fleet already booted its own config"
+                )
             fw = firmware_fleet if firmware_fleet is not None else self._build_fleet(
                 cfg, _firmware
             )
@@ -371,17 +396,20 @@ class SkyFlowEnv:
             raise ValueError(
                 f'cfg.firmware must be "auto", "cpu" or "gpu", got {cfg.firmware!r}'
             )
+        # Render before any fleet exists: the render boots its own throwaway CPU
+        # instance, and the CPU library allows one live fleet per process.
+        eeprom = self._render_eeprom(cfg)
         if cfg.firmware == "cpu":
-            return _firmware.CpuFirmwareFleet(self.fleet)
+            return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom)
         if cfg.firmware == "gpu":
-            return _firmware.GpuFirmwareFleet(self.fleet)
+            return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom)
         try:
             gpu_visible = bool(jax.devices("gpu"))
         except RuntimeError:
             gpu_visible = False
         if self.fleet >= 3 and gpu_visible:
             try:
-                return _firmware.GpuFirmwareFleet(self.fleet)
+                return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom)
             except Exception as e:  # ImportError (wheel < 0.3.3), RuntimeError (create)
                 warnings.warn(
                     f'firmware="auto": GPU fleet unavailable ({e}); '
@@ -389,7 +417,39 @@ class SkyFlowEnv:
                     RuntimeWarning,
                     stacklevel=3,
                 )
-        return _firmware.CpuFirmwareFleet(self.fleet)
+        return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom)
+
+    def _render_eeprom(self, cfg: SimConfig) -> str | None:
+        """cfg.eeprom (CLI `dump all` path) → boot-image temp file path, or None.
+
+        cudaflight renders through a version-gated strict round-trip on one throwaway
+        CPU boot, so a stale or foreign dump fails HERE — an image one parameter-group
+        version behind would factory-reset silently and fly stock defaults. The image
+        is a derived artifact: rendered fresh per construction, never committed. The
+        path lands on `self.eeprom_image` for logs/provenance.
+        """
+        if cfg.eeprom is None:
+            return None
+        dump = Path(cfg.eeprom)
+        if not dump.is_file():
+            raise FileNotFoundError(f"cfg.eeprom: no such CLI dump file: {dump}")
+        overrides: Path | None = None
+        if cfg.eeprom_overrides is not None:
+            overrides = Path(cfg.eeprom_overrides)
+            if not overrides.is_file():
+                raise FileNotFoundError(
+                    f"cfg.eeprom_overrides: no such CLI file: {overrides}"
+                )
+        import cudaflight  # deferred like the fleet import: only this seam needs it
+
+        image = cudaflight.render_eeprom(dump, overrides)
+        f = tempfile.NamedTemporaryFile(
+            prefix="skyflow-eeprom-", suffix=".bin", delete=False
+        )
+        with f:
+            f.write(image)
+        self.eeprom_image = f.name
+        return f.name
 
     @staticmethod
     def _build_task(cfg: SimConfig) -> Task:
