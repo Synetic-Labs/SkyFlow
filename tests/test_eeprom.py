@@ -104,3 +104,54 @@ def test_version_gate_rejects_foreign_release(tmp_path):
     with pytest.raises(RuntimeError):
         SkyFlowEnv(SimConfig(num_envs=1, control="sticks", firmware="cpu",
                              eeprom=str(stale)))
+
+
+# -- base auto-selection: the dump header picks the firmware binaries ----------------------
+
+_HEADER_TMPL = ("# Betaflight / SITL_LOCKSTEP (SLCK) 2026.6.0-alpha May 15 2026 / "
+                "06:14:55 ({rev}) MSP API: 1.48\n")
+
+
+def _stage_bundle(root, rev):
+    import hashlib
+    import json
+
+    d = root / rev
+    d.mkdir(parents=True)
+    sha = {}
+    for name, payload in (("libcpuflight.so", b"lib"), ("fw.fatbin", b"fatbin")):
+        (d / name).write_bytes(payload)
+        sha[name] = hashlib.sha256(payload).hexdigest()
+    (d / "manifest.json").write_text(json.dumps(
+        {"tag": f"cudaflight-vX+bf.{rev}", "wheel_url": "staged", "sha256": sha}))
+
+
+def test_base_resolution(tmp_path, monkeypatch):
+    pytest.importorskip("cudaflight.bases")
+    from skyflow.env import _installed_base_rev, _resolve_firmware_base
+
+    monkeypatch.setenv("CUDAFLIGHT_BASE_CACHE", str(tmp_path / "cache"))
+
+    # a norevision dump cannot select a base — the installed binaries serve
+    norev = tmp_path / "norev.txt"
+    norev.write_text(_HEADER_TMPL.format(rev="norevision"))
+    assert _resolve_firmware_base(norev) is None
+
+    # a dump naming the installed wheel's own base — no bundle lookup
+    inst = _installed_base_rev()
+    if inst is not None:
+        own = tmp_path / "own.txt"
+        own.write_text(_HEADER_TMPL.format(rev=inst + "f"))
+        assert _resolve_firmware_base(own) is None
+
+    # a foreign base with no cached bundle — fail loudly, naming the fetch command
+    foreign = tmp_path / "foreign.txt"
+    foreign.write_text(_HEADER_TMPL.format(rev="abcdef012"))
+    with pytest.raises(FileNotFoundError, match=r"cudaflight\.bases abcdef012"):
+        _resolve_firmware_base(foreign)
+
+    # the same foreign base with a staged bundle — resolves to its pair
+    _stage_bundle(tmp_path / "cache", "abcdef01")
+    b = _resolve_firmware_base(foreign)
+    assert b is not None and b.rev == "abcdef01"
+    assert b.lib.name == "libcpuflight.so" and b.fatbin.name == "fw.fatbin"

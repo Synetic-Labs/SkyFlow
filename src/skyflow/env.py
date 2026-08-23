@@ -36,6 +36,7 @@ Step pipeline (order is normative, DESIGN.md §7):
 
 import inspect
 import math
+import re
 import tempfile
 import warnings
 from collections.abc import Sequence
@@ -160,6 +161,10 @@ class SimConfig:
     # stock defaults. CLI text is the config source of truth; the rendered image is a
     # derived artifact (examples/configs/README.md). `eeprom_overrides` is an optional
     # file of sim-only CLI lines appended after the dump (e.g. blackbox_device = NONE).
+    # The dump header also SELECTS the firmware base: a dump built from another
+    # Betaflight base than the installed wheel picks the matching per-base binaries
+    # from the cudaflight bundle cache (fetch once: `python -m cudaflight.bases
+    # <rev>`; needs cudaflight >= 0.6.0) — no reinstall, one wheel flies every drone.
     eeprom: str | None = None
     eeprom_overrides: str | None = None
     control_hz: float = 100.0
@@ -175,6 +180,43 @@ class SimConfig:
     max_speed_mps: float = 30.0
     max_rate_rps: float = 50.0
     ground_tilt_limit_rad: float = math.pi / 3
+
+
+def _installed_base_rev() -> "str | None":
+    """The Betaflight base of the INSTALLED cudaflight wheel, from its version
+    metadata (`0.6.0+bf.6dbc4218` → `6dbc4218`). None for source checkouts. Metadata
+    is trustworthy here because it describes the wheel's own embedded binaries; the
+    render gate separately verifies whichever lib actually boots."""
+    try:
+        from importlib.metadata import version
+
+        m = re.search(r"\+bf\.([0-9a-f]+)", version("cudaflight"))
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _resolve_firmware_base(dump: Path) -> Any:
+    """The per-base firmware bundle a dump selects, or None for the installed base.
+
+    The dump header names the Betaflight base the drone's firmware was built from.
+    When it matches the installed wheel (or carries no revision), the wheel's own
+    binaries serve and this returns None. Otherwise the cudaflight bundle cache
+    provides the matching (libcpuflight.so, fw.fatbin) pair — fetched once with
+    `python -m cudaflight.bases <rev>`; a cache miss raises with that command. The
+    render's version gate verifies the selection against the booted lib either way.
+    """
+    from cudaflight import bases  # cudaflight >= 0.6.0
+    from cudaflight.config import parse_header
+
+    header = parse_header(dump.read_text(errors="replace"))
+    rev = header["rev"] if header else None
+    if rev is None or rev == "norevision":
+        return None
+    installed = _installed_base_rev()
+    if installed is not None and bases.rev_match(installed, rev):
+        return None
+    return bases.paths(rev)
 
 
 def tree_where(done: Array, fresh: Any, current: Any) -> Any:
@@ -356,6 +398,8 @@ class SkyFlowEnv:
         self._fw: FirmwareFleet | None = None
         # boot-image temp file path when cfg.eeprom rendered (logs/provenance), else None
         self.eeprom_image: str | None = None
+        # per-base bundle revision when the dump selected one (logs/provenance)
+        self.firmware_base: str | None = None
         if cfg.control == "sticks":
             if cfg.physics_hz != 1000.0:
                 raise ValueError(
@@ -398,18 +442,18 @@ class SkyFlowEnv:
             )
         # Render before any fleet exists: the render boots its own throwaway CPU
         # instance, and the CPU library allows one live fleet per process.
-        eeprom = self._render_eeprom(cfg)
+        eeprom, lib, fatbin = self._render_eeprom(cfg)
         if cfg.firmware == "cpu":
-            return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom)
+            return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom, lib=lib)
         if cfg.firmware == "gpu":
-            return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom)
+            return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom, cubin=fatbin)
         try:
             gpu_visible = bool(jax.devices("gpu"))
         except RuntimeError:
             gpu_visible = False
         if self.fleet >= 3 and gpu_visible:
             try:
-                return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom)
+                return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom, cubin=fatbin)
             except Exception as e:  # ImportError (wheel < 0.3.3), RuntimeError (create)
                 warnings.warn(
                     f'firmware="auto": GPU fleet unavailable ({e}); '
@@ -417,19 +461,24 @@ class SkyFlowEnv:
                     RuntimeWarning,
                     stacklevel=3,
                 )
-        return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom)
+        return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom, lib=lib)
 
-    def _render_eeprom(self, cfg: SimConfig) -> str | None:
-        """cfg.eeprom (CLI `dump all` path) → boot-image temp file path, or None.
+    def _render_eeprom(self, cfg: SimConfig) -> tuple[str | None, str | None, str | None]:
+        """cfg.eeprom (CLI `dump all` path) → (boot image, CPU lib, GPU fatbin) paths.
+
+        All three are None when cfg.eeprom is None; lib/fatbin are None when the dump
+        belongs to the installed wheel's own base (or carries no revision) — the
+        wheel's embedded binaries serve. A dump from ANOTHER base selects the matching
+        per-base pair from the cudaflight bundle cache (`_resolve_firmware_base`).
 
         cudaflight renders through a version-gated strict round-trip on one throwaway
-        CPU boot, so a stale or foreign dump fails HERE — an image one parameter-group
-        version behind would factory-reset silently and fly stock defaults. The image
-        is a derived artifact: rendered fresh per construction, never committed. The
-        path lands on `self.eeprom_image` for logs/provenance.
+        CPU boot of the SELECTED lib, so a stale or foreign dump fails HERE — an image
+        one parameter-group version behind would factory-reset silently and fly stock
+        defaults. The image is a derived artifact: rendered fresh per construction,
+        never committed. Provenance lands on `self.eeprom_image` / `self.firmware_base`.
         """
         if cfg.eeprom is None:
-            return None
+            return None, None, None
         dump = Path(cfg.eeprom)
         if not dump.is_file():
             raise FileNotFoundError(f"cfg.eeprom: no such CLI dump file: {dump}")
@@ -442,14 +491,19 @@ class SkyFlowEnv:
                 )
         import cudaflight  # deferred like the fleet import: only this seam needs it
 
-        image = cudaflight.render_eeprom(dump, overrides)
+        bundle = _resolve_firmware_base(dump)
+        lib = str(bundle.lib) if bundle is not None else None
+        fatbin = str(bundle.fatbin) if bundle is not None else None
+        self.firmware_base = bundle.rev if bundle is not None else None
+
+        image = cudaflight.render_eeprom(dump, overrides, lib_path=lib)
         f = tempfile.NamedTemporaryFile(
             prefix="skyflow-eeprom-", suffix=".bin", delete=False
         )
         with f:
             f.write(image)
         self.eeprom_image = f.name
-        return f.name
+        return f.name, lib, fatbin
 
     @staticmethod
     def _build_task(cfg: SimConfig) -> Task:
