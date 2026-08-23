@@ -62,14 +62,14 @@ src/skyflow/
     replay.py           # python -m skyflow.viz.replay: scrub/replay host + mp4 export
 examples/
   fly_hover.py          # tiny PD hover demo (examples are demos, not package code)
-  fly_figure_eight.py   # scripted course fly-through + optional mask dump
+  fly_figure_eight.py   # benchmark env from a drone config (default) + course tracer (--trace)
   fly_teleop.py         # hand-fly control="sticks": keyboard / joystick / UDP + viewer
 tests/                  # pytest; §11 lists the required suites
 ```
 
 Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: the public git
 URL). Extras: `cuda` → `jax[cuda13]`;
-`firmware` → `cudaflight>=0.3.3` (public GitHub release-wheel URL source); `viz` → nothing but
+`firmware` → `cudaflight>=0.6.0` (public GitHub release-wheel URL source); `viz` → nothing but
 `pygame-ce>=2.5` (§13; the maintained fork, imports as `pygame`). Dev group: `pytest>=9`,
 `ruff>=0.16`. License MIT. Version 0.2.0.
 
@@ -332,13 +332,18 @@ tasks own semantics, the env owns corruption); reward per control step:
 success `d < 0.1 m` (does not terminate); task crash: leaving the safe box.
 
 **figure_eight** — the registered name of the generic `GateCourseTask`; course = `GateSet`
-from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder: the
-research-canonical figure-8 — a GERONO lemniscate (x = a·sin t, y = ½a·sin 2t, 2:1
-footprint, round lobes) through 2·k gates, alternating crossing directions at the center.
-The 6-gate default (k = 3) reproduces the standard layout — one apex gate per lobe plus
-four gates on the crossover diagonals (cf. the 6-gate Figure-8 of Xing et al., RA-L 2025;
-same curve as crazyflow's figure-eight trajectory). Spawn: podium behind gate 1 or spread
-across gates (curriculum knob). Active-gate
+from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder: two
+ellipse lobes (semi-axes `lobe_radius_m` x `lobe_half_width_m`) tangent at a gate-free
+crossover, 2·k gates tangent-yawed at the ellipse angles φ = j·2π/(k+1) per lobe,
+alternating crossing directions at the center. The 6-gate default is the nav-jax
+FigureEight map EXACTLY (z-up from its NED rows, nav-jax tests/test_gate_spawn.py):
+shoulders (±5, ∓3) m flown straight along ±x, apexes (±10, 0) flown along +y, 1.5 m
+altitude, 20 x 6 m footprint; gate 1 is the right lobe's lower shoulder. Spawn: podium pad ON
+THE GROUND (z = 0, resting, airborne latch cold — arm at idle, spool, lift; a raised pad
+free-falls during spool-up and trips the §7 ground-impact terminal) facing gate 1 — the
+shipped course pads the centre of the cluster OPPOSITE gate 1 (the canonical start;
+`podium_pos_m` / `podium_height_m` override, custom courses default behind gate 1) — or
+spread across gates (curriculum knob). Active-gate
 progress: `r = w_prog·(d_prev - d)` toward the pre-gate point + pass credit
 `w_gate·centering` on crossing (from `classify_crossings`; miss/frame-hit = task crash),
 minus rate penalty. Obs (state mode): `[gate_rel(3), gate_normal(3), next_gate_rel(3),
@@ -382,6 +387,22 @@ SkyFlow therefore ships:
   falling back to CPU with a `warnings.warn` when GPU construction fails.
 - Injection: `SkyFlowEnv(cfg, firmware_fleet=...)` accepts any FirmwareFleet and
   overrides `cfg.firmware`.
+- Boot config (`SimConfig.eeprom` / `eeprom_overrides`): `eeprom` is a path to a drone's
+  Betaflight CLI `dump all` text — the config source of truth (examples/configs/README.md).
+  `_build_fleet` renders it at construction via `cudaflight.render_eeprom` (version-gated
+  strict round-trip on one throwaway CPU boot, BEFORE the fleet exists — the CPU library
+  allows one live fleet per process) and hands the image to either backend.
+  `eeprom_overrides` is an optional file of sim-only CLI lines appended after the dump
+  (e.g. `blackbox_device = NONE`). A stale or foreign dump fails at construction — never a
+  silent factory reset to stock defaults. The rendered temp-file path lands on
+  `env.eeprom_image` for run logs. Fail-loud guards: overrides without a dump, eeprom in
+  motors mode, eeprom plus an injected `firmware_fleet` (that fleet already booted its own
+  config), missing files. `eeprom=None` boots the wheel's stock defaults. The dump header
+  also SELECTS the firmware base (cudaflight >= 0.6.0): a dump built from another
+  Betaflight base than the installed wheel picks its (libcpuflight.so, fw.fatbin) pair
+  from the cudaflight bundle cache — fetched once with `python -m cudaflight.bases <rev>`;
+  a cache miss fails at construction naming that command. A norevision dump or the
+  installed base uses the wheel's embedded binaries. Provenance: `env.firmware_base`.
 
 Sticks substep order (normative): synth sensors
 (FLU→FRD flip; baro from z-up altitude, isothermal 101325 Pa / 8434 m — a harness-side
@@ -427,6 +448,12 @@ cudaflight importable → ImportError with install guidance at construction.
 - `test_firmware.py` — skipped unless cudaflight importable; arm→spin-up→hover smoke.
   GPU-fleet twin marked `gpu` (skipped without a CUDA device): same smoke through
   `GpuFirmwareFleet`, plus snapshot restore determinism and the `firmware="auto"` pick.
+- `test_eeprom.py` — own module (test_firmware.py keeps a module-scoped fleet open, and
+  the render needs a fleet-free process): construction-time guards (overrides without a
+  dump, eeprom in motors mode, eeprom + injected fleet, missing file); stock dump renders,
+  boots, and climbs (`env.eeprom_image` set); version gate rejects a foreign-release dump;
+  base resolution (installed base / norevision → embedded binaries, foreign base → bundle
+  cache or a construction error naming the fetch command).
 - `test_jit.py` — one jitted 50-step rollout, no NaN; second call does not retrace
   (jit cache check); vision task jitted rollout smoke.
 - `test_viz.py` — pygame-free half: primitive serde round-trip (bind is live-only);

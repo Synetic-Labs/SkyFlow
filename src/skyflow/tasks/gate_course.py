@@ -82,8 +82,9 @@ class GateCourseTask:
         w_rate: float = 0.01,
         pre_gate_offset_m: float = 0.5,
         spawn_mode: str = "podium",
+        podium_pos_m: tuple[float, float] | None = None,
         spawn_dist_m: float = 1.5,
-        podium_height_m: float = 0.3,
+        podium_height_m: float = 0.0,
         spawn_lateral_m: float = 0.4,
         spawn_alt_jitter_m: float = 0.3,
         spawn_yaw_jitter_rad: float = 0.3,
@@ -91,7 +92,8 @@ class GateCourseTask:
         """
         Args:
           gates: course geometry. None builds the shipped default figure-eight
-            (`figure_eight(3)`: six gates, 2.5 m lobes, 1.5 m altitude).
+            (`figure_eight(3)`: the nav-jax FigureEight map — six gates, 20 x 6 m,
+            1.5 m altitude).
           vision: observe the rendered gate mask instead of privileged gate geometry.
           camera: vision-mode CameraModel; None takes the renderer's nominal camera.
           body_radius_m: drone-as-sphere radius for `classify_crossings` — a pass needs
@@ -102,11 +104,20 @@ class GateCourseTask:
           pre_gate_offset_m: pre-gate point distance in front of the plane (-normal
             side). Progress pulls to the approach side only; the pass credit, not the
             progress term, pays for committing through the opening.
-          spawn_mode: "podium" — every world starts behind gate 0 at podium height;
-            "spread" — each world starts behind a uniformly drawn gate at its altitude
-            (curriculum knob: seeds every course segment from step one).
+          spawn_mode: "podium" — every world starts on the podium pad at podium
+            height, facing gate 0; "spread" — each world starts behind a uniformly
+            drawn gate at its altitude (curriculum knob: seeds every course segment
+            from step one).
+          podium_pos_m: podium pad world (x, y). None pads `spawn_dist_m` behind
+            gate 0 — except on the SHIPPED default course, which pads the centre of
+            the gate cluster opposite gate 0, the canonical figure-eight start
+            (DESIGN.md §9).
           spawn_dist_m / podium_height_m / spawn_lateral_m / spawn_alt_jitter_m /
-          spawn_yaw_jitter_rad: spawn geometry (metres, radians).
+          spawn_yaw_jitter_rad: spawn geometry (metres, radians). podium_height_m
+            defaults to 0: worlds start RESTING on the ground with the env's airborne
+            latch cold, so the arm-idle → spool → lift sequence of a real drone cannot
+            trip the ground-impact terminal (DESIGN.md §7 step 6). Raise it only for a
+            physical podium — a raised pad free-falls during spool-up.
         """
         if spawn_mode not in ("podium", "spread"):
             raise ValueError(f"spawn_mode must be 'podium' or 'spread', got {spawn_mode!r}")
@@ -141,6 +152,16 @@ class GateCourseTask:
         self._verticals = self.gates.verticals_world  # [G, 3] unit, in-plane vertical
         self._inner = self.gates.inner_half  # [G, 2] (lateral, vertical) half-extents
 
+        # Podium pad: an explicit (x, y), or — on the shipped default course only — the
+        # centre of the gate cluster opposite gate 0 (the second course half: the other
+        # lobe), the canonical figure-eight start. Custom courses keep the legacy
+        # behind-gate-0 pad unless podium_pos_m says otherwise.
+        self._podium_xy: jax.Array | None = None
+        if podium_pos_m is not None:
+            self._podium_xy = jnp.asarray(podium_pos_m, jnp.float32).reshape(2)
+        elif gates is None and self.num_gates >= 2:
+            self._podium_xy = jnp.mean(self._centers[self.num_gates // 2 :, :2], axis=0)
+
         self.vision = bool(vision)
         tail = (
             ObsTerm("vel_body", 3, "m/s body FLU"),
@@ -173,10 +194,12 @@ class GateCourseTask:
     # -- Task protocol -------------------------------------------------------------
 
     def spawn(self, key: Array, n: int, params: Array) -> tuple[Array, GateTaskState]:
-        """Fresh plant rows [n,17] f32 on the approach (-normal) side of the start gate.
+        """Fresh plant rows [n,17] f32 facing the start gate, on the approach side.
 
-        Podium mode places every world behind gate 0 at podium height with lateral and
-        yaw jitter, facing the gate; spread mode draws the start gate uniformly and
+        Podium mode places every world on the podium pad at podium height with lateral
+        and yaw jitter, facing gate 0 — the pad is the course's fixed podium when one is
+        defined (the shipped figure-eight pads the opposite lobe's centre), else
+        `spawn_dist_m` behind gate 0. Spread mode draws the start gate uniformly and
         spawns near its altitude (active_gate starts there). Velocity and body rates are
         zero and rotors are at rest — the env's post-step clip lifts them to the
         airframe's idle floor on the first substep. `params` is unused: the spawn is
@@ -193,17 +216,29 @@ class GateCourseTask:
         lateral = self._laterals[active]
 
         lat_off = jax.random.uniform(k_lat, (n, 1), jnp.float32, -1.0, 1.0)
-        pos = center - self.spawn_dist_m * normal + self.spawn_lateral_m * lat_off * lateral
-        if self.spawn_mode == "podium":
-            pos = pos.at[:, 2].set(self.podium_height_m)
+        if self.spawn_mode == "podium" and self._podium_xy is not None:
+            # fixed pad: face gate 0's centre, jitter across the takeoff line
+            to_gate = self._centers[0, :2] - self._podium_xy
+            heading = jnp.arctan2(to_gate[1], to_gate[0])
+            perp = jnp.stack([-jnp.sin(heading), jnp.cos(heading)])
+            xy = self._podium_xy + self.spawn_lateral_m * lat_off * perp
+            pos = jnp.concatenate(
+                [xy, jnp.full((n, 1), self.podium_height_m, jnp.float32)], axis=-1
+            )
+            bearing = jnp.broadcast_to(heading, (n,))
         else:
-            alt_off = jax.random.uniform(k_alt, (n, 1), jnp.float32, -1.0, 1.0)
-            pos = pos + self.spawn_alt_jitter_m * alt_off * jnp.asarray(_UP, jnp.float32)
-            pos = pos.at[:, 2].set(jnp.maximum(pos[:, 2], 0.05))  # never below the ground
+            pos = center - self.spawn_dist_m * normal + self.spawn_lateral_m * lat_off * lateral
+            if self.spawn_mode == "podium":
+                pos = pos.at[:, 2].set(self.podium_height_m)
+            else:
+                alt_off = jax.random.uniform(k_alt, (n, 1), jnp.float32, -1.0, 1.0)
+                pos = pos + self.spawn_alt_jitter_m * alt_off * jnp.asarray(_UP, jnp.float32)
+                pos = pos.at[:, 2].set(jnp.maximum(pos[:, 2], 0.05))  # never below ground
+            bearing = jnp.arctan2(normal[:, 1], normal[:, 0])
 
-        # Face the gate: heading = bearing of the through-normal, plus yaw jitter, level.
+        # Heading toward the gate, plus yaw jitter, level.
         yaw_off = jax.random.uniform(k_yaw, (n,), jnp.float32, -1.0, 1.0)
-        half = 0.5 * (jnp.arctan2(normal[:, 1], normal[:, 0]) + self.spawn_yaw_jitter_rad * yaw_off)
+        half = 0.5 * (bearing + self.spawn_yaw_jitter_rad * yaw_off)
         zeros = jnp.zeros_like(half)
         quat = jnp.stack([jnp.cos(half), zeros, zeros, jnp.sin(half)], axis=-1)
 
@@ -377,4 +412,10 @@ class GateCourseTask:
             {"type": "path", "points": [tuple(c) for c in centers], "closed": True,
              "dashed": True, "style": "dim"}
         )
+        if self._podium_xy is not None:
+            px, py = (float(v) for v in np.asarray(self._podium_xy))
+            scene.append(
+                {"type": "marker", "center": (px, py, self.podium_height_m),
+                 "style": "bright", "size": 0.12, "plumb": False}
+            )
         return scene

@@ -387,33 +387,31 @@ def circle(
 
 def figure_eight(
     k_gates_per_lobe: int,
-    lobe_radius_m: float = 2.5,
+    lobe_radius_m: float = 5.0,
+    lobe_half_width_m: float = 3.0,
     alt_m: float = 1.5,
     inner_half: tuple[float, float] = GateSet.DEFAULT_INNER_HALF,
     outer_half: tuple[float, float] | None = None,
     depth: float = 0.0,
 ) -> GateSet:
     """
-    Figure-eight course on a lemniscate of Gerono — the research-canonical figure-8 —
-    with 2·k gates yawed tangent to the path, all at ``alt_m`` (DESIGN.md §9).
+    The canonical figure-eight course: two ellipse lobes tangent at the crossover, 2·k
+    gates yawed along the flight tangent, all at ``alt_m`` (DESIGN.md §9).
 
-    Path (z-up world, centre crossover at the origin, main axis along x):
+    Each lobe is an ellipse with semi-axes ``lobe_radius_m`` (along x — the apex sits
+    2·lobe_radius_m from the crossover) by ``lobe_half_width_m`` (along y), the two
+    lobes meeting at the origin. Per lobe the k gates sit at the evenly spaced ellipse
+    angles φ = j·2π/(k+1), j = 1..k — the crossover slot stays empty, and consecutive
+    crossover transits run along the two DIFFERENT diagonals (the alternating-crossing
+    property the gate task pins). Flight order: right lobe (down-right first), then left
+    lobe.
 
-        x(t) = a·sin t,   y(t) = ½·a·sin 2t
-
-    with a = 2·``lobe_radius_m``: each lobe spans 2·lobe_radius_m along ±x from the
-    crossover, the full footprint is 4·lobe_radius_m x 2·lobe_radius_m (2:1, round
-    lobes — the proportions of the standard research figure-8; the Bernoulli lemniscate,
-    by contrast, is pinched to ~4:1). Flight order follows t from 0: the right lobe
-    clockwise, then the left lobe counter-clockwise — the ∞ shape — so consecutive
-    transits of the crossover run along the two DIFFERENT diagonals (alternating crossing
-    directions at the centre, the property the gate task's alternating-normals test
-    pins). Gates sit at k evenly spaced parameter values per lobe, offset half a slot so
-    none lands on the crossover; each is yawed along the path tangent (direction of
-    travel, analytic derivative) and upright. The 6-gate default (k = 3) lands one gate
-    on each lobe apex and four on the crossover diagonals — the canonical 6-gate layout
-    (cf. the Figure-8 track of Xing et al., RA-L 2025; crazyflow's figure-eight
-    trajectory rides the same curve).
+    The 6-gate default reproduces the nav-jax FigureEight map EXACTLY (z-up from its
+    NED rows; nav-jax tests/test_gate_spawn.py): shoulders (±5, ∓3) m, apexes (±10, 0),
+    1.5 m altitude — a 20 x 6 m footprint. At the 6-gate slots the ellipse tangents are
+    axis-aligned, so the shoulders are flown straight along ±x and the apexes along +y,
+    matching that map's yaws {0°, 90°, 180°} gate for gate. Gate 0 (first) is the right
+    lobe's lower shoulder.
 
     ``outer_half`` defaults to inner + DEFAULT_FRAME_WIDTH per side; ``depth`` is the
     frame thickness along the normal (0 = flat plane). Returns the gates in flight order;
@@ -422,15 +420,18 @@ def figure_eight(
     if k_gates_per_lobe < 1:
         raise ValueError("k_gates_per_lobe must be >= 1")
     k = int(k_gates_per_lobe)
-    a = 2.0 * float(lobe_radius_m)
+    a = float(lobe_radius_m)  # lobe semi-major: apex at 2a from the crossover
+    w = float(lobe_half_width_m)  # lobe semi-minor: half the course width
     centers: list[tuple[float, float, float]] = []
     yaws: list[float] = []
     for i in range(2 * k):
-        t = (i + 0.5) * math.pi / k
-        centers.append((a * math.sin(t), 0.5 * a * math.sin(2.0 * t), float(alt_m)))
-        # tangent = (dx/dt, dy/dt) = (a·cos t, a·cos 2t); the parametrization runs in
-        # flight direction, so no sign fix-up
-        yaws.append(math.atan2(math.cos(2.0 * t), math.cos(t)))
+        side = 1.0 if i < k else -1.0  # right lobe first, then the left
+        phi = (i % k + 1) * 2.0 * math.pi / (k + 1)
+        centers.append(
+            (side * a * (1.0 - math.cos(phi)), -w * math.sin(phi), float(alt_m))
+        )
+        # ellipse tangent in flight order: d/dφ = (side·a·sin φ, -w·cos φ)
+        yaws.append(math.atan2(-w * math.cos(phi), side * a * math.sin(phi)))
     iw, ih = float(inner_half[0]), float(inner_half[1])
     ow, oh = (outer_half if outer_half is not None
               else (iw + GateSet.DEFAULT_FRAME_WIDTH, ih + GateSet.DEFAULT_FRAME_WIDTH))
