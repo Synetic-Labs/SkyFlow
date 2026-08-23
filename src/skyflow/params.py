@@ -242,6 +242,28 @@ def factor_floor(factors=None) -> float:
     return float(np.abs(limits[:, 0]).max())
 
 
+def apply_tw_guard(rows, nominal, w_max):
+    """
+    Clamp the mass entries of drawn parameter rows [F,P] so the drawn thrust at the
+    rotor-speed ceiling still lifts the drawn vehicle at TW_FLOOR. ``w_max`` is the
+    ceiling — the airframe scalar, or per-world [F] rows once the battery-sag trait has
+    been drawn (the env re-applies this guard with the sagged ceiling: a tired pack
+    buys less thrust, so the same payload rule must see it). Never pushes mass below
+    the nominal build — a vehicle whose thrust alone cannot make TW_FLOOR is what it
+    is. Idempotent, and a stricter (lower) ceiling only tightens the clamp.
+    """
+    slices = param_slices(N_ROTORS)
+    w = jnp.asarray(w_max, jnp.float32)
+    w = w[:, None] if w.ndim == 1 else w
+    thrust_max = (rows[:, slices["ct0"]].sum(-1)
+                  + (rows[:, slices["ct1"]] * w).sum(-1)
+                  + (rows[:, slices["ct2"]] * w * w).sum(-1))
+    grav = nominal[slices["grav"]][0]  # never jittered
+    mass_cap = jnp.maximum(thrust_max / (TW_FLOOR * grav), nominal[slices["mass"]][0])
+    m_idx = slices["mass"]
+    return rows.at[:, m_idx].set(jnp.minimum(rows[:, m_idx], mass_cap[:, None]))
+
+
 def sample_params(key, airframe: Airframe, fleet: int, scale: float, brackets=None,
                   factors=None):
     """
@@ -284,15 +306,8 @@ def sample_params(key, airframe: Airframe, fleet: int, scale: float, brackets=No
                            limits[:, 0], limits[:, 1])
     row = row * (1.0 + scale * (g @ masks))
 
+    row = apply_tw_guard(row, nominal, airframe.rotor_speed_max)
     slices = param_slices(N_ROTORS)
-    w_max = airframe.rotor_speed_max
-    thrust_max = (row[:, slices["ct0"]].sum(-1)
-                  + row[:, slices["ct1"]].sum(-1) * w_max
-                  + row[:, slices["ct2"]].sum(-1) * w_max * w_max)
-    grav = nominal[slices["grav"]][0]  # never jittered
-    mass_cap = jnp.maximum(thrust_max / (TW_FLOOR * grav), nominal[slices["mass"]][0])
-    m_idx = slices["mass"]
-    row = row.at[:, m_idx].set(jnp.minimum(row[:, m_idx], mass_cap[:, None]))
 
     # Planar guard on the draw, relative to the vehicle's own shape: a flat body has
     # Izz = Ixx + Iyy, but measured EFFECTIVE inertias sit slightly above it (ducts,

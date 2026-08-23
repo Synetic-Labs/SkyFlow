@@ -48,7 +48,13 @@ import jax
 import jax.numpy as jnp
 
 from skyflow import dynamics, sensors
-from skyflow.params import AIRFRAMES, factor_floor, max_bracket, sample_params
+from skyflow.params import (
+    AIRFRAMES,
+    apply_tw_guard,
+    factor_floor,
+    max_bracket,
+    sample_params,
+)
 from skyflow.types import Array, DRState, FirmwareFleet, SimState, StepInfo, Task
 
 __all__ = ["DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
@@ -409,6 +415,13 @@ class SkyFlowEnv:
         self._imu_bias_on = dr.gyro_bias_rps > 0.0 or dr.accel_bias_mps2 > 0.0
         self.fleet = int(cfg.num_envs)
         self.airframe = AIRFRAMES[cfg.airframe]
+        # Battery sag shrinks the very ceiling the thrust-to-weight guard prices, so
+        # the guard re-runs over the SAGGED per-world ceiling after the trait draw
+        # (factor stage only; sag=0 makes the re-run an idempotent no-op, skipped).
+        self._tw_reguard = dr.factors is not None and dr.battery_sag > 0.0
+        self._nominal_row = jnp.asarray(
+            dynamics.pack_params(self.airframe.values), jnp.float32
+        )
         self.decimation = int(decimation)
         self.dt_physics = 1.0 / cfg.physics_hz
         self.dt_control = self.decimation / cfg.physics_hz
@@ -624,9 +637,11 @@ class SkyFlowEnv:
         params = sample_params(
             k_params, self.airframe, f, dr.body_scale, dr.brackets, dr.factors
         )
+        dr_state = self._draw_traits(k_traits, f)
+        if self._tw_reguard:
+            params = apply_tw_guard(params, self._nominal_row, dr_state.w_max)
         plant, task_state = self.task.spawn(k_spawn, f, params)
         plant = plant.astype(jnp.float32)
-        dr_state = self._draw_traits(k_traits, f)
         delay_idx = jax.random.randint(
             k_delay, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
         )
@@ -844,9 +859,11 @@ class SkyFlowEnv:
         # through untouched (bit-identical).
         k_rp, k_rs, k_rt, k_rd, k_ri, k_ro = jax.random.split(k_reset, 6)
         params_new = sample_params(k_rp, af, f, dr.body_scale, dr.brackets, dr.factors)
+        dr_new = self._draw_traits(k_rt, f)
+        if self._tw_reguard:
+            params_new = apply_tw_guard(params_new, self._nominal_row, dr_new.w_max)
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
-        dr_new = self._draw_traits(k_rt, f)
         la_new = jnp.zeros((f, 4), jnp.float32)
         wind_new = jnp.zeros((f, 3), jnp.float32)
         k_ro_task, k_ro_dr = jax.random.split(k_ro)
