@@ -48,7 +48,7 @@ import jax
 import jax.numpy as jnp
 
 from skyflow import dynamics, sensors
-from skyflow.params import AIRFRAMES, max_bracket, sample_params
+from skyflow.params import AIRFRAMES, factor_floor, max_bracket, sample_params
 from skyflow.types import Array, DRState, FirmwareFleet, SimState, StepInfo, Task
 
 __all__ = ["DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
@@ -88,8 +88,13 @@ class DomainRand:
     scale: float = 1.0  # master dial over every continuous magnitude
 
     # -- body: the vehicle (trait, §6 sample_params) --------------------------------
-    body_scale: float = 1.0  # multiplies the DR_BRACKETS half-widths
-    brackets: dict | None = None  # per-key half-width overrides of DR_BRACKETS (§6)
+    body_scale: float = 1.0  # multiplies the bracket half-widths and factor limits
+    brackets: dict | None = None  # per-key half-width overrides (§6); base table is
+    # DR_BRACKETS, or RESIDUAL_BRACKETS once `factors` is on
+    factors: dict | None = None  # correlated factor stage (§6): None = off (legacy
+    # independent draws, bit-exact); {} = on with FACTOR_LIMITS defaults;
+    # {group: (lo, hi)} overrides one group's limits. Measured 2026-08-22: at equal
+    # ±20% width on ct2+cq2 the factor structure flies 0.88, independent draws 0.12.
 
     # -- world: wind and shocks ------------------------------------------------------
     wind_mean_mps: float = 0.0  # trait: steady horizontal wind, magnitude ceiling, m/s
@@ -366,11 +371,18 @@ class SkyFlowEnv:
         ):
             if getattr(cfg.dr, name) < 0.0:
                 raise ValueError(f"dr.{name} must be >= 0, got {getattr(cfg.dr, name)}")
-        b_max = max_bracket(dr.brackets)  # loud key validation happens in here too
+        # Loud key/group validation happens inside max_bracket and factor_floor.
+        b_max = max_bracket(dr.brackets, residual=dr.factors is not None)
         if dr.body_scale * b_max >= 1.0:
             raise ValueError(
                 f"dr.scale·dr.body_scale·max bracket = {dr.body_scale * b_max:.3f} >= 1: "
                 "a multiplicative factor could reach zero or flip a physical parameter"
+            )
+        f_low = factor_floor(dr.factors)
+        if dr.body_scale * f_low >= 1.0:
+            raise ValueError(
+                f"dr.scale·dr.body_scale·max factor low = {dr.body_scale * f_low:.3f} >= 1: "
+                "a shared factor could reach zero or flip a physical parameter"
             )
         decimation = round(cfg.physics_hz / cfg.control_hz)
         if decimation < 1:
@@ -592,7 +604,9 @@ class SkyFlowEnv:
             key, 7
         )
 
-        params = sample_params(k_params, self.airframe, f, dr.body_scale, dr.brackets)
+        params = sample_params(
+            k_params, self.airframe, f, dr.body_scale, dr.brackets, dr.factors
+        )
         plant, task_state = self.task.spawn(k_spawn, f, params)
         plant = plant.astype(jnp.float32)
         dr_state = self._draw_traits(k_traits, f)
@@ -808,7 +822,7 @@ class SkyFlowEnv:
         # cleared buffers/gust for done worlds, blended leaf-wise; live worlds pass
         # through untouched (bit-identical).
         k_rp, k_rs, k_rt, k_rd, k_ri, k_ro = jax.random.split(k_reset, 6)
-        params_new = sample_params(k_rp, af, f, dr.body_scale, dr.brackets)
+        params_new = sample_params(k_rp, af, f, dr.body_scale, dr.brackets, dr.factors)
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
         dr_new = self._draw_traits(k_rt, f)
