@@ -106,6 +106,12 @@ class DomainRand:
 
     # -- actuation: command transport (trait) ----------------------------------------
     delay_steps: tuple[int, int] = (0, 0)  # (min, max) control steps (never scaled)
+    # trait: battery voltage sag — per-episode rotor-speed-ceiling factor
+    # 1 - U(0, battery_sag) on the airframe's rotor_speed_max (one-sided: a pack only
+    # sags). Measured on the Air75 II Racer battery_hover sysid: -9.6% RPM per motor
+    # command over 3.71->3.30 V; ~13% across a full pack. The firmware sees nothing —
+    # full stick simply buys less rotor speed, exactly like a tired pack.
+    battery_sag: float = 0.0
 
     # -- sensing: the IMU/baro rows the firmware and IMU-observing tasks consume ------
     gyro_noise_rps: float = 0.0  # process: white per-sample std, rad/s
@@ -141,6 +147,7 @@ class DomainRand:
             accel_bias_mps2=s * self.accel_bias_mps2,
             baro_noise_pa=s * self.baro_noise_pa,
             obs_noise=s * self.obs_noise,
+            battery_sag=s * self.battery_sag,
         )
 
 
@@ -384,6 +391,11 @@ class SkyFlowEnv:
                 f"dr.scale·dr.body_scale·max factor low = {dr.body_scale * f_low:.3f} >= 1: "
                 "a shared factor could reach zero or flip a physical parameter"
             )
+        if not 0.0 <= dr.battery_sag < 1.0:
+            raise ValueError(
+                f"dr.scale·dr.battery_sag must be in [0, 1), got {dr.battery_sag}: "
+                "a sagged ceiling of zero or below stops every rotor"
+            )
         decimation = round(cfg.physics_hz / cfg.control_hz)
         if decimation < 1:
             raise ValueError(
@@ -564,7 +576,12 @@ class SkyFlowEnv:
             [dr.accel_bias_mps2] * 3 + [dr.gyro_bias_rps] * 3, jnp.float32
         )
         imu_bias = half * jax.random.uniform(k_bias, (f, 6), jnp.float32, -1.0, 1.0)
-        return DRState(wind_mean=wind_mean, imu_bias=imu_bias)
+        # Battery sag: one-sided ceiling factor per world (a pack only sags). sag=0
+        # gives exactly the airframe ceiling, so the leaf always exists and stays inert.
+        k_sag = jax.random.fold_in(k_bias, 1)
+        sag = dr.battery_sag * jax.random.uniform(k_sag, (f,), jnp.float32, 0.0, 1.0)
+        w_max = self.airframe.rotor_speed_max * (1.0 - sag)
+        return DRState(wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max)
 
     def _measure(
         self, plant: Array, omega: Array, wind: Array, params: Array,
@@ -665,7 +682,11 @@ class SkyFlowEnv:
         dr = self.dr
         f = self.fleet
         af = self.airframe
-        w_min, w_max, k_thr = af.rotor_speed_min, af.rotor_speed_max, af.throttle_k
+        w_min, k_thr = af.rotor_speed_min, af.throttle_k
+        # Per-world ceiling, materialized [F,4]: the battery-sag trait. Exact per-rotor
+        # shape — the generated throttle map is elementwise and must see no implicit
+        # rank growth. sag=0 draws the airframe constant, so numerics do not change.
+        w_max = jnp.broadcast_to(state.dr_state.w_max[:, None], (f, 4))
         cos_tilt_min = math.cos(cfg.ground_tilt_limit_rad)
 
         if self._fw is not None:

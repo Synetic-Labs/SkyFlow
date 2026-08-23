@@ -54,14 +54,18 @@ def _assemble_inputs(omega_cmd, wind_vel, f_ext, tau_ext):
 
 
 @cache
-def _substep_fleet(motor_model: str):
-    """vmap of one backend RK4 step + reference post-step over the fleet axis."""
+def _substep_fleet(motor_model: str, per_world_w_max: bool = False):
+    """vmap of one backend RK4 step + reference post-step over the fleet axis.
+
+    ``per_world_w_max`` maps the rotor-speed ceiling over the fleet axis too ([F,4]
+    rows — the battery-sag trait); the default keeps the scalar-constant path
+    bit-identical for every existing caller."""
     step = sfd.rk4_step_fn(N_ROTORS, motor_model)
 
     def one(s, u, p, dt, w_min, w_max):
         return sfd.post_step(step(s, u, p, dt), w_min, w_max)
 
-    return jax.vmap(one, in_axes=(0, 0, 0, None, None, None))
+    return jax.vmap(one, in_axes=(0, 0, 0, None, None, 0 if per_world_w_max else None))
 
 
 def substep(
@@ -86,7 +90,8 @@ def substep(
     omega_cmd [F,4] rad/s; wind_vel [F,3] world; f_ext [F,3] N world; tau_ext [F,3] N·m body.
     """
     u = _assemble_inputs(omega_cmd, wind_vel, f_ext, tau_ext)
-    return _substep_fleet(motor_model)(plant, u, params, dt, w_min, w_max)
+    per_world = jnp.ndim(w_max) > 0  # [F,4] battery-sag rows vs the scalar constant
+    return _substep_fleet(motor_model, per_world)(plant, u, params, dt, w_min, w_max)
 
 
 @cache

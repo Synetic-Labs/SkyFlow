@@ -14,7 +14,7 @@ import pytest
 from skyflow_dynamics.backends import jax as sfd
 
 from skyflow import dynamics, sensors
-from skyflow.params import NEVER_JITTER, sample_params
+from skyflow.params import AIRFRAMES, NEVER_JITTER, sample_params
 from skyflow.types import DRState, SimState
 
 
@@ -199,6 +199,7 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         dr_state=DRState(
             wind_mean=jnp.zeros((f, 3), jnp.float32),
             imu_bias=jnp.zeros((f, 6), jnp.float32),
+            w_max=jnp.full((f,), AIRFRAMES["crazyflie"].rotor_speed_max, jnp.float32),
         ),
         act_buf=jnp.zeros((f, 3, 4), jnp.float32),
         delay_idx=jnp.zeros(f, jnp.int32),

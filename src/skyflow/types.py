@@ -66,6 +66,7 @@ class DRState(NamedTuple):
 
     wind_mean: Array  # [F,3] f32 steady wind velocity, world frame (z component is 0)
     imu_bias: Array  # [F,6] f32 additive IMU bias: accel(3) m/s², gyro(3) rad/s
+    w_max: Array  # [F] f32 per-world rotor-speed ceiling, rad/s (battery-sag trait)
 
 
 class TaskEval(NamedTuple):
