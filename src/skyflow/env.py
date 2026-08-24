@@ -112,13 +112,13 @@ class DomainRand:
 
     # -- actuation: command transport (trait) ----------------------------------------
     delay_steps: tuple[int, int] = (0, 0)  # (min, max) control steps (never scaled)
-    # process: per-step transport jitter, ± control steps on the per-episode delay
-    # draw (never scaled — integer steps). The jittered index clips at the ring
-    # edges, so worlds drawn at the delay extremes jitter one-sided there.
-    delay_jitter_steps: int = 0
-    # event: this step's arriving command is lost; the link holds the previous
-    # applied command (never scaled — an event rate). Measured basis: the uplink
-    # link-statistics path (deploy sync-spin xcorr rig) — drops are rare but real.
+    # event: this step's arriving command is lost or LATE; the link holds the
+    # previous applied command and the next success applies the newest frame —
+    # the RX's actual behavior, so drops subsume link jitter with NO command
+    # reordering (never scaled — an event rate). Measured 2026-08-24: an i.i.d.
+    # per-step jitter index REORDERS commands, which no real link does, and the
+    # reordered stick stream through the firmware's RC feedforward kills takeoff
+    # (0.003 airborne vs 0.91 for drops at the same 10M probe).
     cmd_drop_prob: float = 0.0
     # trait: battery voltage sag — per-episode rotor-speed-ceiling factor
     # 1 - U(0, battery_sag) on the airframe's rotor_speed_max (one-sided: a pack only
@@ -151,8 +151,7 @@ class DomainRand:
     def off(self) -> "DomainRand":
         """This setting with all model error and corruption off: bit-exact nominal."""
         return replace(
-            self, scale=0.0, delay_steps=(0, 0), delay_jitter_steps=0,
-            cmd_drop_prob=0.0, obs_error=None,
+            self, scale=0.0, delay_steps=(0, 0), cmd_drop_prob=0.0, obs_error=None,
         )
 
     def effective(self) -> "DomainRand":
@@ -429,10 +428,6 @@ class SkyFlowEnv:
                 f"dr.scale·dr.battery_sag must be in [0, 1), got {dr.battery_sag}: "
                 "a sagged ceiling of zero or below stops every rotor"
             )
-        if int(dr.delay_jitter_steps) < 0:
-            raise ValueError(
-                f"dr.delay_jitter_steps must be >= 0, got {dr.delay_jitter_steps}"
-            )
         if not 0.0 <= dr.cmd_drop_prob < 1.0:
             raise ValueError(
                 f"dr.cmd_drop_prob must be in [0, 1), got {dr.cmd_drop_prob}: "
@@ -441,7 +436,6 @@ class SkyFlowEnv:
         # L5 estimator-error model (errors.py) — loud key/profile validation inside;
         # None keeps the truth-observation path bit-exact and key-free.
         self._est = errors.resolve_obs_error(dr.obs_error)
-        self._jitter = int(dr.delay_jitter_steps)
         self._drop_on = dr.cmd_drop_prob > 0.0
         decimation = round(cfg.physics_hz / cfg.control_hz)
         if decimation < 1:
@@ -778,20 +772,12 @@ class SkyFlowEnv:
         ) = jax.random.split(state.key, 9)
         action = jnp.clip(jnp.asarray(action, jnp.float32), -1.0, 1.0)
         act_buf = jnp.concatenate([action[:, None, :], state.act_buf[:, :-1, :]], axis=1)
-        delay_idx = state.delay_idx
-        if self._jitter > 0:
-            # Per-step transport jitter around the per-episode draw, clipped at the
-            # ring edges (documented in DomainRand). fold_in keeps the legacy
-            # stream untouched.
-            jit = jax.random.randint(
-                jax.random.fold_in(k_gate, 101), (f,), -self._jitter,
-                self._jitter + 1, dtype=jnp.int32,
-            )
-            delay_idx = jnp.clip(delay_idx + jit, 0, self._delay_max)
-        delayed = act_buf[jnp.arange(f), delay_idx]
+        delayed = act_buf[jnp.arange(f), state.delay_idx]
         if self._drop_on:
-            # A dropped packet never lands: the link holds the previous APPLIED
-            # command (exactly the ZOH a real RX performs on a missed frame).
+            # A dropped/late frame never lands: the link holds the previous APPLIED
+            # command (the RX's ZOH), and the next success applies the newest frame
+            # — no command reordering, ever. fold_in keeps the legacy stream
+            # untouched.
             dropped = jax.random.bernoulli(
                 jax.random.fold_in(k_gate, 102), dr.cmd_drop_prob, (f,)
             )

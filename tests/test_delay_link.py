@@ -1,8 +1,14 @@
 """
-ERRORS.md L3 — the transport-link error models on the delay ring: per-step jitter
-(delay_jitter_steps) and command drops (cmd_drop_prob, the RX's hold-last-command
-ZOH). Includes the legacy bit-exactness guard: both knobs at zero reproduce the
-plain env exactly. CPU motors-mode fleets only.
+ERRORS.md L3 — the transport-link error model on the delay ring: command drops
+(cmd_drop_prob — a dropped or LATE frame holds the previous applied command; the
+next success applies the newest frame, so drops subsume link jitter with no
+command reordering). Includes the legacy bit-exactness guard: the knob at zero
+reproduces the plain env exactly.
+
+An i.i.d. per-step jitter index was measured and REMOVED 2026-08-24: it reorders
+commands (no real link does), and the reordered stick stream through the
+firmware's RC feedforward kills takeoff (0.003 airborne vs 0.91 for drops at the
+same whoop 10M probe). CPU motors-mode fleets only.
 """
 
 import jax
@@ -23,16 +29,16 @@ def _env(**dr_kwargs):
 
 
 def test_validation_rejects_bad_knobs():
-    with pytest.raises(ValueError, match="delay_jitter_steps"):
-        _env(delay_jitter_steps=-1)
     with pytest.raises(ValueError, match="cmd_drop_prob"):
         _env(cmd_drop_prob=1.0)
+    with pytest.raises(TypeError):
+        DomainRand(delay_jitter_steps=1)  # removed 2026-08-24 — reordering is unphysical
 
 
-def test_zero_knobs_are_bit_exact_with_the_plain_env():
+def test_zero_knob_is_bit_exact_with_the_plain_env():
     key = jax.random.PRNGKey(0)
     env_a = _env()
-    env_b = _env(delay_jitter_steps=0, cmd_drop_prob=0.0)
+    env_b = _env(cmd_drop_prob=0.0)
     obs_a, s_a = env_a.reset(key)
     obs_b, s_b = env_b.reset(key)
     np.testing.assert_array_equal(np.asarray(obs_a), np.asarray(obs_b))
@@ -79,28 +85,15 @@ def test_drops_hold_the_previously_applied_command():
     assert np.asarray(s_f.plant[:, 13:17]).min() > np.asarray(s_d.plant[:, 13:17]).max()
 
 
-def test_jitter_runs_and_respects_the_ring():
-    """Jitter larger than the delay window still indexes inside the ring (the
-    documented edge clip) — the env steps without error and stays finite."""
-    env = _env(delay_steps=(1, 2), delay_jitter_steps=5)
-    _, state = env.reset(jax.random.PRNGKey(0))
+def test_recovery_applies_the_newest_frame_not_a_stale_one():
+    """After a drop the next successful step reads the normal delayed slot — the
+    applied command never moves backward in send time. With delay (1,1) and a
+    known action sequence, cmd_prev after a clean step equals the action sent one
+    step earlier, regardless of drops before it."""
+    env = _env(delay_steps=(1, 1), cmd_drop_prob=0.0)
+    _, state = env.reset(jax.random.PRNGKey(2))
     step = jax.jit(env.step)
-    a = jnp.full((FLEET, 4), 0.5, jnp.float32)
-    for _ in range(10):
+    seq = [jnp.full((FLEET, 4), v, jnp.float32) for v in (0.1, 0.2, 0.3)]
+    for a in seq:
         _, state, _, _, _ = step(state, a)
-    assert bool(jnp.isfinite(state.plant).all())
-
-
-def test_jitter_spreads_the_applied_command_across_worlds():
-    """delay (2,2) with jitter 2: after ONE distinctive action followed by
-    neutrals, worlds see that action land at different steps — cmd_prev differs
-    across the fleet at a fixed step, which a constant delay cannot produce."""
-    env = _env(delay_steps=(2, 2), delay_jitter_steps=2)
-    _, state = env.reset(jax.random.PRNGKey(3))
-    step = jax.jit(env.step)
-    mark = jnp.full((FLEET, 4), 0.9, jnp.float32)
-    neutral = jnp.zeros((FLEET, 4), jnp.float32)
-    _, state, _, _, _ = step(state, mark)
-    _, state, _, _, _ = step(state, neutral)
-    applied = np.asarray(state.cmd_prev[:, 0], dtype=np.float64)  # 0.9 mark or 0.0
-    assert sorted(set(np.round(applied, 3))) == [0.0, 0.9]
+    np.testing.assert_allclose(np.asarray(state.cmd_prev), 0.2, atol=1e-6)

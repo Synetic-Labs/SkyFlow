@@ -84,8 +84,13 @@ sensor model, the policy eats the estimator model.
 - L5 estimator error: `errors.py` — profiles `mocap` (the current rig) and
   `vio` (planned), per-group bias + OU + white, attitude as one small rotation,
   relative rotor-telemetry error, dropout holds. Config: `DomainRand.obs_error`.
-- L3 link: per-episode delay draw + per-step jitter (`delay_jitter_steps`) +
-  command drops (`cmd_drop_prob`), battery-sag ceiling trait.
+- L3 link: per-episode delay draw + command drops (`cmd_drop_prob` — a dropped
+  or LATE frame holds the last applied command, the next success applies the
+  newest frame; drops subsume link jitter with NO reordering), battery-sag
+  ceiling trait. An i.i.d. per-step jitter index was measured and REMOVED
+  2026-08-24: it reorders commands, which no real link does, and the reordered
+  stick stream through the firmware's RC feedforward kills takeoff (0.003
+  airborne vs 0.91 for drops, whoop 10M probes) — a live example of rule 6.
 - L4 IMU: white noise + per-episode bias (`sensors.measure`); baro white noise.
 - L1/L2: factor-stage body DR (`params.py`), OU gusts, steady wind, pokes.
 
