@@ -47,7 +47,7 @@ from typing import Any, NamedTuple, cast
 import jax
 import jax.numpy as jnp
 
-from skyflow import dynamics, sensors
+from skyflow import dynamics, errors, sensors
 from skyflow.params import (
     AIRFRAMES,
     apply_tw_guard,
@@ -112,6 +112,14 @@ class DomainRand:
 
     # -- actuation: command transport (trait) ----------------------------------------
     delay_steps: tuple[int, int] = (0, 0)  # (min, max) control steps (never scaled)
+    # process: per-step transport jitter, ± control steps on the per-episode delay
+    # draw (never scaled — integer steps). The jittered index clips at the ring
+    # edges, so worlds drawn at the delay extremes jitter one-sided there.
+    delay_jitter_steps: int = 0
+    # event: this step's arriving command is lost; the link holds the previous
+    # applied command (never scaled — an event rate). Measured basis: the uplink
+    # link-statistics path (deploy sync-spin xcorr rig) — drops are rare but real.
+    cmd_drop_prob: float = 0.0
     # trait: battery voltage sag — per-episode rotor-speed-ceiling factor
     # 1 - U(0, battery_sag) on the airframe's rotor_speed_max (one-sided: a pack only
     # sags). Measured on the Air75 II Racer battery_hover sysid: -9.6% RPM per motor
@@ -127,21 +135,40 @@ class DomainRand:
     baro_noise_pa: float = 0.0  # process: white per-sample std on the baro row, Pa
 
     # -- observation: the policy vector (applied by the env after task.observe) -------
-    obs_noise: float = 0.0  # process: additive uniform half-width
+    obs_noise: float = 0.0  # process: additive uniform half-width. LEGACY stress
+    # knob: unit-blind white on the finalized vector (it corrupts task constants and
+    # breaks rotation orthonormality). Prefer obs_error below for realism arms.
+    # L5 estimator-error model (errors.py): the task observes a CORRUPTED plant
+    # state — per-group bias (trait) + OU drift + white, attitude as one small
+    # rotation, relative rotor-telemetry error, dropout holds. None = off
+    # (bit-exact); {"profile": "mocap"} etc.; fracs scale the profile widths and
+    # the master `scale` folds into them. p_drop is an event rate — never scaled.
+    obs_error: dict | None = None
 
     # -- initial state: task variety, forwarded to builders as spawn_dr_scale ---------
     spawn_scale: float = 1.0
 
     def off(self) -> "DomainRand":
         """This setting with all model error and corruption off: bit-exact nominal."""
-        return replace(self, scale=0.0, delay_steps=(0, 0))
+        return replace(
+            self, scale=0.0, delay_steps=(0, 0), delay_jitter_steps=0,
+            cmd_drop_prob=0.0, obs_error=None,
+        )
 
     def effective(self) -> "DomainRand":
         """This setting with `scale` folded into every continuous magnitude (scale=1)."""
         s = self.scale
+        obs_error = self.obs_error
+        if obs_error is not None:
+            # Fold the master scale into the width fractions; the event knobs
+            # (p_drop, drop_mean_steps) pass through unscaled per the charter.
+            obs_error = dict(obs_error)
+            for key in ("bias_frac", "ou_frac", "white_frac"):
+                obs_error[key] = s * float(obs_error.get(key, 1.0))
         return replace(
             self,
             scale=1.0,
+            obs_error=obs_error,
             body_scale=s * self.body_scale,
             wind_mean_mps=s * self.wind_mean_mps,
             wind_gust_mps=s * self.wind_gust_mps,
@@ -402,6 +429,20 @@ class SkyFlowEnv:
                 f"dr.scale·dr.battery_sag must be in [0, 1), got {dr.battery_sag}: "
                 "a sagged ceiling of zero or below stops every rotor"
             )
+        if int(dr.delay_jitter_steps) < 0:
+            raise ValueError(
+                f"dr.delay_jitter_steps must be >= 0, got {dr.delay_jitter_steps}"
+            )
+        if not 0.0 <= dr.cmd_drop_prob < 1.0:
+            raise ValueError(
+                f"dr.cmd_drop_prob must be in [0, 1), got {dr.cmd_drop_prob}: "
+                "at 1 no command ever lands and the link is dead by construction"
+            )
+        # L5 estimator-error model (errors.py) — loud key/profile validation inside;
+        # None keeps the truth-observation path bit-exact and key-free.
+        self._est = errors.resolve_obs_error(dr.obs_error)
+        self._jitter = int(dr.delay_jitter_steps)
+        self._drop_on = dr.cmd_drop_prob > 0.0
         decimation = round(cfg.physics_hz / cfg.control_hz)
         if decimation < 1:
             raise ValueError(
@@ -594,7 +635,15 @@ class SkyFlowEnv:
         k_sag = jax.random.fold_in(k_bias, 1)
         sag = dr.battery_sag * jax.random.uniform(k_sag, (f,), jnp.float32, 0.0, 1.0)
         w_max = self.airframe.rotor_speed_max * (1.0 - sag)
-        return DRState(wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max)
+        # Estimator-error bias trait (errors.py channel groups). fold_in keeps the
+        # legacy RNG stream untouched; feature off gives exactly-zero columns.
+        if self._est is not None:
+            est_bias = errors.draw_bias(jax.random.fold_in(k_bias, 2), f, self._est)
+        else:
+            est_bias = jnp.zeros((f, 12), jnp.float32)
+        return DRState(
+            wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max, est_bias=est_bias
+        )
 
     def _measure(
         self, plant: Array, omega: Array, wind: Array, params: Array,
@@ -650,11 +699,20 @@ class SkyFlowEnv:
         last_action = jnp.zeros((f, 4), jnp.float32)
 
         # First observation: IMU with the rotors held at their spawn speeds (no command
-        # has been issued yet, so hold is the only self-consistent input).
+        # has been issued yet, so hold is the only self-consistent input). The task
+        # observes the ESTIMATOR's state when obs_error is on (errors.py: fresh bias
+        # trait, drift starts at zero, no dropout on the first frame).
         k_obs_task, k_obs_dr = jax.random.split(k_obs)
         imu = self._measure(plant, plant[:, 13:17], dr_state.wind_mean, params, dr_state, k_imu)
+        if self._est is not None:
+            emitted = errors.corrupt_plant(
+                plant, dr_state.est_bias, jnp.zeros((f, 12), jnp.float32),
+                jax.random.fold_in(k_obs, 1), self._est,
+            )
+        else:
+            emitted = plant
         obs, task_state = self.task.observe(
-            plant, task_state, imu, last_action, k_obs_task, fresh_spawn=True
+            emitted, task_state, imu, last_action, k_obs_task, fresh_spawn=True
         )
         obs = self._corrupt_obs(obs, k_obs_dr)
 
@@ -670,7 +728,11 @@ class SkyFlowEnv:
             dr_state=dr_state,
             act_buf=act_buf,
             delay_idx=delay_idx,
+            cmd_prev=last_action,
             last_action=last_action,
+            est_ou=jnp.zeros((f, 12), jnp.float32),
+            est_hold=jnp.zeros(f, jnp.int32),
+            est_held=emitted,
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
@@ -716,7 +778,24 @@ class SkyFlowEnv:
         ) = jax.random.split(state.key, 9)
         action = jnp.clip(jnp.asarray(action, jnp.float32), -1.0, 1.0)
         act_buf = jnp.concatenate([action[:, None, :], state.act_buf[:, :-1, :]], axis=1)
-        delayed = act_buf[jnp.arange(f), state.delay_idx]
+        delay_idx = state.delay_idx
+        if self._jitter > 0:
+            # Per-step transport jitter around the per-episode draw, clipped at the
+            # ring edges (documented in DomainRand). fold_in keeps the legacy
+            # stream untouched.
+            jit = jax.random.randint(
+                jax.random.fold_in(k_gate, 101), (f,), -self._jitter,
+                self._jitter + 1, dtype=jnp.int32,
+            )
+            delay_idx = jnp.clip(delay_idx + jit, 0, self._delay_max)
+        delayed = act_buf[jnp.arange(f), delay_idx]
+        if self._drop_on:
+            # A dropped packet never lands: the link holds the previous APPLIED
+            # command (exactly the ZOH a real RX performs on a missed frame).
+            dropped = jax.random.bernoulli(
+                jax.random.fold_in(k_gate, 102), dr.cmd_drop_prob, (f,)
+            )
+            delayed = jnp.where(dropped[:, None], state.cmd_prev, delayed)
 
         # 3. OU gust deviation, exact discretization over dt_control: stationary std is
         # exactly wind_gust_mps per axis for any step size (decay + variance-matched
@@ -823,11 +902,33 @@ class SkyFlowEnv:
         truncated = (steps >= cfg.max_episode_steps) | stuck
         done = terminated | truncated
 
-        # 8. Observe the post-transition state (pre-reset: this is final_obs on done rows).
+        # 8. Observe the post-transition state (pre-reset: this is final_obs on done
+        # rows). With obs_error on, the task observes the ESTIMATOR's state
+        # (errors.py): bias trait + advanced OU drift + fresh white, one small
+        # rotation on the quaternion; during a dropout hold the estimator repeats
+        # its last emitted estimate (staleness, not noise).
         k_obs_task, k_obs_dr = jax.random.split(k_obs)
         imu = self._measure(plant, omega_last, wind_total, state.params, state.dr_state, k_imu)
+        if self._est is not None:
+            est_ou = errors.advance_ou(
+                state.est_ou, jax.random.fold_in(k_obs, 2), self.dt_control, self._est
+            )
+            emitted = errors.corrupt_plant(
+                plant, state.dr_state.est_bias, est_ou,
+                jax.random.fold_in(k_obs, 3), self._est,
+            )
+            est_hold = state.est_hold
+            if self._est.p_drop > 0.0:
+                start = jax.random.bernoulli(
+                    jax.random.fold_in(k_obs, 4), self._est.p_drop, (f,)
+                ) & (est_hold == 0)
+                dur = errors.draw_hold(jax.random.fold_in(k_obs, 5), f, self._est)
+                est_hold = jnp.where(start, dur, jnp.maximum(est_hold - 1, 0))
+                emitted = jnp.where((est_hold > 0)[:, None], state.est_held, emitted)
+        else:
+            est_ou, est_hold, emitted = state.est_ou, state.est_hold, plant
         obs, ts_out = self.task.observe(
-            plant, ev.task_state, imu, action, k_obs_task, fresh_spawn=False
+            emitted, ev.task_state, imu, action, k_obs_task, fresh_spawn=False
         )
         obs = self._corrupt_obs(obs, k_obs_dr)
 
@@ -870,8 +971,15 @@ class SkyFlowEnv:
         imu_new = self._measure(
             plant_new, plant_new[:, 13:17], dr_new.wind_mean, params_new, dr_new, k_ri
         )
+        if self._est is not None:
+            emitted_new = errors.corrupt_plant(
+                plant_new, dr_new.est_bias, jnp.zeros((f, 12), jnp.float32),
+                jax.random.fold_in(k_ro, 1), self._est,
+            )
+        else:
+            emitted_new = plant_new
         obs_new, ts_fresh = self.task.observe(
-            plant_new, ts_fresh, imu_new, la_new, k_ro_task, fresh_spawn=True
+            emitted_new, ts_fresh, imu_new, la_new, k_ro_task, fresh_spawn=True
         )
         obs_new = self._corrupt_obs(obs_new, k_ro_dr)
         fresh = dict(
@@ -883,7 +991,11 @@ class SkyFlowEnv:
             delay_idx=jax.random.randint(
                 k_rd, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
             ),
+            cmd_prev=la_new,
             last_action=la_new,
+            est_ou=jnp.zeros((f, 12), jnp.float32),
+            est_hold=jnp.zeros(f, jnp.int32),
+            est_held=emitted_new,
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
@@ -897,7 +1009,11 @@ class SkyFlowEnv:
             dr_state=state.dr_state,
             act_buf=act_buf,
             delay_idx=state.delay_idx,
+            cmd_prev=delayed,
             last_action=action,
+            est_ou=est_ou,
+            est_hold=est_hold,
+            est_held=emitted,
             steps=steps,
             airborne=airborne,
             ep_return=ep_return,

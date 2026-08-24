@@ -67,6 +67,8 @@ class DRState(NamedTuple):
     wind_mean: Array  # [F,3] f32 steady wind velocity, world frame (z component is 0)
     imu_bias: Array  # [F,6] f32 additive IMU bias: accel(3) m/s², gyro(3) rad/s
     w_max: Array  # [F] f32 per-world rotor-speed ceiling, rad/s (battery-sag trait)
+    est_bias: Array  # [F,12] f32 estimator-error bias trait: pos(3) m, vel(3) m/s,
+    # att rotation-vector(3) rad, rate(3) rad/s (errors.py channel groups)
 
 
 class TaskEval(NamedTuple):
@@ -176,7 +178,13 @@ class SimState:
     dr_state: "DRState"  # per-episode trait draws (steady wind, IMU bias)
     act_buf: Array  # [F,D+1,4] transport-delay ring, newest first
     delay_idx: Array  # [F] int32 per-world delay draw
+    cmd_prev: Array  # [F,4] the last APPLIED (post-delay/drop) command — what the
+    # link holds when a packet drops (dr.cmd_drop_prob)
     last_action: Array  # [F,4]
+    # -- estimator-error process state (errors.py; inert zeros when obs_error off) ----
+    est_ou: Array  # [F,12] f32 OU drift state, errors.py channel groups
+    est_hold: Array  # [F] int32 dropout hold steps remaining (0 = tracking)
+    est_held: Array  # [F,17] f32 the estimate emitted during a dropout hold
     steps: Array  # [F] int32
     airborne: Array  # [F] bool
     ep_return: Array  # [F]
