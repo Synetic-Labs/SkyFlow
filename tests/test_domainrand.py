@@ -312,7 +312,7 @@ def test_baro_noise_reaches_the_firmware_rows(key):
 
 def test_obs_noise_skips_mask_terms(key):
     """dr.obs_noise is unit-blind (LEGACY knob): a half-width sane for metres used
-    to DESTROY the {0,1} mask pixels riding in the same vector (TECH_DEBT C8).
+    to DESTROY the mask pixels riding in the same vector (TECH_DEBT C8).
     Mask-valued terms are excluded; numeric terms keep the blanket."""
     kw: dict = {"num_envs": 2, "task": "figure_eight", "task_kwargs": {"vision": True}}
     with SkyFlowEnv(SimConfig(dr=DomainRand(body_scale=0.0), **kw)) as clean, \

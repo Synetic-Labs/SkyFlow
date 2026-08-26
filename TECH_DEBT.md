@@ -289,15 +289,16 @@ Most findings are instances of six patterns. Fixing a pattern kills its class.
    gates._crossing_point shared by classify_crossings and the new
    crossing_offsets; gate_course.evaluate consumes it (centering/miss can drift
    from the pass predicate by nothing; reward numerics move by last-ulp only —
-   dot-then-interpolate vs interpolate-then-dot). [V5] partial: the fleet
+   dot-then-interpolate vs interpolate-then-dot). [T6] DONE 2026-08-25: the mask
+   ObsTerm units read "[0,1] coverage HxW row-major" (supersample emits
+   fractions); nav's task declares its own units strings and never consumed
+   this one, so no downstream hash moves. [V5] partial: the fleet
    scatter is strided ON DEVICE (snapshot fleet_stride; viewer caps ~2048 dots);
    snapshot itself stays on the render thread by design (callers must not pay
    draw time) — the carry no longer rides into it after wave 3, so the GPU
    sticks blob pull is gone.
 
-Still open after wave 6: full motor_perm derivation [C13/F9]; T6 (mask units
-string "{0,1}" understates supersample fractions — it is HASHED by downstream
-contracts, so changing it is a layout change: James's call); armed_frac metric
+Still open after wave 6: full motor_perm derivation [C13/F9]; armed_frac metric
 + nav live-viz armed flag (wave-1 deferral); Q9 private-attr coupling in the
 older tests; example smoke tests; the §2/§3/§4 trap-list items not named in
 any wave (C7 control_hz desync, C10 name-matched task kwargs, C11 info-key

@@ -289,6 +289,12 @@ def tree_where(done: Array, fresh: Any, current: Any) -> Any:
     return jax.tree.map(sel, fresh, current)
 
 
+def _is_image_units(units: str) -> bool:
+    """True for ObsTerm units that declare a bounded image block ("[0,1] coverage ...",
+    "{0,1} ..."): dr.obs_noise must not touch those pixels (TECH_DEBT C8)."""
+    return units.startswith(("[0,1]", "{0,1}"))
+
+
 def _uniform_ball(key: Array, n: int) -> Array:
     """[n,3] f32 points uniform in the unit ball (direction · radius^(1/3) law)."""
     k_dir, k_r = jax.random.split(key)
@@ -475,14 +481,15 @@ class SkyFlowEnv:
         self.obs_dim = self.obs_spec.dim
         self.image_shape = self.task.image_shape
         # dr.obs_noise is unit-blind (the LEGACY stress knob): one half-width sane
-        # for metres DESTROYS {0,1} mask pixels riding in the same vector. Zero the
-        # noise on mask-valued terms; numeric terms keep the blanket, so state-only
-        # tasks stay bit-exact against legacy draws (same key, same shape).
+        # for metres DESTROYS mask pixels riding in the same vector. Zero the noise
+        # on image-valued terms (units declared "[0,1] ..." or "{0,1} ..."); numeric
+        # terms keep the blanket, so state-only tasks stay bit-exact against legacy
+        # draws (same key, same shape).
         self._obs_noise_scale: Array | None = None
-        if any("{0,1}" in t.units for t in self.obs_spec):
+        if any(_is_image_units(t.units) for t in self.obs_spec):
             self._obs_noise_scale = jnp.concatenate([
                 jnp.zeros(t.dim, jnp.float32)
-                if "{0,1}" in t.units
+                if _is_image_units(t.units)
                 else jnp.ones(t.dim, jnp.float32)
                 for t in self.obs_spec
             ])
@@ -765,7 +772,7 @@ class SkyFlowEnv:
     def _corrupt_obs(self, obs: Array, key: Array) -> Array:
         """DomainRand.obs_noise on the finalized task observation (uniform half-width);
         applied by the env so tasks keep semantics and the env keeps corruption.
-        Mask-valued terms ({0,1} units) are excluded — see `_obs_noise_scale`."""
+        Image-valued terms ("[0,1]"/"{0,1}" units) are excluded — see `_obs_noise_scale`."""
         if self.dr.obs_noise <= 0.0:
             return obs
         noise = jax.random.uniform(
