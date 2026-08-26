@@ -12,9 +12,11 @@ thread only snapshots watch rows and posts them to a latest-wins mailbox, so the
 never pays draw time. Replay and export run synchronous (`threaded=False`) — scrubbing and
 video need frame-exact draws in the caller's thread.
 
-Keys (always listed in the window's lower right): Space pause · ←/→ step/scrub (replay) ·
-[ ] speed · Tab focus world · V iso/top/profile · G fleet scatter · P screenshot ·
-R reset request (only hosts that consume take_reset) · Esc quit.
+Keys (always listed in a bar along the window's bottom edge): Space pause · ←/→
+step/scrub (replay) · [ ] speed · Tab focus world · V iso/top/profile (a switch lands on
+a fresh fit) · C follow the focused world · X full glyphs for all watched worlds ·
+G fleet scatter · drag pan · wheel zoom · P screenshot · R reset request (only hosts
+that consume take_reset) · Esc quit.
 """
 
 import os
@@ -47,7 +49,7 @@ from skyflow.viz.scenepane import draw_scene
 __all__ = ["Viewer"]
 
 _PILOT_RES = (192, 256)  # (H, W) of the default pilot cam pane
-_TOP_H, _HUD_H, _FPV_W = 30, 150, 336
+_TOP_H, _HUD_H, _FPV_W, _KEYBAR_H = 30, 150, 336, 20
 _TRAIL_LEN = 300
 
 
@@ -171,6 +173,19 @@ class Viewer:
         self._proj_kind = "iso"
         self._projs: dict[str, Projection] = {}
         self._focus = 0
+        self._drag = False  # scene-pane mouse pan in progress
+        self.follow = False  # C: keep the focused world centred in the scene pane
+        self.show_glyphs = False  # X: full glyphs for ALL watched worlds, not just focus
+        self._gauges: dict[str, float] = {}  # HUD dial full-scales (grow-only)
+        self._fed_t: deque[float] = deque(maxlen=120)  # feed timestamps → health fps
+        self._drawn_t: deque[float] = deque(maxlen=120)  # fresh-draw timestamps
+        self._ep_lens: list[float] = []  # finished-episode lengths, focused world
+        self._ep_partial: list[float] = []  # bin under construction (after compression)
+        self._ep_bin = 1  # episodes per bar; doubles when the chart compresses
+        self._ep_last_step: int | None = None
+        self._scene_rect = (
+            8, _TOP_H + 8, size[0] - _FPV_W - 24, size[1] - _TOP_H - _HUD_H - _KEYBAR_H - 16
+        )
         self._last_draw = 0.0
         self._last_submit = 0.0
         self._last_fleet: tuple[float, np.ndarray | None] = (0.0, None)
@@ -335,6 +350,7 @@ class Viewer:
         if not self._open:
             return
         now = time.perf_counter()
+        self._fed_t.append(now)  # health: the true feed rate, counted before the throttle
         if now - self._last_submit < self._display_dt:
             return
         self._last_submit = now
@@ -419,6 +435,7 @@ class Viewer:
         """
         if not self._open:
             return
+        self._fed_t.append(time.perf_counter())
         if self._thread is not None:
             seq = self._mail.put(vf)
             if force:
@@ -442,6 +459,7 @@ class Viewer:
         if not self._open:
             return
         if vf is not self._last_vf:
+            self._drawn_t.append(now)
             self._track(vf)
         self._last_vf = vf
         self._draw(vf)
@@ -465,7 +483,37 @@ class Viewer:
 
     # -- internals ---------------------------------------------------------------------
 
+    @staticmethod
+    def _fps(ts: "deque[float]") -> float:
+        """Rate over a timestamp window; 0 until two samples exist."""
+        return 0.0 if len(ts) < 2 else (len(ts) - 1) / max(ts[-1] - ts[0], 1e-6)
+
+    def _ep_done(self, length: float) -> None:
+        """Record one finished episode; compress pairwise so the whole run fits."""
+        self._ep_partial.append(float(length))
+        if len(self._ep_partial) >= self._ep_bin:
+            self._ep_lens.append(sum(self._ep_partial) / len(self._ep_partial))
+            self._ep_partial.clear()
+            if len(self._ep_lens) >= 2048:
+                pairs = zip(self._ep_lens[::2], self._ep_lens[1::2], strict=True)
+                self._ep_lens = [(a + b) / 2.0 for a, b in pairs]
+                self._ep_bin *= 2
+
     def _track(self, vf: ViewFrame) -> None:
+        # episode lengths, focused world: a done flag closes an episode at the current
+        # step; a step DROP between drawn frames reveals a missed done (frames drop by
+        # design, so the flag alone would undercount)
+        step = int(vf.step)
+        if vf.done is not None and bool(vf.done[vf.focus]):
+            length = step if step > 0 else (self._ep_last_step or 0)
+            if length > 0:
+                self._ep_done(length)
+            self._ep_last_step = None
+        elif self._ep_last_step is not None and step < self._ep_last_step:
+            self._ep_done(self._ep_last_step)
+            self._ep_last_step = step
+        else:
+            self._ep_last_step = step
         for w in range(vf.plant.shape[0]):
             trail = self._trails.setdefault(w, deque(maxlen=_TRAIL_LEN))
             if vf.done is not None and bool(vf.done[w]):
@@ -481,6 +529,19 @@ class Viewer:
                 self.close()
             elif ev.type == pygame.KEYDOWN:
                 self._key(ev.key)
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self._in_scene(ev.pos):
+                self._drag = True
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+                self._drag = False
+            elif ev.type == pygame.MOUSEMOTION and self._drag:
+                self._proj(self._scene_rect).pan(*ev.rel)
+            elif ev.type == pygame.MOUSEWHEEL:
+                pos = pygame.mouse.get_pos()
+                if self._in_scene(pos):  # zoom about the cursor, scene pane only
+                    self._proj(self._scene_rect).zoom_at(*pos, 1.15 ** float(ev.y))
+
+    def _in_scene(self, pos: tuple[int, int]) -> bool:
+        return pygame.Rect(self._scene_rect).collidepoint(pos)
 
     def _key(self, key: int) -> None:
         if key == pygame.K_ESCAPE:
@@ -490,8 +551,14 @@ class Viewer:
         elif key == pygame.K_TAB:
             self._focus = (self._focus + 1) % len(self.watch)
             self._hists.clear()
+            self._ep_last_step = None  # the bars persist; the step baseline must not
         elif key == pygame.K_v:
             self._proj_kind = KINDS[(KINDS.index(self._proj_kind) + 1) % len(KINDS)]
+            self._projs.pop(self._proj_kind, None)  # a view switch lands on a fresh fit
+        elif key == pygame.K_c:
+            self.follow = not self.follow
+        elif key == pygame.K_x:
+            self.show_glyphs = not self.show_glyphs
         elif key == pygame.K_g:
             self.show_fleet = not self.show_fleet
         elif key == pygame.K_p:
@@ -507,33 +574,44 @@ class Viewer:
         elif key == pygame.K_RIGHTBRACKET:
             self.speed = min(8.0, self.speed * 2.0)
 
-    #: (key, action) rows for the always-on key list — keep in step with _key.
+    #: (key, action) rows for the always-on key bar — keep in step with _key/_events.
+    #: Ordered by importance: a narrow window drops the tail, never the head.
     _KEYS = (
-        ("Space", "pause / resume"),
-        ("Tab", "focus next watched world"),
-        ("V", "view: iso / top / profile"),
-        ("G", "whole-fleet scatter on/off"),
-        ("P", "screenshot to cwd"),
-        ("R", "reset request (hosts that consume it)"),
-        ("← →", "scrub one step (replay, paused)"),
-        ("[ ]", "playback speed (replay)"),
-        ("Esc", "close window"),
+        ("Space", "pause"),
+        ("Tab", "focus"),
+        ("V", "view"),
+        ("C", "follow"),
+        ("X", "glyphs"),
+        ("G", "fleet"),
+        ("drag", "pan"),
+        ("wheel", "zoom"),
+        ("P", "shot"),
+        ("R", "reset"),
+        ("←→", "scrub"),
+        ("[ ]", "speed"),
+        ("Esc", "quit"),
     )
 
-    def _draw_keys(self, x: int, y_min: int, y_max: int) -> None:
-        """Always-on key list, bottom-anchored in the right column. Skipped when
-        the panes above (vision mode) leave no room for it."""
-        row_h = 16
-        h = row_h * (len(self._KEYS) + 1)
-        y = y_max - h
-        if y < y_min:
-            return
-        self._screen.blit(self._small.render("KEYS", True, palette.DIM), (x, y))
-        for i, (k, what) in enumerate(self._KEYS, start=1):
-            self._screen.blit(self._small.render(k, True, palette.MUTED),
-                              (x, y + i * row_h))
-            self._screen.blit(self._small.render(what, True, palette.DIM),
-                              (x + 56, y + i * row_h))
+    def _draw_keybar(self) -> None:
+        """Always-on key list: one horizontal row along the very bottom edge."""
+        wpx, hpx = self._size
+        y = hpx - _KEYBAR_H
+        pygame.draw.aaline(self._screen, palette.DIM, (0, y), (wpx, y))
+        sep = self._small.render(" · ", True, palette.dim(palette.DIM, 0.9))
+        x = 12
+        for i, (k, what) in enumerate(self._KEYS):
+            key_img = self._small.render(k, True, palette.MUTED)
+            what_img = self._small.render(" " + what, True, palette.DIM)
+            need = (sep.get_width() if i else 0) + key_img.get_width() + what_img.get_width()
+            if x + need > wpx - 8:
+                break
+            if i:
+                self._screen.blit(sep, (x, y + 4))
+                x += sep.get_width()
+            self._screen.blit(key_img, (x, y + 4))
+            x += key_img.get_width()
+            self._screen.blit(what_img, (x, y + 4))
+            x += what_img.get_width()
 
     def _draw_waiting(self) -> None:
         """Pre-first-frame splash: the window is alive, the sim has not stepped yet
@@ -554,7 +632,7 @@ class Viewer:
         )):
             img = (self._font if dy == 0 else self._small).render(txt, True, col)
             self._screen.blit(img, ((self._size[0] - img.get_width()) // 2, mid_y + dy * 26))
-        self._draw_keys(self._size[0] - _FPV_W - 8, _TOP_H + 8, self._size[1] - _HUD_H - 10)
+        self._draw_keybar()
         pygame.display.flip()
         req, self._shot_req = self._shot_req, None
         if req is not None:  # screenshot() works on the splash too
@@ -583,9 +661,12 @@ class Viewer:
 
         # top bar
         left = f"{self.title} · world {self.watch[vf.focus]} ({vf.focus + 1}/{len(self.watch)})"
+        health = f" · {self._fps(self._drawn_t):.0f}/{self._fps(self._fed_t):.0f} fps"
+        if self.snap_drops:
+            health += f" · drops {self.snap_drops}"
         right = (
             f"{'PAUSED' if self.paused else f'{self.speed:g}x'} · t {vf.t:7.2f} s"
-            f" · step {vf.step}"
+            f" · step {vf.step}{health}"
         )
         screen.blit(self._font.render(left, True, palette.MUTED), (12, 8))
         r_img = self._font.render(right, True, palette.MUTED)
@@ -593,17 +674,23 @@ class Viewer:
         pygame.draw.aaline(screen, palette.DIM, (0, _TOP_H), (wpx, _TOP_H))
 
         # panes
-        scene_rect = (8, _TOP_H + 8, wpx - _FPV_W - 24, hpx - _TOP_H - _HUD_H - 16)
+        scene_rect = self._scene_rect
+        proj = self._proj(scene_rect)
+        if self.follow:  # keep the focused world centred; pan/zoom still compose
+            px, py = proj.point(vf.pos[vf.focus])
+            proj.pan(scene_rect[0] + scene_rect[2] / 2.0 - px,
+                     scene_rect[1] + scene_rect[3] / 2.0 - py)
         draw_scene(
             screen,
             scene_rect,
-            self._proj(scene_rect),
+            proj,
             self.scene,
             vf,
             trails={k: list(v) for k, v in self._trails.items()},
             omega_max=self.omega_max,
             label=f"SCENE · {self._proj_kind.upper()}",
             font=self._small,
+            show_glyphs=self.show_glyphs,
         )
 
         fx = wpx - _FPV_W - 8
@@ -637,9 +724,9 @@ class Viewer:
             k = max(1, (_FPV_W - 16) // img.shape[1])
             self._blit_image(upscale(img, k), fx, y, _FPV_W - 16)
 
-        self._draw_keys(fx, y + 10, hpx - _HUD_H - 10)
+        self._draw_keybar()
 
-        hud_rect = (0, hpx - _HUD_H, wpx, _HUD_H)
+        hud_rect = (0, hpx - _HUD_H - _KEYBAR_H, wpx, _HUD_H)
         armed = None
         if vf.info and "armed" in vf.info:
             armed = bool(np.asarray(vf.info["armed"]).reshape(-1)[vf.focus])
@@ -651,6 +738,8 @@ class Viewer:
             omega_max=self.omega_max,
             histories={k: list(v) for k, v in self._hists.items()},
             armed=armed,
+            ranges=self._gauges,
+            episodes=self._ep_lens or None,
             font=self._font,
             small=self._small,
         )

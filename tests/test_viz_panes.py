@@ -101,12 +101,45 @@ class TestBuilders:
         draw_scene(surface, (0, 0, 200, 160), proj, scene, _frame())
         assert palette.BRIGHT in _colors(surface), "user primitive did not draw"
 
-    def test_scene_pane_lod_fleet_marks(self):
+    def test_show_glyphs_promotes_unfocused_marks(self):
+        # default: unfocused watched worlds draw fleet marks at ANY zoom (here the ppm
+        # is large); show_glyphs=True (the viewer's X key) draws them as full glyphs
+        scene = Scene(Grid(half=(2, 2)))
+        proj = Projection.fit("iso", *scene.aabb(), (0, 0, 400, 300))
+        painted = []
+        for show in (False, True):
+            surface = pygame.Surface((400, 300))
+            draw_scene(surface, (0, 0, 400, 300), proj, scene, _frame(),
+                       omega_max=2500.0, show_glyphs=show)
+            arr = pygame.surfarray.array3d(surface).reshape(-1, 3)
+            painted.append(int((arr != palette.BG).any(axis=1).sum()))
+        assert painted[1] > painted[0], "X should add pixels: marks became full glyphs"
+
+    def test_focused_glyph_never_collapses(self):
+        # tiny ppm: unfocused worlds are marks, the focused world keeps the full
+        # glyph — its accent heading line is the fingerprint (marks draw body color)
         surface = pygame.Surface((100, 80))
-        scene = Scene(Grid(half=(60, 60)))  # huge scene → tiny ppm → LOD marks
+        scene = Scene(Grid(half=(60, 60)))
         proj = Projection.fit("iso", *scene.aabb(), (0, 0, 100, 80))
-        draw_scene(surface, (0, 0, 100, 80), proj, scene, _frame())
-        assert proj.ppm * 0.35 < 12.0  # confirms the LOD branch actually ran
+        assert proj.ppm * 0.35 < 12.0
+        draw_scene(surface, (0, 0, 100, 80), proj, scene, _frame(), omega_max=2500.0)
+        arr = pygame.surfarray.array3d(surface).reshape(-1, 3)
+        assert (arr == palette.ACCENT).all(axis=1).any(), "focused glyph lost its accent"
+
+    def test_fleet_mark_flag_breaks_roll_symmetry(self):
+        # pre-flag, the mark was a dot + body-x tick: a roll about body x moved nothing
+        renders = []
+        for half_roll in (0.0, np.pi / 6):
+            vf = _frame()
+            vf.plant[1, 6] = np.cos(half_roll)
+            vf.plant[1, 7] = np.sin(half_roll)  # roll about body x, world 1 (unfocused)
+            surface = pygame.Surface((400, 300))
+            scene = Scene(Grid(half=(4, 4)))
+            proj = Projection.fit("iso", *scene.aabb(), (0, 0, 400, 300))
+            assert proj.ppm * 0.35 < 12.0  # the mark branch, not the full glyph
+            draw_scene(surface, (0, 0, 400, 300), proj, scene, vf)
+            renders.append(pygame.surfarray.array3d(surface))
+        assert (renders[0] != renders[1]).any(), "the up-flag should move with roll"
 
     def test_hud_compass_turns_with_yaw(self):
         # pure yaw changes no other instrument, so any pixel delta comes from the compass
@@ -119,6 +152,54 @@ class TestBuilders:
             draw_hud(surface, (0, 0, 900, 150), f, omega_max=2500.0)
             renders.append(pygame.surfarray.array3d(surface))
         assert (renders[0] != renders[1]).any()
+
+    def test_hud_dials_and_armed_lamp(self):
+        pygame.font.init()
+        font = pygame.font.Font(None, 14)
+
+        def render(speed: float, armed):
+            f = _frame()
+            f.plant[:, 3] = speed
+            surface = pygame.Surface((900, 150))
+            draw_hud(surface, (0, 0, 900, 150), f, control="sticks", omega_max=2500.0,
+                     armed=armed, font=font, small=font)
+            return pygame.surfarray.array3d(surface)
+
+        slow, fast, off = render(1.0, True), render(3.0, True), render(1.0, False)
+        assert (slow != fast).any(), "the speed dial should move"
+        assert (slow != off).any(), "the arm lamp should change with the state"
+        assert palette.GOOD in {tuple(c) for c in slow.reshape(-1, 3)}, "lamp not GOOD"
+
+    def test_hud_climb_dial_is_signed(self):
+        renders = []
+        for vz in (-2.0, 0.0, 2.0):
+            f = _frame()
+            f.plant[:, 5] = vz  # vertical velocity only; the other instruments hold
+            surface = pygame.Surface((900, 150))
+            draw_hud(surface, (0, 0, 900, 150), f, omega_max=2500.0)
+            renders.append(pygame.surfarray.array3d(surface))
+        assert (renders[0] != renders[2]).any(), "climb and sink must draw differently"
+        assert (renders[0] != renders[1]).any() and (renders[1] != renders[2]).any()
+
+    def test_hud_episode_bars(self):
+        base, bars = [], None
+        for episodes in (None, [10.0, 20.0, 40.0, 80.0]):
+            surface = pygame.Surface((900, 150))
+            draw_hud(surface, (0, 0, 900, 150), _frame(), episodes=episodes)
+            base.append(pygame.surfarray.array3d(surface))
+        bars = base[1]
+        assert (base[0] != bars).any(), "the episode panel should draw"
+
+    def test_hud_gauge_ranges_grow_only(self):
+        ranges: dict[str, float] = {}
+        seen = []
+        for speed in (1.0, 9.0, 2.0):
+            f = _frame()
+            f.plant[:, 3] = speed
+            surface = pygame.Surface((900, 150))
+            draw_hud(surface, (0, 0, 900, 150), f, ranges=ranges)
+            seen.append(ranges["SPD m/s"])
+        assert seen == [2.0, 10.0, 10.0]  # grows on 9, never shrinks back
 
     def test_hud_draws_both_control_modes(self):
         pygame.font.init()
@@ -180,6 +261,41 @@ class TestViewer:
             obs, state, reward, done, info = step(state, action)
             viewer.frame(state, obs=obs, action=action, reward=reward, done=done, info=info)
         assert viewer.wait_closed(10.0) and shot.exists()
+
+    def test_viewer_tracks_episode_lengths(self):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            def vf_at(step: int, done: bool = False) -> ViewFrame:
+                f = _frame()
+                f.step = step
+                f.done = np.array([done, False])
+                return f
+
+            # done closes one episode at step 12; a step DROP (4 -> 2) reveals a
+            # missed done between drawn frames and closes one at 4
+            for f in (vf_at(5), vf_at(9), vf_at(12, done=True), vf_at(4), vf_at(2)):
+                viewer._track(f)
+            assert viewer._ep_lens == [12.0, 4.0]
+        finally:
+            viewer.close()
+
+    def test_follow_centers_the_focused_world(self):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid(half=(8, 8))), headless=True, threaded=False)
+        try:
+            viewer.follow = True
+            f = _frame()
+            f.plant[0, 0:3] = (6.0, -5.0, 2.0)
+            viewer.push(f, force=True)
+            rx, ry, rw, rh = viewer._scene_rect
+            px, py = viewer._proj(viewer._scene_rect).point(f.plant[0, 0:3])
+            assert abs(px - (rx + rw / 2)) < 1e-6
+            assert abs(py - (ry + rh / 2)) < 1e-6
+        finally:
+            viewer.close()
 
     def test_render_thread_owns_drawing(self, tmp_path):
         """A threaded viewer draws, screenshots, and closes with NO further pushes:

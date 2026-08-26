@@ -525,7 +525,8 @@ Boundary: viz SHOWS what the vehicle did and sensed — it never decides it. Nor
 Four layers, strict about what each may know:
 
 1. **Vehicle truth — always drawn.** Pose, attitude, rotor speeds, trails, glyphs, the
-   fixed HUD instruments (sticks/action, motors, attitude, heading, speed/altitude). All from
+   fixed HUD instruments (sticks/action + arm lamp, motors, attitude, heading, speed and
+   climb dials, episode-length bars). All from
    `plant` and the step outputs. No task knowledge.
 2. **World geometry — always data.** Scene primitives. Tasks and users contribute them;
    the pane only draws. Extension is public: `register_primitive(cls, draw_fn)` — the

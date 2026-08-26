@@ -116,6 +116,28 @@ class TestProjection:
             proj = Projection(kind, 10.0, (0, 0))
             assert proj.point((0, 0, 2))[1] < proj.point((0, 0, 0))[1]
 
+    def test_pan_shifts_pixels(self):
+        proj = Projection("top", 10.0, (50, 50))
+        before = proj.point((1, 2, 0))
+        proj.pan(7, -3)
+        after = proj.point((1, 2, 0))
+        assert after == (before[0] + 7, before[1] - 3)
+
+    def test_zoom_at_keeps_anchor_fixed(self):
+        proj = Projection("iso", 10.0, (50, 50))
+        ax, ay = proj.point((1.0, -2.0, 0.5))
+        proj.zoom_at(ax, ay, 1.5)
+        bx, by = proj.point((1.0, -2.0, 0.5))
+        assert bx == pytest.approx(ax) and by == pytest.approx(ay)
+        assert proj.ppm == pytest.approx(15.0)
+
+    def test_zoom_at_clamps_scale(self):
+        proj = Projection("top", 10.0, (0, 0))
+        proj.zoom_at(0, 0, 1e9)
+        assert proj.scale <= 5000.0
+        proj.zoom_at(0, 0, 1e-9)
+        assert proj.scale >= 0.05
+
     def test_fit_keeps_aabb_inside_rect(self):
         lo, hi = np.array([-5.0, -2.0, 0.0]), np.array([5.0, 2.0, 3.0])
         rect = (10, 20, 400, 300)

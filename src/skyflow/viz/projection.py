@@ -4,7 +4,9 @@ World → screen projection for the scene pane (DESIGN.md §13).
 A fixed linear projection, fitted ONCE from the scene's AABB — no orbit camera to fight
 during teleop, and every session over the same scene produces comparable footage. Three
 kinds: "iso" (the default 30° isometric, z drawn up), "top" (plan view, +x right, +y up)
-and "profile" (side view, +x right, +z up). Pure numpy.
+and "profile" (side view, +x right, +z up). The viewer may `pan`/`zoom_at` the fitted
+view (mouse drag / wheel); the projection DIRECTION stays fixed — still no orbit. Pure
+numpy.
 """
 
 import math
@@ -52,6 +54,18 @@ class Projection:
         """One world point → (x, y) pixels."""
         q = self.points(np.asarray(p, np.float64).reshape(1, 3))[0]
         return float(q[0]), float(q[1])
+
+    def pan(self, dx: float, dy: float) -> None:
+        """Shift the view by (dx, dy) pixels — mouse drag."""
+        self.offset = (self.offset[0] + float(dx), self.offset[1] + float(dy))
+
+    def zoom_at(self, px: float, py: float, factor: float) -> None:
+        """Scale the view by `factor`, keeping the world point under pixel (px, py)
+        fixed. The scale clamps to [0.05, 5000] px/m."""
+        new = float(np.clip(self.scale * float(factor), 0.05, 5000.0))
+        f = new / self.scale
+        self.scale = new
+        self.offset = (px + (self.offset[0] - px) * f, py + (self.offset[1] - py) * f)
 
     @classmethod
     def fit(
