@@ -15,8 +15,9 @@ video need frame-exact draws in the caller's thread.
 Keys (always listed in a bar along the window's bottom edge): Space pause · ←/→
 step/scrub (replay) · [ ] speed · Tab focus world · V iso/top/profile (a switch lands on
 a fresh fit) · C follow the focused world · X full glyphs for all watched worlds ·
-G fleet scatter · left-drag orbit · right-drag pan · wheel zoom · P screenshot · R reset
-request (only hosts that consume take_reset) · Esc quit.
+G fleet scatter · left-drag orbit (the scene's near side follows the cursor) ·
+right-drag pan · wheel zoom · P print a screenshot · R reset request (only hosts that
+consume take_reset) · Esc quit.
 """
 
 import os
@@ -562,7 +563,9 @@ class Viewer:
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button in (1, 2, 3):
                 self._drag = None
             elif ev.type == pygame.MOUSEMOTION and self._drag == "orbit":
-                self._proj(self._scene_rect).orbit(ev.rel[0] * 0.4, ev.rel[1] * 0.4)
+                # -dx: the scene's NEAR side follows the cursor (the three.js turntable
+                # feel); +dx would make the far side follow and the near side fight you
+                self._proj(self._scene_rect).orbit(-ev.rel[0] * 0.4, ev.rel[1] * 0.4)
             elif ev.type == pygame.MOUSEMOTION and self._drag == "pan":
                 self._proj(self._scene_rect).pan(*ev.rel)
             elif ev.type == pygame.MOUSEWHEEL:
@@ -614,10 +617,9 @@ class Viewer:
         ("C", "follow"),
         ("X", "glyphs"),
         ("G", "fleet"),
-        ("drag", "orbit"),
-        ("Rdrag", "pan"),
+        ("drag", "orbit/pan"),
         ("wheel", "zoom"),
-        ("P", "shot"),
+        ("P", "print"),
         ("R", "reset"),
         ("←→", "scrub"),
         ("[ ]", "speed"),

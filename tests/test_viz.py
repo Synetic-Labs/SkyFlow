@@ -132,6 +132,16 @@ class TestProjection:
         np.testing.assert_allclose(after, before, atol=1e-9)
         assert proj.orbited
 
+    def test_orbit_near_side_follows_a_rightward_drag(self):
+        # the viewer sends orbit(-dx, ...) for a rightward drag: the ground point on
+        # the camera's NEAR side must move right with the cursor (turntable feel)
+        proj = Projection("iso", 10.0, (0, 0))
+        az = np.radians(proj.azim)
+        near = np.array([[np.cos(az), np.sin(az), 0.0]])
+        u0 = proj.points(near)[0][0]
+        proj.orbit(-4.0, 0.0)  # what a rightward drag sends
+        assert proj.points(near)[0][0] > u0
+
     def test_orbit_clamps_elevation(self):
         proj = Projection("profile", 10.0, (0, 0))
         proj.orbit(0.0, 500.0)
