@@ -1,0 +1,39 @@
+# CI (TECH_DEBT Q-5): ruff + pyright + the CPU test suite on every push/PR.
+#
+# gpu-marked tests are excluded — no hosted CUDA runner. Run them locally:
+#   XLA_PYTHON_CLIENT_PREALLOCATE=false uv run pytest -m gpu
+#
+# The firmware extra installs the cudaflight wheel (public release URL,
+# manylinux_2_39 — ubuntu-24.04 glibc satisfies it), so the CPU SITL sticks
+# tests RUN here instead of self-skipping: the sticks axis stays tested (R4).
+
+name: ci
+
+on:
+  push:
+    branches: [master, viz]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Sync environment (viz + firmware extras)
+        run: uv sync --extra viz --extra firmware
+
+      - name: ruff
+        run: uv run ruff check .
+
+      - name: pyright
+        # not a project dep: injected for the check only, against the synced venv
+        run: uv run --with pyright pyright
+
+      - name: pytest (CPU; gpu-marked tests excluded)
+        env:
+          SDL_VIDEODRIVER: dummy
+        run: uv run pytest -q -m "not gpu"
