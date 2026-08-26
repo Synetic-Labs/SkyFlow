@@ -54,14 +54,18 @@ def _assemble_inputs(omega_cmd, wind_vel, f_ext, tau_ext):
 
 
 @cache
-def _substep_fleet(motor_model: str):
-    """vmap of one backend RK4 step + reference post-step over the fleet axis."""
+def _substep_fleet(motor_model: str, per_world_w_max: bool = False):
+    """vmap of one backend RK4 step + reference post-step over the fleet axis.
+
+    ``per_world_w_max`` maps the rotor-speed ceiling over the fleet axis too ([F,4]
+    rows — the battery-sag trait); the default keeps the scalar-constant path
+    bit-identical for every existing caller."""
     step = sfd.rk4_step_fn(N_ROTORS, motor_model)
 
     def one(s, u, p, dt, w_min, w_max):
         return sfd.post_step(step(s, u, p, dt), w_min, w_max)
 
-    return jax.vmap(one, in_axes=(0, 0, 0, None, None, None))
+    return jax.vmap(one, in_axes=(0, 0, 0, None, None, 0 if per_world_w_max else None))
 
 
 def substep(
@@ -86,7 +90,8 @@ def substep(
     omega_cmd [F,4] rad/s; wind_vel [F,3] world; f_ext [F,3] N world; tau_ext [F,3] N·m body.
     """
     u = _assemble_inputs(omega_cmd, wind_vel, f_ext, tau_ext)
-    return _substep_fleet(motor_model)(plant, u, params, dt, w_min, w_max)
+    per_world = jnp.ndim(w_max) > 0  # [F,4] battery-sag rows vs the scalar constant
+    return _substep_fleet(motor_model, per_world)(plant, u, params, dt, w_min, w_max)
 
 
 @cache
@@ -118,18 +123,41 @@ def _imu_fleet(motor_model: str):
     return jax.vmap(one, in_axes=(0, 0, 0))
 
 
-def imu(plant, omega_cmd, wind_vel, params, *, motor_model: str = "first_order"):
-    """
-    Exact generated IMU at the body origin, identity mount → (accel [F,3], gyro [F,3]).
+@cache
+def _imu_fleet_mounted(motor_model: str):
+    """Per-world IMU pose: offset [F,3] m and mount rotation [F,9] row-major ride the
+    fleet axis (the DomainRand mount trait). The generated imu_fn already carries the
+    lever-arm and rotation terms — this vmap only unpins the constants."""
+    f = sfd.imu_fn(N_ROTORS, motor_model)
+    return jax.vmap(f, in_axes=(0, 0, 0, 0, 0))
 
-    accel is specific force in body FLU, m/s² — (0, 0, +g) at exact hover; gyro is body
-    rate, rad/s. External pokes are not fed to the IMU (frozen §5 signature: F_ext, τ_ext
+
+def imu(
+    plant, omega_cmd, wind_vel, params, *,
+    motor_model: str = "first_order", offset=None, mount=None,
+):
+    """
+    Exact generated IMU → (accel [F,3], gyro [F,3]).
+
+    Default: body origin, identity mount (bit-exact legacy path). `offset` [F,3] m and
+    `mount` [F,9] row-major unpin the IMU pose per world (the DomainRand mount trait);
+    the generated imu_fn prices the lever arm and the mount rotation itself. accel is
+    specific force in body FLU, m/s² — (0, 0, +g) at exact hover; gyro is body rate,
+    rad/s. External pokes are not fed to the IMU (frozen §5 signature: F_ext, τ_ext
     zero). Noise, bias, and scale corruption stay in sensors.py per the spec's sensor
     boundary.
     """
     zeros = jnp.zeros_like(wind_vel)
     u = _assemble_inputs(omega_cmd, wind_vel, zeros, zeros)
-    out = _imu_fleet(motor_model)(plant, u, params)
+    if offset is None and mount is None:
+        out = _imu_fleet(motor_model)(plant, u, params)
+        return out[:, :3], out[:, 3:]
+    n = plant.shape[0]
+    if offset is None:
+        offset = jnp.zeros((n, 3), plant.dtype)
+    if mount is None:
+        mount = jnp.broadcast_to(jnp.eye(3, dtype=plant.dtype).reshape(9), (n, 9))
+    out = _imu_fleet_mounted(motor_model)(plant, u, params, offset, mount)
     return out[:, :3], out[:, 3:]
 
 

@@ -22,10 +22,23 @@ PlantState = Array
 
 
 class ObsTerm(NamedTuple):
-    """One named block of the flat observation vector."""
+    """One named block of the flat observation vector.
+
+    ``units`` declares what the numbers ARE — units and frame in one short canonical
+    string ("m world z-up", "m/s body FLU", "[-1,1]"). It defaults to "" so every
+    existing 2-field call site and consumer stays valid, but tasks SHOULD declare it:
+    downstream training contracts hash the string to catch silent re-scales and frame
+    changes at an unchanged width, so once declared, treat it as part of the layout —
+    a units change is a layout change.
+    """
 
     name: str
     dim: int
+    units: str = ""
+    # True for an image block (a rendered mask): env-side corruption that assumes
+    # metric numbers (dr.obs_noise) must skip it. An explicit flag, not a units
+    # string convention — a task that forgets units still gets the right behavior.
+    image: bool = False
 
 
 class ObsSpec(tuple[ObsTerm, ...]):
@@ -46,6 +59,24 @@ class ObsSpec(tuple[ObsTerm, ...]):
             out[t.name] = slice(offset, offset + t.dim)
             offset += t.dim
         return out
+
+
+class DRState(NamedTuple):
+    """
+    Per-world trait draws of the DomainRand block (DESIGN.md §7): quantities drawn once
+    per episode and constant within it, redrawn for done worlds at the auto-reset
+    respawn. New per-episode traits are added here, never as new SimState leaves.
+    """
+
+    wind_mean: Array  # [F,3] f32 steady wind velocity, world frame (z component is 0)
+    imu_bias: Array  # [F,6] f32 additive IMU bias: accel(3) m/s², gyro(3) rad/s
+    w_max: Array  # [F] f32 per-world rotor-speed ceiling, rad/s (battery-sag trait)
+    est_bias: Array  # [F,12] f32 estimator-error bias trait: pos(3) m, vel(3) m/s,
+    # att rotation-vector(3) rad, rate(3) rad/s (errors.py channel groups)
+    gyro_scale: Array  # [F,3] f32 per-axis gyro scale-factor multiplier (1.0 = exact)
+    imu_offset: Array  # [F,3] f32 IMU position offset from the body origin, m
+    imu_mount: Array  # [F,9] f32 IMU mount rotation, row-major (identity = exact)
+    cog_offset: Array  # [F,3] f32 CoG shift, m — applied as -offset on every rotor position
 
 
 class TaskEval(NamedTuple):
@@ -98,7 +129,13 @@ class Task(Protocol):
         key: Array,
         fresh_spawn: bool,
     ) -> tuple[Array, Any]:
-        """Obs rows [n, obs_spec.dim] f32 and the (possibly advanced) task_state."""
+        """Obs rows [n, obs_spec.dim] f32 and the (possibly advanced) task_state.
+
+        `plant` is the ESTIMATOR's state (corrupted under dr.obs_error). Tasks with
+        `image_shape` set additionally receive the keyword `true_plant` (the real
+        pose) and must render their image from it — a camera images from where the
+        vehicle really is. State-only tasks never see the keyword.
+        """
         ...
 
     def evaluate(self, prev_plant: Array, plant: Array, task_state: Any) -> TaskEval:
@@ -122,7 +159,15 @@ class FirmwareFleet(Protocol):
     act_dim: int
 
     def fresh_firmware_state(self) -> tuple[Any, Any]:
-        """New (blob, fwstate) for the whole fleet, disarmed."""
+        """New (blob, fwstate) for the whole fleet, from the ARMED-ON-GROUND snapshot.
+
+        Arming lifecycle (THE normative statement — implementations and docs defer
+        here): instances arm during construction (settle → arm → snapshot), so
+        `armed` is truthy from the first tick after any fresh state or `reset`.
+        A mid-episode disarm (failsafe, runaway-takeoff) persists until the next
+        reset restores the snapshot; Betaflight re-arms only on LOW throttle, so
+        an open-loop feeder that never lowers throttle cannot re-arm a world.
+        """
         ...
 
     def fw_step(
@@ -140,6 +185,21 @@ class FirmwareFleet(Protocol):
         ...
 
 
+class FirmwareCarry(NamedTuple):
+    """
+    Sticks-mode `SimState.task_carry` wrapper: the task's own pytree plus the
+    value-threaded firmware pair of `FirmwareFleet`. The env wraps/unwraps it around
+    every task call, so tasks never see it; motors mode stores the task pytree bare.
+    (SimState has no firmware slot, so the pair rides in the one opaque slot the env
+    owns end to end.) Read task fields through ``env.task_state(state)`` — it unwraps
+    this carry in sticks mode and is the identity in motors mode.
+    """
+
+    task: Any
+    blob: Any
+    fwstate: Any
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class SimState:
@@ -151,12 +211,25 @@ class SimState:
     plant: Array  # [F,17] spec layout: x(3) v(3) q_wxyz(4) ω(3) Ω(4) rad/s
     params: Array  # [F,P] per-world randomized flat spec params (pack_params order)
     key: Array  # jax PRNG key (env-owned; split every step)
-    wind_vel: Array  # [F,3] OU wind velocity state, world frame (statedot's v_wind)
+    wind_vel: Array  # [F,3] OU gust velocity state, world frame, zero-mean deviation
+    dr_state: "DRState"  # per-episode trait draws (steady wind, IMU bias)
     act_buf: Array  # [F,D+1,4] transport-delay ring, newest first
     delay_idx: Array  # [F] int32 per-world delay draw
+    cmd_prev: Array  # [F,4] the last APPLIED (post-delay/drop) command — what the
+    # link holds when a packet drops (dr.cmd_drop_prob)
     last_action: Array  # [F,4]
+    # -- estimator-error process state (errors.py; inert zeros when obs_error off) ----
+    est_ou: Array  # [F,12] f32 OU drift state, errors.py channel groups
+    est_hold: Array  # [F] int32 dropout hold steps remaining (0 = tracking)
+    est_held: Array  # [F,17] f32 the estimate emitted during a dropout hold
+    # -- poke-duration event state (inert zeros at dr.poke_dur_steps = 1) -------------
+    poke_left: Array  # [F] int32 poke steps remaining after this one (0 = idle)
+    poke_fext: Array  # [F,3] f32 the held world-frame poke force, N
+    poke_text: Array  # [F,3] f32 the held body-frame poke torque, N·m
     steps: Array  # [F] int32
     airborne: Array  # [F] bool
+    armed: Array  # [F] bool — sticks: the firmware's arm flag after the last substep
+    # (a failsafe/runaway disarm shows here and in metrics armed_frac); motors: all True
     ep_return: Array  # [F]
     ep_len: Array  # [F] int32
     # -- §7 step 10 episode-bookkeeping EMAs (0-d f32, fleet-global by design): updated
@@ -166,7 +239,27 @@ class SimState:
     trunc_frac: Array  # 0-d f32 — EMA fraction ending by pure truncation (no termination)
     ep_return_ema: Array  # 0-d f32 — EMA of completed-episode return
     ep_len_ema: Array  # 0-d f32 — EMA of completed-episode length, control steps
-    task_state: Any  # opaque task pytree
+    # opaque task pytree (motors) or FirmwareCarry (sticks) — read task fields
+    # through env.task_state(state), never off this field directly
+    task_carry: Any
+
+    @property
+    def task_state(self) -> Any:
+        """The task's own pytree — motors mode only.
+
+        In sticks mode `task_carry` holds the firmware carry, and a raw read of a
+        task field off it compiles fine but binds to the wrong pytree — the shipped
+        vanishing-gates bug. This property therefore RAISES on a carry instead of
+        returning it: read through ``env.task_state(state)`` (unwraps in both
+        modes), or take the carry itself from ``state.task_carry``.
+        """
+        if isinstance(self.task_carry, FirmwareCarry):
+            raise TypeError(
+                "SimState.task_state is the firmware carry in sticks mode — read "
+                "the task pytree through env.task_state(state), or the raw carry "
+                "through state.task_carry"
+            )
+        return self.task_carry
 
     def replace(self, **updates: Any) -> Self:
         """New SimState with the given leaves swapped (dataclasses.replace)."""

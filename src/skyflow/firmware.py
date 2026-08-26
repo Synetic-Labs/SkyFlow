@@ -16,7 +16,9 @@ call. `CpuFirmwareFleet` (libcpuflight.so, ctypes) is complete and self-containe
 fleet size, no CUDA, jits via ordered `io_callback`, but is NOT vmappable or replayable
 because the real firmware state mutates host-side and the threaded pair is a zero-length
 placeholder. `GpuFirmwareFleet` (libcudaflight.so, in-jit XLA FFI, genuinely donated
-buffers) requires cudaflight >= 0.3.3, which ships its `cudaflight.xla` FFI half. Any
+buffers) needs the `cudaflight.xla` FFI half (added in 0.3.3 — but the PACKAGED floor
+is the pyproject `firmware` extra, cudaflight >= 0.6.0; per-feature version notes below
+are history, not install targets). Any
 external fleet that satisfies the protocol can be injected via
 `SkyFlowEnv(cfg, firmware_fleet=...)`.
 
@@ -30,6 +32,8 @@ mode, which never touches this module) works without the wheel installed.
 
 import ctypes
 import os
+import warnings
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +41,12 @@ import numpy as np
 from jax.experimental import io_callback
 from jax.typing import ArrayLike
 
-__all__ = ["CpuFirmwareFleet", "GpuFirmwareFleet", "baro_pa", "flu_to_frd"]
+__all__ = ["GPU_FLEET_MIN", "CpuFirmwareFleet", "GpuFirmwareFleet", "baro_pa", "flu_to_frd"]
+
+#: The GPU backend's minimum fleet: the runtime relocation table cannot be
+#: discovered below 3 instances. THE definition — env's auto-selection and the
+#: constructor guard both read it (smaller fleets belong to CpuFirmwareFleet).
+GPU_FLEET_MIN = 3
 
 _INSTALL_GUIDANCE = (
     'control="sticks" needs the cudaflight wheel (Betaflight SITL fleets). Install the '
@@ -50,6 +59,11 @@ _INSTALL_GUIDANCE = (
 _SEA_LEVEL_PA = 101325.0
 _BARO_SCALE_M = 8434.0
 
+# libcpuflight keeps ONE global SITL fleet per process ("render before create or
+# after destroy"); a second live fleet corrupts the first. The reference is weak
+# so the guard never keeps a dropped fleet alive past its __del__.
+_LIVE_CPU_FLEET: "weakref.ref[CpuFirmwareFleet] | None" = None
+
 
 def flu_to_frd(v: ArrayLike) -> jax.Array:
     """
@@ -58,10 +72,13 @@ def flu_to_frd(v: ArrayLike) -> jax.Array:
     Harness-side sensor PACKAGING for the firmware boundary, not spec physics — the frames
     share the x axis and negate the other two, so the map is elementwise, dtype-preserving,
     and its own inverse. Used to hand body-FLU gyro/specific-force rows from the generated
-    IMU to Betaflight as FRD (DESIGN.md §10 authorizes exactly this flip here).
+    IMU to Betaflight as FRD. THE implementation is vision._ned.flip_xyz — this wrapper
+    only names the boundary (DESIGN.md §10 authorizes the flip at exactly two homes:
+    vision internals and here).
     """
-    v = jnp.asarray(v)
-    return v * jnp.array([1.0, -1.0, -1.0], dtype=v.dtype)
+    from skyflow.vision._ned import flip_xyz
+
+    return flip_xyz(jnp.asarray(v))
 
 
 def baro_pa(alt_m: ArrayLike) -> jax.Array:
@@ -117,6 +134,15 @@ class CpuFirmwareFleet:
         except ImportError as e:
             raise ImportError(_INSTALL_GUIDANCE) from e
 
+        global _LIVE_CPU_FLEET
+        live = _LIVE_CPU_FLEET() if _LIVE_CPU_FLEET is not None else None
+        if live is not None and live._h:
+            raise RuntimeError(
+                "a live CpuFirmwareFleet already exists in this process — libcpuflight "
+                "keeps one global SITL fleet, and a second create corrupts the first. "
+                "close() the existing fleet (or its SkyFlowEnv) before constructing "
+                "another."
+            )
         self.fleet = int(fleet)
         self._lib = load_cpu(lib)
         eeprom_arg = str(eeprom).encode() if eeprom else None
@@ -124,11 +150,26 @@ class CpuFirmwareFleet:
         if not self._h:
             raise RuntimeError(f"cpuflight_create failed: {self._lib.cpuflight_error().decode()}")
         self.act_dim = int(self._lib.cpuflight_act_dim(self._h))
+        _LIVE_CPU_FLEET = weakref.ref(self)
+
+    def _require_open(self) -> None:
+        """Raise on a closed fleet. Called at the public entry points (clean eager /
+        trace-time errors) AND inside the host halves below, so it also fires on
+        re-runs of programs compiled before close() — where a raw call would hand
+        ctypes a destroyed handle and segfault. A host-half raise poisons jax's
+        ordered-callback token for the process; that path is already fatal misuse,
+        and an error beats a segfault."""
+        if not self._h:
+            raise RuntimeError(
+                "CpuFirmwareFleet is closed — its SITL instances are destroyed; "
+                "construct a new fleet"
+            )
 
     # -- host sides of the ordered io_callbacks --------------------------------------
 
     def _host_step(self, sticks: np.ndarray, sensors: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """One 1 kHz tick for the whole fleet through ctypes → (motors [F,4], armed [F])."""
+        self._require_open()
         sticks = np.ascontiguousarray(sticks, np.float32)
         sensors = np.ascontiguousarray(sensors, np.float32)
         motors = np.empty((self.fleet, 4), np.float32)
@@ -149,6 +190,7 @@ class CpuFirmwareFleet:
 
     def _host_reset(self, mask: np.ndarray) -> np.ndarray:
         """Restore the flagged instances (uint8 [F]) to the armed snapshot."""
+        self._require_open()
         mask = np.ascontiguousarray(mask, np.uint8)
         rc = self._lib.cpuflight_reset_mask(
             self._h, mask.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
@@ -161,6 +203,7 @@ class CpuFirmwareFleet:
 
     def _host_reset_all(self) -> np.ndarray:
         """Restore ALL instances to the armed snapshot."""
+        self._require_open()
         self._lib.cpuflight_reset_all(self._h)
         return np.zeros((0,), np.uint8)
 
@@ -168,6 +211,7 @@ class CpuFirmwareFleet:
 
     def fresh_firmware_state(self) -> tuple[jax.Array, jax.Array]:
         """Restore ALL instances to the armed snapshot; placeholder (blob, fwstate)."""
+        self._require_open()
         blob = io_callback(
             self._host_reset_all, jax.ShapeDtypeStruct((0,), jnp.uint8), ordered=True
         )
@@ -177,6 +221,7 @@ class CpuFirmwareFleet:
         self, blob: jax.Array, fwstate: jax.Array, sticks: jax.Array, sensors: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """One 1 kHz firmware tick → (blob, fwstate, motors [F,4] in [0,1], armed u8 [F])."""
+        self._require_open()
         motors, armed = io_callback(
             self._host_step,
             (
@@ -193,6 +238,7 @@ class CpuFirmwareFleet:
         self, blob: jax.Array, fwstate: jax.Array, mask: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         """Restore the worlds selected by mask (u8 [F]) to the armed snapshot."""
+        self._require_open()
         blob = io_callback(
             self._host_reset, jax.ShapeDtypeStruct((0,), jnp.uint8), mask, ordered=True
         )
@@ -256,19 +302,34 @@ class GpuFirmwareFleet:
         cubin: str | os.PathLike[str] | None = None,
         lib: str | os.PathLike[str] | None = None,
     ) -> None:
-        if int(fleet) < 3:
+        if int(fleet) < GPU_FLEET_MIN:
             raise ValueError(
-                f"GpuFirmwareFleet needs fleet >= 3 (the runtime relocation table "
-                f"cannot be discovered below 3 instances), got {fleet}; use "
-                f"CpuFirmwareFleet for smaller fleets"
+                f"GpuFirmwareFleet needs fleet >= {GPU_FLEET_MIN} (the runtime "
+                f"relocation table cannot be discovered below that), got {fleet}; "
+                f"use CpuFirmwareFleet for smaller fleets"
+            )
+        # The instance arrays share the device with XLA's arena. With default
+        # preallocation XLA grabs ~90% of VRAM first and cudaflight_create OOMs —
+        # historically that OOM was swallowed into a silent CPU fallback. Warn
+        # BEFORE creating so the failure names its cause.
+        prealloc = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "").lower()
+        if prealloc not in ("false", "0") and "XLA_PYTHON_CLIENT_MEM_FRACTION" not in os.environ:
+            warnings.warn(
+                "XLA_PYTHON_CLIENT_PREALLOCATE is not 'false' and no MEM_FRACTION is "
+                "set: XLA's arena will claim most of the VRAM before the firmware "
+                "instance arrays allocate. Export XLA_PYTHON_CLIENT_PREALLOCATE=false "
+                "before jax touches the GPU.",
+                RuntimeWarning,
+                stacklevel=2,
             )
         try:
             from cudaflight import xla as _cfx
             from cudaflight.lib import default_fatbin_path, load
         except ImportError as e:
             raise ImportError(
-                _INSTALL_GUIDANCE + " GpuFirmwareFleet additionally needs cudaflight "
-                ">= 0.3.3 (the first wheel that ships the cudaflight.xla FFI half)."
+                _INSTALL_GUIDANCE + " GpuFirmwareFleet additionally needs the "
+                "cudaflight.xla FFI half (any wheel at the pyproject floor, "
+                "cudaflight >= 0.6.0, ships it)."
             ) from e
 
         self.fleet = int(fleet)
@@ -316,22 +377,36 @@ class GpuFirmwareFleet:
         else:
             self._reset_pure = _cfx.reset_pure_call(self._lib, self._h)
 
+    def _require_open(self) -> None:
+        """Raise on a closed fleet. This fires at trace time and on eager calls; a
+        program COMPILED before close() bypasses Python entirely and would launch
+        the FFI kernels on the destroyed handle — never re-run one after close()."""
+        if not self._h:
+            raise RuntimeError(
+                "GpuFirmwareFleet is closed — its device instances are destroyed; "
+                "construct a new fleet (and never re-run programs compiled before "
+                "close())"
+            )
+
     # -- types.FirmwareFleet ----------------------------------------------------------
 
     def fresh_firmware_state(self) -> tuple[jax.Array, jax.Array]:
         """A fresh (blob, fwstate) pair copied from the armed snapshot."""
+        self._require_open()
         return jnp.copy(self._snap_blob), jnp.copy(self._snap_state)
 
     def fw_step(
         self, blob: jax.Array, fwstate: jax.Array, sticks: jax.Array, sensors: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """One 1 kHz firmware tick → (blob, fwstate, motors [F,4] in [0,1], armed u8 [F])."""
+        self._require_open()
         return self._fw_pure(blob, fwstate, sticks, sensors)
 
     def reset(
         self, blob: jax.Array, fwstate: jax.Array, mask: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         """Restore the worlds selected by mask (u8 [F]) to the armed snapshot."""
+        self._require_open()
         return self._reset_pure(blob, fwstate, mask)
 
     def close(self) -> None:

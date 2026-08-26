@@ -1,10 +1,11 @@
 """
 World → screen projection for the scene pane (DESIGN.md §13).
 
-A fixed linear projection, fitted ONCE from the scene's AABB — no orbit camera to fight
-during teleop, and every session over the same scene produces comparable footage. Three
-kinds: "iso" (the default 30° isometric, z drawn up), "top" (plan view, +x right, +y up)
-and "profile" (side view, +x right, +z up). Pure numpy.
+An orthographic camera around the z-up world: azimuth/elevation angles build the 2x3
+basis, fitted ONCE from the scene's AABB so every session over the same scene starts
+from the same framing. Three presets ("iso", "top", "profile" — the V key) plus full
+user control through `orbit`, `pan` and `zoom_at` — the viewer maps the standard
+mouse scheme onto them (left-drag orbit, right-drag pan, wheel zoom). Pure numpy.
 """
 
 import math
@@ -15,27 +16,41 @@ __all__ = ["KINDS", "Projection"]
 
 KINDS = ("iso", "top", "profile")
 
-_C30, _S30, _ZS = math.cos(math.radians(30.0)), math.sin(math.radians(30.0)), 0.95
-
-#: 2x3 world→screen bases. Screen y grows DOWN, so world "up" carries a negative row-1
-#: coefficient (iso: altitude lifts the point; top: +y is away from the viewer).
-_BASES: dict[str, np.ndarray] = {
-    "iso": np.array([[_C30, -_C30, 0.0], [_S30, _S30, -_ZS]]),
-    "top": np.array([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]),
-    "profile": np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0]]),
+#: Preset camera angles per kind: (azimuth°, elevation°). Elevation 90 looks straight
+#: down (plan view); 0 sits on the horizon (side view).
+_PRESETS: dict[str, tuple[float, float]] = {
+    "iso": (-135.0, 30.0),
+    "top": (-90.0, 90.0),
+    "profile": (-90.0, 0.0),
 }
+
+
+def _camera_basis(azim: float, elev: float) -> np.ndarray:
+    """2x3 world→screen rows for an orthographic camera at (azimuth°, elevation°)
+    looking at the scene, z-up world, screen y growing DOWN."""
+    az, el = math.radians(azim), math.radians(elev)
+    sa, ca, se, ce = math.sin(az), math.cos(az), math.sin(el), math.cos(el)
+    return np.array([[-sa, ca, 0.0], [se * ca, se * sa, -ce]])
 
 
 class Projection:
     """Affine world→pixel map: `points([N,3]) -> [N,2]`. Build with `fit`."""
 
     def __init__(self, kind: str, scale: float, offset: tuple[float, float]) -> None:
-        if kind not in _BASES:
+        if kind not in _PRESETS:
             raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
         self.kind = kind
         self.scale = float(scale)
         self.offset = (float(offset[0]), float(offset[1]))
-        self._basis = _BASES[kind]
+        self.azim, self.elev = _PRESETS[kind]
+        self._home = (self.azim, self.elev)
+        self._basis = _camera_basis(self.azim, self.elev)
+        self._pivot = np.zeros(3)  # orbit centre; fit() sets the AABB centre
+
+    @property
+    def orbited(self) -> bool:
+        """True once the camera left its preset angles (label hint for the viewer)."""
+        return (self.azim, self.elev) != self._home
 
     #: Pixels per world metre (approximate for iso, exact for top/profile) — the glyph
     #: level-of-detail decision reads this.
@@ -53,6 +68,31 @@ class Projection:
         q = self.points(np.asarray(p, np.float64).reshape(1, 3))[0]
         return float(q[0]), float(q[1])
 
+    def pan(self, dx: float, dy: float) -> None:
+        """Shift the view by (dx, dy) pixels — right/middle mouse drag."""
+        self.offset = (self.offset[0] + float(dx), self.offset[1] + float(dy))
+
+    def orbit(self, dazim: float, delev: float, pivot: np.ndarray | tuple | None = None) -> None:
+        """Rotate the camera by (dazim°, delev°) about `pivot` (default: the fit
+        centre) — left mouse drag. The pivot's pixel stays put; elevation clamps to
+        [-89°, 89°] so the basis never degenerates."""
+        pv = np.asarray(self._pivot if pivot is None else pivot, np.float64)
+        anchor = self.points(pv)[0]
+        self.azim = (self.azim + float(dazim) + 180.0) % 360.0 - 180.0
+        self.elev = float(np.clip(self.elev + float(delev), -89.0, 89.0))
+        self._basis = _camera_basis(self.azim, self.elev)
+        moved = self.points(pv)[0]
+        self.offset = (self.offset[0] + float(anchor[0] - moved[0]),
+                       self.offset[1] + float(anchor[1] - moved[1]))
+
+    def zoom_at(self, px: float, py: float, factor: float) -> None:
+        """Scale the view by `factor`, keeping the world point under pixel (px, py)
+        fixed. The scale clamps to [0.05, 5000] px/m."""
+        new = float(np.clip(self.scale * float(factor), 0.05, 5000.0))
+        f = new / self.scale
+        self.scale = new
+        self.offset = (px + (self.offset[0] - px) * f, py + (self.offset[1] - py) * f)
+
     @classmethod
     def fit(
         cls,
@@ -66,7 +106,7 @@ class Projection:
         Projection fitted so the world AABB (lo, hi) fills `rect` = (x, y, w, h) pixels,
         centred, with `margin` of the rect kept clear on every side.
         """
-        basis = _BASES[kind]
+        basis = _camera_basis(*_PRESETS[kind])
         lo = np.asarray(lo, np.float64)
         hi = np.asarray(hi, np.float64)
         corners = np.array(
@@ -85,4 +125,6 @@ class Projection:
             x + (w - (umin + umax) * scale) / 2.0,
             y + (h - (vmin + vmax) * scale) / 2.0,
         )
-        return cls(kind, scale, offset)
+        proj = cls(kind, scale, offset)
+        proj._pivot = (lo + hi) / 2.0
+        return proj

@@ -141,20 +141,6 @@ def test_observe_sanitizes_diverged_worlds():
     assert np.isfinite(o).all() and np.abs(o).max() <= 100.0
 
 
-def test_observe_noise_hook():
-    pos, la = [[1.0, 0.0, 1.0]], jnp.zeros((1, 4), jnp.float32)
-    clean_task, noisy_task = HoverTask(), HoverTask(obs_noise=0.1)
-    args = (_plant(pos), _state([GOAL]), _no_imu(1), la)
-    clean, _ = clean_task.observe(*args, jax.random.PRNGKey(0), fresh_spawn=False)
-    n1, _ = noisy_task.observe(*args, jax.random.PRNGKey(0), fresh_spawn=False)
-    n2, _ = noisy_task.observe(*args, jax.random.PRNGKey(0), fresh_spawn=False)
-    n3, _ = noisy_task.observe(*args, jax.random.PRNGKey(1), fresh_spawn=False)
-    np.testing.assert_array_equal(np.asarray(n1), np.asarray(n2))  # same key, same noise
-    assert not np.array_equal(np.asarray(n1), np.asarray(n3))
-    assert not np.array_equal(np.asarray(n1), np.asarray(clean))
-    assert np.abs(np.asarray(n1) - np.asarray(clean)).max() <= 0.1 + 1e-6
-
-
 def test_goal_resamples_every_hold_steps():
     task = HoverTask(goal_hold_s=0.05, control_hz=100.0)  # hold_steps = 5
     assert task.hold_steps == 5

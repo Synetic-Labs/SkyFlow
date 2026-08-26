@@ -95,16 +95,19 @@ def bench_env(cfg: SimConfig, n_steps: int, budget_s: float):
     """Full env.step. Blocks on the whole (obs, state, reward, done, info) tuple so no
     part of the pipeline is dead-code-eliminated out of the measurement."""
     env = SkyFlowEnv(cfg)
-    step = jax.jit(env.step)
-    obs, state = env.reset(jax.random.PRNGKey(0))
-    action = jnp.zeros((env.fleet, env.act_dim), jnp.float32)
-    jax.block_until_ready((obs, state))
+    try:
+        step = jax.jit(env.step)
+        obs, state = env.reset(jax.random.PRNGKey(0))
+        action = jnp.zeros((env.fleet, env.act_dim), jnp.float32)
+        jax.block_until_ready((obs, state))
 
-    def advance(state):
-        out = jax.block_until_ready(step(state, action))
-        return out[1]
+        def advance(state):
+            out = jax.block_until_ready(step(state, action))
+            return out[1]
 
-    return timed_run(advance, state, n_steps, budget_s)
+        return timed_run(advance, state, n_steps, budget_s)
+    finally:
+        env.close()  # frees the one-per-process CPU SITL slot for the next size
 
 
 def bench_dynamics(cfg: SimConfig, n_steps: int, budget_s: float, substeps: int):
@@ -113,6 +116,7 @@ def bench_dynamics(cfg: SimConfig, n_steps: int, budget_s: float, substeps: int)
     caller divides the metrics back down."""
     env = SkyFlowEnv(cfg)  # reused only to spawn plant rows and per-world param packs
     _, state = env.reset(jax.random.PRNGKey(0))
+    env.close()  # nothing below touches the env; free the fleet slot immediately
     af = AIRFRAMES[cfg.airframe]
     w_min, w_max = af.rotor_speed_min, af.rotor_speed_max
     omega_cmd = jnp.full((env.fleet, 4), 0.5 * (w_min + w_max), jnp.float32)

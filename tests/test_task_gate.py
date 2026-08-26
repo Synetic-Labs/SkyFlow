@@ -283,3 +283,45 @@ def test_metrics_are_fleet_shaped():
     assert set(m) == {"gate/active_idx", "gate/passes"}
     for v in m.values():
         assert v.shape == (4,) and v.dtype == jnp.float32
+
+
+# -- TECH_DEBT T3/T15 regressions ----------------------------------------------------
+
+
+def test_reassigning_gates_rederives_reward_geometry():
+    """Reward geometry and collision geometry must come from ONE course: swapping
+    `gates` used to leave the cached reward constants on the OLD course."""
+    task = GateCourseTask()
+    new_course = GateSet.build([[7.0, 3.0, 2.0]], [0.0])
+    task.gates = new_course
+    assert task.num_gates == 1
+
+    # a straight fly-through of the NEW gate registers on both geometries
+    c, n, _lat, _vert = _axes(new_course, 0)
+    before = c - 0.6 * n
+    after = c + 0.6 * n
+    ev = task.evaluate(_plant(before[None]), _plant(after[None]), _fresh_state(1))
+    assert bool(ev.success[0])  # single-gate course: a clean pass ends it
+    assert float(ev.info["gate_centering"][0]) > 0.99  # centered through the NEW gate
+
+
+def test_crossing_offsets_matches_the_pass_predicate():
+    """crossing_offsets shares classify_crossings' solve: where a clean pass fires,
+    the shared solve reports a forward crossing with in-opening offsets."""
+    from skyflow.vision.gates import classify_crossings, crossing_offsets
+
+    gates = _single_gate()
+    c, n, lat, _vert = _axes(gates, 0)
+    prev = np.stack([c - 0.5 * n, c - 0.5 * n + 0.2 * lat])
+    pos = np.stack([c + 0.5 * n, c + 0.5 * n + 0.2 * lat])
+    fwd, _bwd, _hit = classify_crossings(jnp.asarray(prev), jnp.asarray(pos), gates)
+    crossed, forward, lat_off, vert_off = crossing_offsets(
+        jnp.asarray(prev), jnp.asarray(pos), gates
+    )
+    fwd, crossed, forward = np.asarray(fwd), np.asarray(crossed), np.asarray(forward)
+    lat_off, vert_off = np.asarray(lat_off), np.asarray(vert_off)
+    inner = np.asarray(gates.inner_half)
+    assert fwd.all()  # both segments are clean passes
+    assert (crossed & forward).all()
+    assert (lat_off[:, 0] < inner[0, 0]).all() and (vert_off[:, 0] < inner[0, 1]).all()
+    np.testing.assert_allclose(lat_off[1, 0], 0.2, atol=1e-5)  # the offset is metric

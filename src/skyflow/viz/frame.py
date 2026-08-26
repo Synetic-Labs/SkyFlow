@@ -87,6 +87,7 @@ def snapshot(
     task_state: Any = None,
     focus: int = 0,
     fleet_positions: bool = False,
+    fleet_stride: int = 1,
 ) -> ViewFrame:
     """
     One ViewFrame from a SimState (+ optional step outputs), single host transfer.
@@ -94,9 +95,13 @@ def snapshot(
     `watch` indexes the fleet axis; `focus` indexes the watch list. `channels` are named
     [F] scalars to trace; `reward` is shorthand for `channels={"reward": ...}`.
     `task_state` overrides `state.task_state` — pass `env.task_state(state)` so binds see
-    the task's own pytree in sticks mode too. Task-state leaves keep their non-fleet
-    shape when they don't lead with [F]. `fleet_positions` adds the whole-fleet [F,3]
-    scatter — the only fleet-sized pull the viewer ever makes.
+    the task's own pytree in sticks mode too. On a sticks-mode SimState the fallback
+    read RAISES (SimState.task_state refuses to hand out the firmware carry), so a
+    snapshot without the accessor fails loudly instead of hiding every bound
+    primitive. Task-state leaves keep their non-fleet shape when they don't lead
+    with [F]. `fleet_positions` adds the fleet [F/stride,3] scatter — the only
+    fleet-sized pull the viewer ever makes; `fleet_stride` thins it ON DEVICE, so a
+    100k-world fleet never crosses the host bus whole (TECH_DEBT V5).
     """
     import jax  # deferred: keeps this module importable for pure-numpy consumers
 
@@ -133,7 +138,7 @@ def snapshot(
         task_rows,
         info_rows,
         state.steps[idx[focus]],
-        state.plant[:, 0:3] if fleet_positions else None,
+        state.plant[:: max(1, int(fleet_stride)), 0:3] if fleet_positions else None,
     )
     plant, action_w, chans_w, done_w, obs_w, ts, info_w, steps, positions = jax.device_get(
         bundle

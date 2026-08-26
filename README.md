@@ -2,6 +2,8 @@
 
 An accurate and fast quadrotor simulator in JAX. Advanced physics, massive parallel training.
 
+![SkyFlow viewer](skyflow_viewer.png)
+
 The dynamics is generated from the [SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics).
 That maintains the symbolic spec, and SkyFlow is the harness.
 
@@ -22,37 +24,30 @@ obs, state, reward, done, info = step(state, action)
 
 ### Environment
 
-The env owns the world and everything that happens to the vehicle: RK4 physics, 
-per-world parameter randomization, Ornstein-Uhlenbeck wind, random pokes, 
+- The env is the world: RK4 physics, per-world parameter randomization, Ornstein-Uhlenbeck wind, random pokes, 
 command transport delay, ground contact, crash detection, and in-jit auto-reset. 
-A task owns the objective; spawn distribution, observation, reward, 
-task-specific terminals.
+- A task is the objective; spawn distribution, observation, reward, task-specific terminals.
 
 ### Airframe
 
 The built-in airframe is the spec's Crazyflie reference row;
 `register_airframe` adds vehicles from spec parameter rows.
 
-### Vision inside jit
+### Vision
 
 `figure_eight` in vision mode renders analytic ray-cast coverage masks of the gate
-frames directly from pose — no rasterizer, no host round-trip, batched over the fleet
+frames directly from pose without rasterizer or host round-trips, and batched over the fleet
 inside jit.
 
-### firmware in the loop
+### Firmware
 
-A stick-level policy can fly through Betaflight, `control="sticks"` closes
+A stick-level policy can fly through Betaflight, `control="sticks"` which closes
 the loop through the real firmware (the `cudaflight` SITL, `firmware` extra)
 
 ### Viewer
 
-The `viz` extra (pygame only) adds a live viewer — wireframe scene, drone glyphs, an
-honest FPV pane pair, instruments — plus gamepad/keyboard/UDP teleop and flight-log
-replay. The scene is data: five primitives (`Grid`, `Path`, `Gate`, `Box`, `Marker`)
-that any task or user composes, so it draws whatever you are training. Logs store poses,
-never pixels — the camera is a pure analytic function of pose, so a recorded flight
-re-renders at any resolution later, and watching a GPU training run costs one small
-host pull per chunk.
+The `viz` extra adds a live viewer. The camera is an analytic function of pose,
+ and watching a GPU training run costs one host pull per chunk.
 
 ```bash
 uv run python examples/fly_hover.py --seconds 30 --view
@@ -95,8 +90,8 @@ Single-vehicle fleets on an NVIDIA RTX 4090:
 | 16384 | 487 M | 22.5 M |
 | 65536 | 1.08 B | 35.5 M |
 
-Physics steps are bare RK4 substeps of the plant at 1 kHz. 
-Env steps are 100 Hz control with observation, reward, termination, and in-jit reset.
+Physics steps are RK4 substeps of the plant at 1 kHz. 
+Env steps are 100 Hz control with observation, reward, termination, and reset.
 
 ## Tasks
 
@@ -109,10 +104,7 @@ register_task("my_task", MyTask)
 env = SkyFlowEnv(SimConfig(num_envs=1024, task="my_task", task_kwargs={...}))
 ```
 
-
-## Credits
-
-SkyFlow stands on work that came before it:
+## Inspiration
 
 - **[crazyflow](https://github.com/utiasDSL/crazyflow)** — the JAX-first, fleet-batched
   quadrotor-RL environment design. The sensor-synthesis seam and the general shape of a
@@ -121,9 +113,5 @@ SkyFlow stands on work that came before it:
   with Model-Based Reinforcement Learning"* (Diermayr et al., 2025,
   [arXiv:2510.14783](https://arxiv.org/abs/2510.14783)) — the gate-course reward shape
   ports its pass/centering machinery.
-- Physics and coefficient provenance is tracked per term in the SkyFlow-Dynamics
-  registry, source by source.
+- Physics and coefficient provenance is tracked per term in the SkyFlow-Dynamics registry.
 
-## License
-
-MIT — see [LICENSE](LICENSE).

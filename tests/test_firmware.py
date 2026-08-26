@@ -268,7 +268,7 @@ def test_env_firmware_auto_picks_gpu_fleet(gpu_fleet):
         obs, state = env.reset(jax.random.PRNGKey(0))
         step = jax.jit(env.step)
         aetr = jnp.tile(jnp.array([0.0, 0.0, -1.0, 0.0], jnp.float32), (GPU_FLEET, 1))
-        obs, state, reward, done, _info = step(state, aetr)
+        obs, state, reward, _done, _info = step(state, aetr)
         assert bool(jnp.isfinite(obs).all()) and reward.shape == (GPU_FLEET,)
     finally:
-        env._fw.close()
+        env.close()

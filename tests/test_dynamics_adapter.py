@@ -14,8 +14,8 @@ import pytest
 from skyflow_dynamics.backends import jax as sfd
 
 from skyflow import dynamics, sensors
-from skyflow.params import NEVER_JITTER, sample_params
-from skyflow.types import SimState
+from skyflow.params import AIRFRAMES, NEVER_JITTER, sample_params
+from skyflow.types import DRState, SimState
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -196,11 +196,31 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         params=nominal_params,
         key=key,
         wind_vel=jnp.zeros((f, 3), jnp.float32),
+        dr_state=DRState(
+            wind_mean=jnp.zeros((f, 3), jnp.float32),
+            imu_bias=jnp.zeros((f, 6), jnp.float32),
+            w_max=jnp.full((f,), AIRFRAMES["crazyflie"].rotor_speed_max, jnp.float32),
+            est_bias=jnp.zeros((f, 12), jnp.float32),
+            gyro_scale=jnp.ones((f, 3), jnp.float32),
+            imu_offset=jnp.zeros((f, 3), jnp.float32),
+            imu_mount=jnp.broadcast_to(
+                jnp.eye(3, dtype=jnp.float32).reshape(9), (f, 9)
+            ),
+            cog_offset=jnp.zeros((f, 3), jnp.float32),
+        ),
         act_buf=jnp.zeros((f, 3, 4), jnp.float32),
         delay_idx=jnp.zeros(f, jnp.int32),
+        cmd_prev=jnp.zeros((f, 4), jnp.float32),
         last_action=jnp.zeros((f, 4), jnp.float32),
+        est_ou=jnp.zeros((f, 12), jnp.float32),
+        est_hold=jnp.zeros(f, jnp.int32),
+        est_held=jnp.zeros((f, dynamics.STATE_DIM), jnp.float32),
+        poke_left=jnp.zeros(f, jnp.int32),
+        poke_fext=jnp.zeros((f, 3), jnp.float32),
+        poke_text=jnp.zeros((f, 3), jnp.float32),
         steps=jnp.zeros(f, jnp.int32),
         airborne=jnp.zeros(f, bool),
+        armed=jnp.ones(f, bool),
         ep_return=jnp.zeros(f, jnp.float32),
         ep_len=jnp.zeros(f, jnp.int32),
         crash_frac=jnp.zeros((), jnp.float32),
@@ -208,7 +228,7 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         trunc_frac=jnp.zeros((), jnp.float32),
         ep_return_ema=jnp.zeros((), jnp.float32),
         ep_len_ema=jnp.zeros((), jnp.float32),
-        task_state={"goal": jnp.zeros((f, 3), jnp.float32)},
+        task_carry={"goal": jnp.zeros((f, 3), jnp.float32)},
     )
 
     def body(s, _):
@@ -218,4 +238,4 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
     assert isinstance(out, SimState)
     assert np.all(np.asarray(out.steps) == 4)
     assert stacked.shape == (4, f)
-    assert out.task_state["goal"].shape == (f, 3)
+    assert out.task_state["goal"].shape == (f, 3)  # property passthrough (motors)

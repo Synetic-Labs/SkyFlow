@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from skyflow import SimConfig, SkyFlowEnv
+from skyflow import DomainRand, SimConfig, SkyFlowEnv
 from skyflow.params import AIRFRAMES
 
 # Position PD (world frame): error [m] → desired acceleration [m/s²].
@@ -96,13 +96,13 @@ def main() -> None:
         # Goal held longer than the flight so the setpoint never moves mid-demo. (The
         # env also accepts a pre-built instance: SkyFlowEnv(cfg, task=HoverTask(...)).)
         task_kwargs={"goal_hold_s": 60.0},
-        physics_dr_scale=0.0,  # nominal vehicle: this demo shows the sim, not DR
+        dr=DomainRand().off(),  # nominal vehicle: this demo shows the sim, not DR
     )
     env = SkyFlowEnv(cfg)
     u_hover, g = hover_throttle(AIRFRAMES["crazyflie"])
 
     obs, state = env.reset(jax.random.PRNGKey(args.seed))
-    goal = np.asarray(state.task_state.goal)
+    goal = np.asarray(env.task_state(state).goal)
     print(f"fleet of {args.fleet}: pad → goal, {args.seconds:.1f} s at {cfg.control_hz:.0f} Hz")
     print(f"  goal[0] = {goal[0].round(2)}, initial error {np.linalg.norm(np.asarray(obs)[:, 0:3], axis=-1).mean():.2f} m")
 

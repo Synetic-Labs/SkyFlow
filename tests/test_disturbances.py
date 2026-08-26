@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.env import DomainRand, SimConfig, SkyFlowEnv
 from skyflow.params import AIRFRAMES, Airframe, register_airframe
 from skyflow.tasks.hover import HoverTask
 
@@ -38,11 +38,15 @@ if "crazyflie_cd" not in AIRFRAMES:
     )
 
 
-def make_env(fleet: int, **cfg_kwargs) -> SkyFlowEnv:
-    cfg_kwargs.setdefault("physics_dr_scale", 0.0)
+def dr0(**dr_kwargs) -> DomainRand:
+    """DomainRand with body jitter off (thresholds stay exact) plus the given knobs."""
+    return DomainRand(body_scale=0.0, **dr_kwargs)
+
+
+def make_env(fleet: int, dr: DomainRand | None = None, **cfg_kwargs) -> SkyFlowEnv:
     cfg_kwargs.setdefault("stuck_steps", 10**6)
     cfg_kwargs.setdefault("max_episode_steps", 10**6)
-    cfg = SimConfig(num_envs=fleet, **cfg_kwargs)
+    cfg = SimConfig(num_envs=fleet, dr=dr if dr is not None else dr0(), **cfg_kwargs)
     return SkyFlowEnv(cfg, task=HoverTask(safe_xy_m=100.0, safe_z_m=100.0, goal_hold_s=1e6))
 
 
@@ -60,11 +64,11 @@ def _scan_rollout(env, state, action, n_steps: int, collect):
 
 
 def test_ou_wind_stationary_std_matches_config(key):
-    """Exact OU discretization ⇒ stationary per-axis std equals wind_std_mps. 256 worlds
+    """Exact OU discretization ⇒ stationary per-axis std equals wind_gust_mps. 256 worlds
     x 250 post-burn-in steps x 3 axes at decay ≈ 0.967 give ≈3.2k effective samples: the
     0.12 tolerances sit beyond 4 std errors of both the mean and std estimators."""
     fleet, std, tau = 256, 1.5, 0.3
-    env = make_env(fleet, wind_std_mps=std, wind_tau_s=tau, physics_hz=500.0)
+    env = make_env(fleet, dr0(wind_gust_mps=std, wind_tau_s=tau), physics_hz=500.0)
     _, state = env.reset(key)
     idle = -jnp.ones((fleet, 4), jnp.float32)
     _, (winds, dones) = _scan_rollout(env, state, idle, 400, lambda s, i: s.wind_vel)
@@ -77,7 +81,7 @@ def test_ou_wind_stationary_std_matches_config(key):
 
 def test_wind_stays_exactly_zero_when_disabled(key):
     fleet = 16
-    env = make_env(fleet, wind_std_mps=0.0)
+    env = make_env(fleet)
     _, state = env.reset(key)
     idle = -jnp.ones((fleet, 4), jnp.float32)
     _, (winds, _) = _scan_rollout(env, state, idle, 30, lambda s, i: s.wind_vel)
@@ -93,14 +97,14 @@ def test_poke_rate_matches_poke_prob(key):
     while info["poke_active"] still reports the Bernoulli gate. n = 256·200 draws ⇒
     se ≈ 0.0016; tolerance 0.015 is ≈9 standard errors."""
     fleet, prob = 256, 0.15
-    env = make_env(fleet, poke_prob=prob, poke_force_n=0.0)
+    env = make_env(fleet, dr0(poke_prob=prob, poke_force_n=0.0))
     _, state = env.reset(key)
     idle = -jnp.ones((fleet, 4), jnp.float32)
     _, (pokes, _) = _scan_rollout(env, state, idle, 200, lambda s, i: i["poke_active"])
     rate = float(np.asarray(pokes, np.float64).mean())
     assert abs(rate - prob) < 0.015
 
-    env0 = make_env(fleet=16, poke_prob=0.0)
+    env0 = make_env(fleet=16)
     _, state0 = env0.reset(key)
     _, (pokes0, _) = _scan_rollout(
         env0, state0, -jnp.ones((16, 4), jnp.float32), 20, lambda s, i: i["poke_active"]
@@ -115,7 +119,7 @@ def test_pokes_shove_through_exogenous_inputs(key):
 
     def run(poke_force, poke_torque):
         env = make_env(
-            fleet, poke_prob=1.0, poke_force_n=poke_force, poke_torque_nm=poke_torque
+            fleet, dr0(poke_prob=1.0, poke_force_n=poke_force, poke_torque_nm=poke_torque)
         )
         _, state = env.reset(key)
         state = state.replace(plant=state.plant.at[:, 2].set(2.0))  # airborne, clamp inert
@@ -140,7 +144,7 @@ def test_wind_enters_aerodynamics_on_a_draggy_vehicle(key):
     fleet = 8
 
     def run(wind_std):
-        env = make_env(fleet, airframe="crazyflie_cd", wind_std_mps=wind_std)
+        env = make_env(fleet, dr0(wind_gust_mps=wind_std), airframe="crazyflie_cd")
         _, state = env.reset(key)
         state = state.replace(plant=state.plant.at[:, 2].set(2.0))
         a = jnp.zeros((fleet, 4), jnp.float32)

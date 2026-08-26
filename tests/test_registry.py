@@ -8,7 +8,7 @@ explicit task_kwargs, and never pushed on builders that don't (GateCourseTask).
 import pytest
 
 from skyflow import build_task, register_task, tasks
-from skyflow.env import SimConfig, SkyFlowEnv
+from skyflow.env import DomainRand, SimConfig, SkyFlowEnv
 from skyflow.tasks.gate_course import GateCourseTask
 from skyflow.tasks.hover import HoverTask
 
@@ -48,7 +48,7 @@ def test_env_forwards_env_owned_kwargs_to_naming_builders():
             task_kwargs={"goal_hold_s": 1.0},
             control_hz=50.0,
             physics_hz=1000.0,
-            spawn_dr_scale=0.25,
+            dr=DomainRand(spawn_scale=0.25),
         )
     )
     task = env.task
@@ -71,5 +71,5 @@ def test_explicit_task_kwargs_beat_forwarding():
 
 
 def test_builders_not_naming_the_kwargs_build_untouched():
-    env = SkyFlowEnv(SimConfig(num_envs=2, task="figure_eight", spawn_dr_scale=3.0))
+    env = SkyFlowEnv(SimConfig(num_envs=2, task="figure_eight", dr=DomainRand(spawn_scale=3.0)))
     assert isinstance(env.task, GateCourseTask)

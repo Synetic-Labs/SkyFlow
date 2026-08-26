@@ -16,16 +16,19 @@ Step pipeline (order is normative, DESIGN.md §7):
 
  1. split the key; push the action into the delay ring, read the delayed action per world
  2. command map (motors mode: u = (a+1)/2 → verified throttle curve → Ω_c)
- 3. OU wind velocity advance (exact discretization: decay exp(-dt/τ) + matched kick)
+ 3. OU gust advance (exact discretization: decay exp(-dt/τ) + matched kick); the wind
+    every consumer sees is the per-episode steady mean (DomainRand trait) + the gust
  4. poke sampling (world-frame F_ext, body τ_ext through the backend's exogenous inputs —
     velocity state is never written directly)
  5. `decimation` x [generated substep + ground contact §8], all inputs zero-order-held
-    (sticks mode re-derives Ω_c from the firmware every 1 kHz substep, §10)
+    (sticks mode re-derives Ω_c from the firmware every 1 kHz substep, feeding it
+    DomainRand-corrupted sensor rows, §10)
  6. airborne latch; env crash set; task `evaluate` on the transition
  7. terminated / truncated / done
- 8. IMU measurement + task `observe`
- 9. in-jit auto-reset of done worlds via `tree_where` blending; the pre-reset observation
-    goes to info["final_obs"], the pre-reset flags to info["terminated"/"truncated"]
+ 8. IMU measurement (DomainRand bias + noise) + task `observe` + DomainRand obs noise
+ 9. in-jit auto-reset of done worlds via `tree_where` blending (fresh params, traits,
+    delay draw); the pre-reset observation goes to info["final_obs"], the pre-reset
+    flags to info["terminated"/"truncated"]
 10. episode bookkeeping EMAs for `metrics`: the SimState EMA leaves (outcome fractions,
     completed-episode return/length) update from the pre-reset done rows, decayed
     `_METRICS_EMA_DECAY` per completed episode; no-op when nothing finished
@@ -33,19 +36,38 @@ Step pipeline (order is normative, DESIGN.md §7):
 
 import inspect
 import math
+import re
+import tempfile
 import warnings
+import weakref
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any, NamedTuple, cast
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
 
-from skyflow import dynamics, sensors
-from skyflow.params import AIRFRAMES, sample_params
-from skyflow.types import Array, FirmwareFleet, SimState, StepInfo, Task
+from skyflow import dynamics, errors, sensors
+from skyflow.params import (
+    AIRFRAMES,
+    apply_cog_offset,
+    apply_tw_guard,
+    factor_floor,
+    max_bracket,
+    sample_params,
+)
+from skyflow.types import (
+    Array,
+    DRState,
+    FirmwareCarry,
+    FirmwareFleet,
+    SimState,
+    StepInfo,
+    Task,
+)
 
-__all__ = ["SimConfig", "SkyFlowEnv", "tree_where"]
+__all__ = ["DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
 
 #: Near-ground band, metres: below it a descending/tilted airborne vehicle is a ground
 #: crash; above it the airborne latch sets (DESIGN.md §7 step 6 uses 0.05 for both).
@@ -60,12 +82,179 @@ _METRICS_EMA_DECAY = 0.99
 
 
 @dataclass(frozen=True)
+class DomainRand:
+    """
+    All training-robustness randomization in one object (DESIGN.md §7). One instance is
+    one robustness setting: a curriculum or an outer controller produces DomainRand
+    values, the env consumes them. Every magnitude is in physical units. Randomness
+    enters only at loop boundaries — the params row, exogenous forces, the delay ring,
+    the sensor rows, the observation vector; the ODE and the firmware stay exact.
+
+    Draw classes: traits (once per episode, constant within it — body params, steady
+    wind, IMU bias, transport delay), processes (every sample — gusts, sensor noise,
+    obs noise) and events (pokes). Spawn spread is task variety, not model error.
+
+    `scale` multiplies every continuous magnitude; it never touches time constants
+    (`wind_tau_s`), event rates (`poke_prob`), integer delays (`delay_steps`) or the
+    spawn spread (`spawn_scale`). scale=0 with delay_steps=(0,0) is bit-exact nominal —
+    `off()` returns that setting. Defaults reproduce a plain SimConfig(): body DR on,
+    everything else off.
+    """
+
+    scale: float = 1.0  # master dial over every continuous magnitude
+
+    # -- body: the vehicle (trait, §6 sample_params) --------------------------------
+    body_scale: float = 1.0  # multiplies the bracket half-widths and factor limits
+    brackets: dict | None = None  # per-key half-width overrides (§6); base table is
+    # DR_BRACKETS, or RESIDUAL_BRACKETS once `factors` is on
+    factors: dict | None = None  # correlated factor stage (§6): None = off (legacy
+    # independent draws, bit-exact); {} = on with FACTOR_LIMITS defaults;
+    # {group: (lo, hi)} overrides one group's limits. Measured 2026-08-22: at equal
+    # ±20% width on ct2+cq2 the factor structure flies 0.88, independent draws 0.12.
+    cog_offset_m: float = 0.0  # trait: CoG shift half-width per axis, m — applied as a
+    # COMMON-MODE translation of all rotor positions (battery placement, the most
+    # common real asymmetry). Never per-rotor jitter. Parallel-axis inertia change is
+    # second order at mm-cm scale and stays unmodeled (ERRORS.md). Prefer the
+    # arm-relative knob below for anything but a single known vehicle.
+    cog_offset_frac: float = 0.0  # trait: CoG shift half-width as a FRACTION of the
+    # nominal mean rotor arm — the same relative asymmetry on ANY airframe (5 mm is
+    # a big shift on a whoop's ~40 mm arm and nothing on a 5-inch's ~120 mm).
+    # Measured (whoop 10M ladder 2026-08-26): 0.125 of arm trains 0.86, 0.25 half-dead
+    # 0.44, 0.5 unflyable 0.01 — the cliff is trim authority, honest physics.
+    # Exclusive with cog_offset_m (setting both raises).
+
+    # -- world: wind and shocks ------------------------------------------------------
+    wind_mean_mps: float = 0.0  # trait: steady horizontal wind, magnitude ceiling, m/s
+    wind_gust_mps: float = 0.0  # process: OU gust stationary std per axis, m/s
+    wind_tau_s: float = 0.5  # OU gust correlation time, s (a clock — never scaled)
+    poke_prob: float = 0.0  # event rate per control step per world (never scaled).
+    # With poke_dur_steps > 1 this is the START rate while no poke is active.
+    poke_force_n: float = 0.0  # world-frame poke force magnitude ceiling, N (absolute —
+    # prefer poke_force_frac below: the same newtons are a different disturbance class
+    # on every airframe)
+    poke_torque_nm: float = 0.0  # body-frame poke torque magnitude ceiling, N·m
+    poke_force_frac: float = 0.0  # weight-relative ceiling: fraction of the NOMINAL
+    # airframe weight m·g. One value is the same physical shove on ANY quadrotor.
+    # Exclusive with poke_force_n (setting both raises).
+    poke_torque_frac: float = 0.0  # fraction of m·g·r_arm (nominal mean rotor radius);
+    # exclusive with poke_torque_nm
+    poke_dur_steps: float = 1.0  # mean poke duration, control steps (exponential draw,
+    # min 1). 1 = the legacy single-step impulse, bit-exact. Real contacts and prop-wash
+    # hits last 50-300 ms; a 10 ms impulse is mostly absorbed by the rotor spool.
+    # A clock — never scaled.
+
+    # -- actuation: command transport (trait) ----------------------------------------
+    delay_steps: tuple[int, int] = (0, 0)  # (min, max) control steps (never scaled)
+    # event: this step's arriving command is lost or LATE; the link holds the
+    # previous applied command and the next success applies the newest frame —
+    # the RX's actual behavior, so drops subsume link jitter with NO command
+    # reordering (never scaled — an event rate). Measured 2026-08-24: an i.i.d.
+    # per-step jitter index REORDERS commands, which no real link does, and the
+    # reordered stick stream through the firmware's RC feedforward kills takeoff
+    # (0.003 airborne vs 0.91 for drops at the same 10M probe).
+    cmd_drop_prob: float = 0.0
+    # trait: battery voltage sag — per-episode rotor-speed-ceiling factor
+    # 1 - U(0, battery_sag) on the airframe's rotor_speed_max (one-sided: a pack only
+    # sags). Measured on the Air75 II Racer battery_hover sysid: -9.6% RPM per motor
+    # command over 3.71->3.30 V; ~13% across a full pack. The firmware sees nothing —
+    # full stick simply buys less rotor speed, exactly like a tired pack.
+    battery_sag: float = 0.0
+    # start-charge skew: sag_start = battery_sag * U(0,1)**shape. shape > 1 weights
+    # episodes toward a FULL pack (sag near 0) with rare deep-sag starts — most real
+    # flights begin on a fresh charge. 1 = legacy uniform, bit-exact. Never scaled
+    # (a distribution shape).
+    battery_sag_shape: float = 1.0
+    # within-episode discharge: the per-world ceiling declines by this fraction of
+    # rotor_speed_max per FLIGHT SECOND, floored at rotor_speed_min. Measured Air75 II
+    # battery_hover: -9.6% over 282 s hover ≈ 3.4e-4 /s. The T/W guard prices the
+    # START ceiling only — a long flight may honestly sag below hover.
+    battery_sag_rate_ps: float = 0.0
+
+    # -- sensing: the IMU/baro rows the firmware and IMU-observing tasks consume ------
+    gyro_noise_rps: float = 0.0  # process: white per-sample std, rad/s
+    accel_noise_mps2: float = 0.0  # process: white per-sample std, m/s²
+    gyro_bias_rps: float = 0.0  # trait: constant per-axis bias half-width, rad/s
+    accel_bias_mps2: float = 0.0  # trait: constant per-axis bias half-width, m/s²
+    baro_noise_pa: float = 0.0  # process: white per-sample std on the baro row, Pa
+    gyro_sat_rps: float = 0.0  # gyro full-scale clip, rad/s (0 = off). The BMI270 at
+    # Betaflight's ±2000 dps range saturates at 34.9 rad/s; crash tumbles and yaw spins
+    # exceed it, so the real firmware sees a clipped, useless gyro there while an
+    # unclipped sim gyro can "see" recoveries no real vehicle can fly. A hardware
+    # constant — never scaled.
+    gyro_scale_frac: float = 0.0  # trait: per-axis gyro scale-factor error half-width
+    # (BMI270 sensitivity tolerance class ±1% -> 0.01). At a 500 dps commanded rate a
+    # 1% gain error is a 5 dps rate error the loop must absorb.
+    imu_offset_m: float = 0.0  # trait: IMU position offset from the body origin,
+    # per-axis half-width, m (real builds: mm class). The generated imu_fn prices the
+    # lever-arm terms; this trait unpins its constant.
+    imu_mount_deg: float = 0.0  # trait: IMU mounting misalignment, per-axis rotation-
+    # vector half-width, DEGREES (real builds: ~1 deg class)
+
+    # -- observation: the policy vector (applied by the env after task.observe) -------
+    obs_noise: float = 0.0  # process: additive uniform half-width. LEGACY stress
+    # knob: unit-blind white on the finalized vector (it corrupts task constants and
+    # breaks rotation orthonormality). Prefer obs_error below for realism arms.
+    # L5 estimator-error model (errors.py): the task observes a CORRUPTED plant
+    # state — per-group bias (trait) + OU drift + white, attitude as one small
+    # rotation, relative rotor-telemetry error, dropout holds. None = off
+    # (bit-exact); {"profile": "mocap"} etc.; fracs scale the profile widths and
+    # the master `scale` folds into them. p_drop is an event rate — never scaled.
+    obs_error: dict | None = None
+
+    # -- initial state: task variety, forwarded to builders as spawn_dr_scale ---------
+    spawn_scale: float = 1.0
+
+    def off(self) -> "DomainRand":
+        """This setting with all model error and corruption off: bit-exact nominal."""
+        return replace(
+            self, scale=0.0, delay_steps=(0, 0), cmd_drop_prob=0.0, obs_error=None,
+            gyro_sat_rps=0.0,
+        )
+
+    def effective(self) -> "DomainRand":
+        """This setting with `scale` folded into every continuous magnitude (scale=1)."""
+        s = self.scale
+        obs_error = self.obs_error
+        if obs_error is not None:
+            # Fold the master scale into the width fractions; the event knobs
+            # (p_drop, drop_mean_steps) pass through unscaled per the charter.
+            obs_error = dict(obs_error)
+            for key in ("bias_frac", "ou_frac", "white_frac"):
+                obs_error[key] = s * float(obs_error.get(key, 1.0))
+        return replace(
+            self,
+            scale=1.0,
+            obs_error=obs_error,
+            body_scale=s * self.body_scale,
+            wind_mean_mps=s * self.wind_mean_mps,
+            wind_gust_mps=s * self.wind_gust_mps,
+            poke_force_n=s * self.poke_force_n,
+            poke_torque_nm=s * self.poke_torque_nm,
+            gyro_noise_rps=s * self.gyro_noise_rps,
+            accel_noise_mps2=s * self.accel_noise_mps2,
+            gyro_bias_rps=s * self.gyro_bias_rps,
+            accel_bias_mps2=s * self.accel_bias_mps2,
+            baro_noise_pa=s * self.baro_noise_pa,
+            obs_noise=s * self.obs_noise,
+            battery_sag=s * self.battery_sag,
+            battery_sag_rate_ps=s * self.battery_sag_rate_ps,
+            poke_force_frac=s * self.poke_force_frac,
+            poke_torque_frac=s * self.poke_torque_frac,
+            gyro_scale_frac=s * self.gyro_scale_frac,
+            imu_offset_m=s * self.imu_offset_m,
+            imu_mount_deg=s * self.imu_mount_deg,
+            cog_offset_m=s * self.cog_offset_m,
+            cog_offset_frac=s * self.cog_offset_frac,
+        )
+
+
+@dataclass(frozen=True)
 class SimConfig:
     """
     Platform configuration (DESIGN.md §7). Frozen and plain — no omegaconf/hydra; build
     variants with `dataclasses.replace`. Physics advances at `physics_hz`; the policy
     acts at `control_hz`; `decimation = round(physics_hz / control_hz)` substeps run per
-    control step with all inputs zero-order-held.
+    control step with all inputs zero-order-held. All randomization lives in `dr`.
     """
 
     num_envs: int = 1024
@@ -74,19 +263,24 @@ class SimConfig:
     airframe: str = "crazyflie"
     control: str = "motors"  # "motors" | "sticks" (DESIGN.md §10)
     firmware: str = "auto"  # sticks backend: "auto" | "cpu" | "gpu" (DESIGN.md §10)
+    # sticks firmware config: path to a drone's Betaflight CLI `dump all` file. The env
+    # renders it into the boot eeprom at construction (cudaflight.render_eeprom — a
+    # version-gated strict round-trip, so a dump from another firmware release or a
+    # line that does not hold raises here, at construction). None boots the wheel's
+    # stock defaults. CLI text is the config source of truth; the rendered image is a
+    # derived artifact (examples/configs/README.md). `eeprom_overrides` is an optional
+    # file of sim-only CLI lines appended after the dump (e.g. blackbox_device = NONE).
+    # The dump header also SELECTS the firmware base: a dump built from another
+    # Betaflight base than the installed wheel picks the matching per-base binaries
+    # from the cudaflight bundle cache (fetch once: `python -m cudaflight.bases
+    # <rev>`; needs cudaflight >= 0.6.0) — no reinstall, one wheel flies every drone.
+    eeprom: str | None = None
+    eeprom_overrides: str | None = None
     control_hz: float = 100.0
     physics_hz: float = 1000.0  # sticks mode requires exactly 1000 (§10: 1 kHz fw tick)
     differentiable: bool = False  # raises NotImplementedError("planned") if True
-    # randomization / disturbance
-    physics_dr_scale: float = 1.0
-    wind_std_mps: float = 0.0  # OU wind stationary std per world axis, m/s
-    wind_tau_s: float = 0.5  # OU wind correlation time, s
-    poke_prob: float = 0.0  # per control step, per world
-    poke_force_n: float = 0.0  # world-frame poke force magnitude ceiling, N
-    poke_torque_nm: float = 0.0  # body-frame poke torque magnitude ceiling, N·m
-    act_delay_min: int = 0  # command transport delay bounds, control steps
-    act_delay_max: int = 0
-    spawn_dr_scale: float = 1.0
+    # randomization / disturbance — the DomainRand block, one object = one setting
+    dr: DomainRand = field(default_factory=DomainRand)
     # episode / safety
     max_episode_steps: int = 1000
     stuck_steps: int = 200  # never-airborne worlds truncate after this many steps
@@ -97,33 +291,58 @@ class SimConfig:
     ground_tilt_limit_rad: float = math.pi / 3
 
 
+def _installed_base_rev() -> "str | None":
+    """The Betaflight base of the INSTALLED cudaflight wheel, from its version
+    metadata (`0.6.0+bf.6dbc4218` → `6dbc4218`). None for source checkouts. Metadata
+    is trustworthy here because it describes the wheel's own embedded binaries; the
+    render gate separately verifies whichever lib actually boots."""
+    try:
+        from importlib.metadata import version
+
+        m = re.search(r"\+bf\.([0-9a-f]+)", version("cudaflight"))
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def _resolve_firmware_base(dump: Path) -> Any:
+    """The per-base firmware bundle a dump selects, or None for the installed base.
+
+    The dump header names the Betaflight base the drone's firmware was built from.
+    When it matches the installed wheel (or carries no revision), the wheel's own
+    binaries serve and this returns None. Otherwise the cudaflight bundle cache
+    provides the matching (libcpuflight.so, fw.fatbin) pair — fetched once with
+    `python -m cudaflight.bases <rev>`; a cache miss raises with that command. The
+    render's version gate verifies the selection against the booted lib either way.
+    """
+    from cudaflight import bases  # cudaflight >= 0.6.0
+    from cudaflight.config import parse_header
+
+    header = parse_header(dump.read_text(errors="replace"))
+    rev = header["rev"] if header else None
+    if rev is None or rev == "norevision":
+        return None
+    installed = _installed_base_rev()
+    if installed is not None and bases.rev_match(installed, rev):
+        return None
+    return bases.paths(rev)
+
+
 def tree_where(done: Array, fresh: Any, current: Any) -> Any:
     """
     Row-wise pytree blend: leaf rows from `fresh` where `done`, else from `current`.
 
     `done` is [F] bool; every leaf of both trees leads with the fleet axis (DESIGN.md §4).
     This is the auto-reset blend of the step pipeline (§7 step 9): done worlds take the
-    freshly spawned leaves, live worlds keep theirs, with no host round-trip.
+    freshly spawned leaves, live worlds keep theirs, with no host round-trip. Two step-9
+    exclusions never pass through here: the fleet-global metrics EMAs (cross-episode)
+    and the sticks firmware pair (FirmwareFleet.reset masks internally).
     """
 
     def sel(a: Array, b: Array) -> Array:
         return jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), a, b)
 
     return jax.tree.map(sel, fresh, current)
-
-
-class _FirmwareCarry(NamedTuple):
-    """
-    Sticks-mode `SimState.task_state` wrapper: the task's own pytree plus the
-    value-threaded firmware pair of `types.FirmwareFleet`. The env wraps/unwraps it
-    around every task call, so tasks never see it; motors mode stores the task pytree
-    bare. (SimState §4 has no firmware slot, so the pair rides in the one opaque slot
-    the env owns end to end.)
-    """
-
-    task: Any
-    blob: Any
-    fwstate: Any
 
 
 def _uniform_ball(key: Array, n: int) -> Array:
@@ -216,19 +435,92 @@ class SkyFlowEnv:
             raise NotImplementedError("planned")
         if cfg.control not in ("motors", "sticks"):
             raise ValueError(f'cfg.control must be "motors" or "sticks", got {cfg.control!r}')
+        if cfg.eeprom is None and cfg.eeprom_overrides is not None:
+            raise ValueError(
+                "cfg.eeprom_overrides is set without cfg.eeprom — overrides are "
+                "sim-only CLI lines appended to a dump, not a config by themselves"
+            )
+        if cfg.eeprom is not None and cfg.control != "sticks":
+            raise ValueError('cfg.eeprom requires control="sticks": motors mode boots no firmware')
         if cfg.airframe not in AIRFRAMES:
             raise ValueError(
                 f"unknown airframe {cfg.airframe!r}; registered: {sorted(AIRFRAMES)}"
             )
         if cfg.num_envs < 1:
             raise ValueError(f"num_envs must be >= 1, got {cfg.num_envs}")
-        if not 0 <= cfg.act_delay_min <= cfg.act_delay_max:
+        dr = cfg.dr.effective()  # fold the master scale once; the env reads only this
+        d_min, d_max = (int(d) for d in dr.delay_steps)
+        if not 0 <= d_min <= d_max:
+            raise ValueError(f"need 0 <= delay min <= max, got dr.delay_steps={dr.delay_steps}")
+        if dr.wind_tau_s <= 0.0:
+            raise ValueError(f"dr.wind_tau_s must be > 0, got {dr.wind_tau_s}")
+        if not 0.0 <= dr.poke_prob <= 1.0:
+            raise ValueError(f"dr.poke_prob must be in [0,1], got {dr.poke_prob}")
+        for name in (
+            "scale", "body_scale", "wind_mean_mps", "wind_gust_mps", "poke_force_n",
+            "poke_torque_nm", "poke_force_frac", "poke_torque_frac",
+            "gyro_noise_rps", "accel_noise_mps2", "gyro_bias_rps",
+            "accel_bias_mps2", "baro_noise_pa", "gyro_sat_rps", "gyro_scale_frac",
+            "imu_offset_m", "imu_mount_deg", "cog_offset_m", "cog_offset_frac",
+            "battery_sag_rate_ps",
+            "obs_noise", "spawn_scale",
+        ):
+            if getattr(cfg.dr, name) < 0.0:
+                raise ValueError(f"dr.{name} must be >= 0, got {getattr(cfg.dr, name)}")
+        # Loud key/group validation happens inside max_bracket and factor_floor.
+        b_max = max_bracket(dr.brackets, residual=dr.factors is not None)
+        if dr.body_scale * b_max >= 1.0:
             raise ValueError(
-                f"need 0 <= act_delay_min <= act_delay_max, got "
-                f"({cfg.act_delay_min}, {cfg.act_delay_max})"
+                f"dr.scale·dr.body_scale·max bracket = {dr.body_scale * b_max:.3f} >= 1: "
+                "a multiplicative factor could reach zero or flip a physical parameter"
             )
-        if cfg.wind_tau_s <= 0.0:
-            raise ValueError(f"wind_tau_s must be > 0, got {cfg.wind_tau_s}")
+        f_low = factor_floor(dr.factors)
+        if dr.body_scale * f_low >= 1.0:
+            raise ValueError(
+                f"dr.scale·dr.body_scale·max factor low = {dr.body_scale * f_low:.3f} >= 1: "
+                "a shared factor could reach zero or flip a physical parameter"
+            )
+        if not 0.0 <= dr.battery_sag < 1.0:
+            raise ValueError(
+                f"dr.scale·dr.battery_sag must be in [0, 1), got {dr.battery_sag}: "
+                "a sagged ceiling of zero or below stops every rotor"
+            )
+        if dr.battery_sag_shape <= 0.0:
+            raise ValueError(
+                f"dr.battery_sag_shape must be > 0, got {dr.battery_sag_shape}"
+            )
+        if dr.poke_dur_steps < 1.0:
+            raise ValueError(
+                f"dr.poke_dur_steps must be >= 1, got {dr.poke_dur_steps}"
+            )
+        if dr.poke_force_n > 0.0 and dr.poke_force_frac > 0.0:
+            raise ValueError(
+                "set dr.poke_force_n OR dr.poke_force_frac, not both — one truth for "
+                "the poke magnitude"
+            )
+        if dr.poke_torque_nm > 0.0 and dr.poke_torque_frac > 0.0:
+            raise ValueError(
+                "set dr.poke_torque_nm OR dr.poke_torque_frac, not both"
+            )
+        if dr.cog_offset_m > 0.0 and dr.cog_offset_frac > 0.0:
+            raise ValueError(
+                "set dr.cog_offset_m OR dr.cog_offset_frac, not both — one truth for "
+                "the CoG shift"
+            )
+        if dr.gyro_scale_frac >= 1.0:
+            raise ValueError(
+                f"dr.scale·dr.gyro_scale_frac must be < 1, got {dr.gyro_scale_frac}: "
+                "a gain of zero or below flips the rate loop"
+            )
+        if not 0.0 <= dr.cmd_drop_prob < 1.0:
+            raise ValueError(
+                f"dr.cmd_drop_prob must be in [0, 1), got {dr.cmd_drop_prob}: "
+                "at 1 no command ever lands and the link is dead by construction"
+            )
+        # L5 estimator-error model (errors.py) — loud key/profile validation inside;
+        # None keeps the truth-observation path bit-exact and key-free.
+        self._est = errors.resolve_obs_error(dr.obs_error)
+        self._drop_on = dr.cmd_drop_prob > 0.0
         decimation = round(cfg.physics_hz / cfg.control_hz)
         if decimation < 1:
             raise ValueError(
@@ -236,19 +528,89 @@ class SkyFlowEnv:
             )
 
         self.cfg = cfg
+        self.dr = dr  # effective DomainRand: master scale already folded in
+        self._delay_min, self._delay_max = d_min, d_max
+        self._imu_noise_on = dr.gyro_noise_rps > 0.0 or dr.accel_noise_mps2 > 0.0
+        self._imu_bias_on = dr.gyro_bias_rps > 0.0 or dr.accel_bias_mps2 > 0.0
         self.fleet = int(cfg.num_envs)
         self.airframe = AIRFRAMES[cfg.airframe]
+        # Battery sag shrinks the very ceiling the thrust-to-weight guard prices, so
+        # the guard re-runs over the SAGGED per-world ceiling after the trait draw.
+        # Gated on sag ALONE: the legacy factors=None sampler never guards, so a
+        # sagged fleet without factors previously flew with NO lift guard at all —
+        # worlds that could not take off truncated as `stuck` with no diagnostic.
+        # sag=0 keeps every path bit-exact (the re-run is skipped).
+        self._tw_reguard = dr.battery_sag > 0.0
+        # Weight-relative pokes: the frac knobs resolve against the NOMINAL airframe
+        # (drawn mass varies per world; the expected disturbance class scales with the
+        # vehicle, not with this episode's draw). r_arm = mean planar rotor radius.
+        _v = self.airframe.values
+        _m_g = float(_v["mass"]) * abs(float(_v["grav"]))
+        _r_arm = float(
+            sum(math.hypot(r[0], r[1]) for r in _v["rotor_pos"]) / len(_v["rotor_pos"])
+        )
+        self._poke_force_n = (
+            dr.poke_force_frac * _m_g if dr.poke_force_frac > 0.0 else dr.poke_force_n
+        )
+        self._poke_torque_nm = (
+            dr.poke_torque_frac * _m_g * _r_arm
+            if dr.poke_torque_frac > 0.0 else dr.poke_torque_nm
+        )
+        self._poke_hold = dr.poke_dur_steps > 1.0
+        # Within-episode discharge rate, rad/s per control step (0 = off).
+        self._sag_rate = (
+            dr.battery_sag_rate_ps * self.airframe.rotor_speed_max
+            * (decimation / cfg.physics_hz)
+            if dr.battery_sag_rate_ps > 0.0 else 0.0
+        )
+        self._mount_on = dr.imu_offset_m > 0.0 or dr.imu_mount_deg > 0.0
+        self._gscale_on = dr.gyro_scale_frac > 0.0
+        # CoG width in meters: the frac knob resolves against the nominal mean rotor
+        # arm (the same r_arm the weight-relative pokes use) — airframe-portable.
+        self._cog_m = (
+            dr.cog_offset_frac * _r_arm if dr.cog_offset_frac > 0.0 else dr.cog_offset_m
+        )
+        self._cog_on = self._cog_m > 0.0
+        self._nominal_row = jnp.asarray(
+            dynamics.pack_params(self.airframe.values), jnp.float32
+        )
         self.decimation = int(decimation)
         self.dt_physics = 1.0 / cfg.physics_hz
         self.dt_control = self.decimation / cfg.physics_hz
         self.act_dim = 4
+        # Delay-ring / last-action NEUTRAL. Motors mode: 0.0 (u = 0.5) per rotor.
+        # Sticks mode is AETR — channel 2 is THROTTLE, where 0.0 means 50% power;
+        # the firmware arms (and idles sanely) only on stick-low, so the neutral
+        # a fresh ring feeds while the real command rides the transport delay
+        # must be throttle -1.0, not mid-stick.
+        self._act_neutral = jnp.array(
+            [0.0, 0.0, -1.0 if cfg.control == "sticks" else 0.0, 0.0], jnp.float32
+        )
 
         self.task: Task = task if task is not None else self._build_task(cfg)
         self.obs_spec = self.task.obs_spec
         self.obs_dim = self.obs_spec.dim
         self.image_shape = self.task.image_shape
+        # dr.obs_noise is unit-blind (the LEGACY stress knob): one half-width sane
+        # for metres DESTROYS mask pixels riding in the same vector. Zero the noise
+        # on image terms (ObsTerm.image=True); numeric terms keep the blanket, so
+        # state-only tasks stay bit-exact against legacy draws (same key, same shape).
+        self._obs_noise_scale: Array | None = None
+        if any(t.image for t in self.obs_spec):
+            self._obs_noise_scale = jnp.concatenate([
+                jnp.zeros(t.dim, jnp.float32) if t.image else jnp.ones(t.dim, jnp.float32)
+                for t in self.obs_spec
+            ])
 
         self._fw: FirmwareFleet | None = None
+        self._owns_fw = False  # close() destroys only fleets this env constructed
+        self._closed = False
+        # unlinks the rendered boot image at close(), GC, or interpreter exit
+        self._eeprom_finalizer: weakref.finalize | None = None
+        # boot-image temp file path when cfg.eeprom rendered (logs/provenance), else None
+        self.eeprom_image: str | None = None
+        # per-base bundle revision when the dump selected one (logs/provenance)
+        self.firmware_base: str | None = None
         if cfg.control == "sticks":
             if cfg.physics_hz != 1000.0:
                 raise ValueError(
@@ -262,16 +624,57 @@ class SkyFlowEnv:
 
             self._flu_to_frd = _firmware.flu_to_frd
             self._baro_pa = _firmware.baro_pa
-            fw = firmware_fleet if firmware_fleet is not None else self._build_fleet(
-                cfg, _firmware
-            )
-            if fw.act_dim != self.act_dim:
-                raise ValueError(f"firmware fleet act_dim {fw.act_dim} != {self.act_dim}")
-            perm = tuple(int(i) for i in motor_perm)
-            if sorted(perm) != [0, 1, 2, 3]:
-                raise ValueError(f"motor_perm must permute (0,1,2,3), got {motor_perm!r}")
+            if firmware_fleet is not None and cfg.eeprom is not None:
+                raise ValueError(
+                    "cfg.eeprom and firmware_fleet= are exclusive — an injected "
+                    "fleet already booted its own config"
+                )
+            self._owns_fw = firmware_fleet is None
+            fw: FirmwareFleet | None = None
+            try:
+                fw = firmware_fleet if firmware_fleet is not None else self._build_fleet(
+                    cfg, _firmware
+                )
+                if fw.act_dim != self.act_dim:
+                    raise ValueError(f"firmware fleet act_dim {fw.act_dim} != {self.act_dim}")
+                perm = tuple(int(i) for i in motor_perm)
+                if sorted(perm) != [0, 1, 2, 3]:
+                    raise ValueError(f"motor_perm must permute (0,1,2,3), got {motor_perm!r}")
+            except BaseException:
+                # a failed construction must not leak: free the one-CPU-fleet slot
+                # and the rendered boot image before re-raising
+                if fw is not None and self._owns_fw:
+                    fw.close()
+                self._reap_eeprom_image()
+                raise
             self._fw = fw
             self._motor_perm = jnp.asarray(perm, jnp.int32)
+
+    def close(self) -> None:
+        """Release lifecycle resources: destroy the firmware fleet this env
+        constructed (an injected fleet belongs to its caller) and unlink the
+        rendered eeprom boot image. Idempotent. A closed env must not step or
+        reset — reset()/step() raise at trace time, and the fleet's own guard
+        raises on any use of already-compiled sticks programs (motors mode
+        holds no firmware, so there close() only reaps the image)."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._fw is not None and self._owns_fw:
+            self._fw.close()
+        self._reap_eeprom_image()
+
+    def __enter__(self) -> "SkyFlowEnv":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _reap_eeprom_image(self) -> None:
+        """Unlink the rendered boot image — a derived artifact, never precious.
+        `eeprom_image` keeps the path string for provenance records."""
+        if self._eeprom_finalizer is not None:
+            self._eeprom_finalizer()  # idempotent: detaches after the first call
 
     def _build_fleet(self, cfg: SimConfig, _firmware: Any) -> FirmwareFleet:
         """cfg.firmware → a FirmwareFleet (DESIGN.md §10).
@@ -284,25 +687,115 @@ class SkyFlowEnv:
             raise ValueError(
                 f'cfg.firmware must be "auto", "cpu" or "gpu", got {cfg.firmware!r}'
             )
+        # Render before any fleet exists: the render boots its own throwaway CPU
+        # instance, and the CPU library allows one live fleet per process.
+        eeprom, lib, fatbin = self._render_eeprom(cfg)
         if cfg.firmware == "cpu":
-            return _firmware.CpuFirmwareFleet(self.fleet)
+            return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom, lib=lib)
         if cfg.firmware == "gpu":
-            return _firmware.GpuFirmwareFleet(self.fleet)
+            return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom, cubin=fatbin)
         try:
             gpu_visible = bool(jax.devices("gpu"))
         except RuntimeError:
             gpu_visible = False
-        if self.fleet >= 3 and gpu_visible:
+        if self.fleet >= _firmware.GPU_FLEET_MIN and gpu_visible:
             try:
-                return _firmware.GpuFirmwareFleet(self.fleet)
-            except Exception as e:  # ImportError (wheel < 0.3.3), RuntimeError (create)
-                warnings.warn(
-                    f'firmware="auto": GPU fleet unavailable ({e}); '
-                    "using the CPU SITL fleet",
-                    RuntimeWarning,
-                    stacklevel=3,
+                return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom, cubin=fatbin)
+            except Exception as e:  # ImportError (wheel too old), RuntimeError (create)
+                reason = f"GPU fleet construction failed ({e!r})"
+        elif not gpu_visible:
+            reason = "no CUDA device is visible to jax"
+        else:
+            reason = (
+                f"fleet {self.fleet} < {_firmware.GPU_FLEET_MIN} "
+                "(the GPU backend's minimum)"
+            )
+        # The fallback changes the backend, the binary, and the throughput by orders
+        # of magnitude — never do it silently. firmware="gpu" is the fail-loudly pin.
+        warnings.warn(
+            f'firmware="auto": {reason}; using the sequential CPU SITL fleet '
+            "(one host round-trip per substep — expect a large slowdown). "
+            'Pin firmware="gpu" to make this an error instead.',
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom, lib=lib)
+
+    def _render_eeprom(self, cfg: SimConfig) -> tuple[str | None, str | None, str | None]:
+        """cfg.eeprom (CLI `dump all` path) → (boot image, CPU lib, GPU fatbin) paths.
+
+        All three are None when cfg.eeprom is None; lib/fatbin are None when the dump
+        belongs to the installed wheel's own base (or carries no revision) — the
+        wheel's embedded binaries serve. A dump from ANOTHER base selects the matching
+        per-base pair from the cudaflight bundle cache (`_resolve_firmware_base`).
+
+        cudaflight renders through a version-gated strict round-trip on one throwaway
+        CPU boot of the SELECTED lib, so a stale or foreign dump fails HERE — an image
+        one parameter-group version behind would factory-reset silently and fly stock
+        defaults. The image is a derived artifact: rendered fresh per construction,
+        never committed. Provenance lands on `self.eeprom_image` / `self.firmware_base`.
+        """
+        if cfg.eeprom is None:
+            return None, None, None
+        dump = Path(cfg.eeprom)
+        if not dump.is_file():
+            raise FileNotFoundError(f"cfg.eeprom: no such CLI dump file: {dump}")
+        overrides: Path | None = None
+        if cfg.eeprom_overrides is not None:
+            overrides = Path(cfg.eeprom_overrides)
+            if not overrides.is_file():
+                raise FileNotFoundError(
+                    f"cfg.eeprom_overrides: no such CLI file: {overrides}"
                 )
-        return _firmware.CpuFirmwareFleet(self.fleet)
+
+        # Board alignment: Betaflight rotates its raw sensor rows by align_board_*
+        # before use. SkyFlow hands the firmware sensors already in the craft frame
+        # and implements NO inverse pre-rotation (DESIGN §10 names it as planned —
+        # TECH_DEBT F8), so a nonzero EFFECTIVE alignment (overrides win over the
+        # dump, as in the render) may leave the firmware reading rotated sensors.
+        # Real dumps carry these values (the Air75 factory CLI: yaw -135), so this
+        # is a warning, never a rejection — the sim must run the real config.
+        align: dict[str, int] = {}
+        for src in (dump, overrides):
+            if src is None:
+                continue
+            for m in re.finditer(
+                r"^\s*set\s+(align_board_(?:roll|pitch|yaw))\s*=\s*(-?\d+)",
+                src.read_text(errors="replace"),
+                re.M,
+            ):
+                align[m.group(1)] = int(m.group(2))  # later files override earlier
+        nonzero = {k: v for k, v in align.items() if v != 0}
+        if nonzero:
+            warnings.warn(
+                f"cfg.eeprom: board alignment {nonzero} is set and SkyFlow applies no "
+                "inverse sensor rotation — the firmware may read rotated sensor rows. "
+                "Verify a hover before trusting this config, or pin align_board_* = 0 "
+                "in eeprom_overrides (the sim's virtual board is craft-aligned).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+        import cudaflight  # deferred like the fleet import: only this seam needs it
+
+        bundle = _resolve_firmware_base(dump)
+        lib = str(bundle.lib) if bundle is not None else None
+        fatbin = str(bundle.fatbin) if bundle is not None else None
+        self.firmware_base = bundle.rev if bundle is not None else None
+
+        image = cudaflight.render_eeprom(dump, overrides, lib_path=lib)
+        f = tempfile.NamedTemporaryFile(
+            prefix="skyflow-eeprom-", suffix=".bin", delete=False
+        )
+        with f:
+            f.write(image)
+        self.eeprom_image = f.name
+        # reap at close(), GC, or interpreter exit — whichever comes first
+        # (weakref.finalize registers an atexit fallback for still-live envs)
+        self._eeprom_finalizer = weakref.finalize(
+            self, Path(f.name).unlink, missing_ok=True
+        )
+        return f.name, lib, fatbin
 
     @staticmethod
     def _build_task(cfg: SimConfig) -> Task:
@@ -310,7 +803,7 @@ class SkyFlowEnv:
         pulls in every shipped task, and injected-task callers never need it).
 
         Two quantities the env owns are forwarded to builders that NAME them —
-        `spawn_dr_scale` (the §6/§7 spawn-jitter scale) and `control_hz` (the Task
+        `spawn_dr_scale` (= cfg.dr.spawn_scale, the §7 spawn-jitter scale) and `control_hz` (the Task
         protocol carries no clock, and a task counting seconds must count them at the
         platform's rate). Explicit `task_kwargs` entries always win, and builders that
         do not name a quantity are built untouched (GateCourseTask names neither).
@@ -324,54 +817,201 @@ class SkyFlowEnv:
             accepted = {}
         kwargs = dict(cfg.task_kwargs)
         for name, value in (
-            ("spawn_dr_scale", cfg.spawn_dr_scale),
+            ("spawn_dr_scale", cfg.dr.spawn_scale),
             ("control_hz", cfg.control_hz),
         ):
             if name in accepted and name not in kwargs:
                 kwargs[name] = value
         return task_registry.build_task(cfg.task, **kwargs)
 
+    # -- DomainRand draws (all read self.dr — the effective, master-scaled setting) ------
+
+    def _draw_traits(self, key: Array, f: int) -> DRState:
+        """Fresh per-episode trait rows (types.DRState) — used at reset and respawn.
+
+        Steady wind: horizontal direction uniform on the circle, magnitude
+        U(0, wind_mean_mps). IMU bias: per-axis U(-half_width, +half_width). Zero
+        ceilings give exactly-zero rows, so the leaves always exist and stay inert."""
+        dr = self.dr
+        k_dir, k_mag, k_bias = jax.random.split(key, 3)
+        theta = jax.random.uniform(k_dir, (f,), jnp.float32, 0.0, 2.0 * math.pi)
+        mag = jax.random.uniform(k_mag, (f,), jnp.float32, 0.0, dr.wind_mean_mps)
+        wind_mean = jnp.stack(
+            [mag * jnp.cos(theta), mag * jnp.sin(theta), jnp.zeros((f,), jnp.float32)],
+            axis=-1,
+        )
+        half = jnp.asarray(
+            [dr.accel_bias_mps2] * 3 + [dr.gyro_bias_rps] * 3, jnp.float32
+        )
+        imu_bias = half * jax.random.uniform(k_bias, (f, 6), jnp.float32, -1.0, 1.0)
+        # Battery sag: one-sided ceiling factor per world (a pack only sags). sag=0
+        # gives exactly the airframe ceiling, so the leaf always exists and stays inert.
+        k_sag = jax.random.fold_in(k_bias, 1)
+        u_sag = jax.random.uniform(k_sag, (f,), jnp.float32, 0.0, 1.0)
+        if dr.battery_sag_shape != 1.0:
+            # Start-charge skew: shape > 1 concentrates mass near a FULL pack (sag ~ 0)
+            # with rare deep-sag starts. shape == 1 skips the power for bit-exactness.
+            u_sag = u_sag ** dr.battery_sag_shape
+        sag = dr.battery_sag * u_sag
+        w_max = self.airframe.rotor_speed_max * (1.0 - sag)
+        # Estimator-error bias trait (errors.py channel groups). fold_in keeps the
+        # legacy RNG stream untouched; feature off gives exactly-zero columns.
+        if self._est is not None:
+            est_bias = errors.draw_bias(jax.random.fold_in(k_bias, 2), f, self._est)
+        else:
+            est_bias = jnp.zeros((f, 12), jnp.float32)
+        # L4 geometry/gain traits + L1 CoG trait — fold_in streams, inert when off.
+        if self._gscale_on:
+            gyro_scale = 1.0 + dr.gyro_scale_frac * jax.random.uniform(
+                jax.random.fold_in(k_bias, 3), (f, 3), jnp.float32, -1.0, 1.0
+            )
+        else:
+            gyro_scale = jnp.ones((f, 3), jnp.float32)
+        if self._mount_on:
+            imu_offset = dr.imu_offset_m * jax.random.uniform(
+                jax.random.fold_in(k_bias, 4), (f, 3), jnp.float32, -1.0, 1.0
+            )
+            rotvec = math.radians(dr.imu_mount_deg) * jax.random.uniform(
+                jax.random.fold_in(k_bias, 5), (f, 3), jnp.float32, -1.0, 1.0
+            )
+            imu_mount = errors.rotvec_to_mat(rotvec)
+        else:
+            imu_offset = jnp.zeros((f, 3), jnp.float32)
+            imu_mount = jnp.broadcast_to(jnp.eye(3, dtype=jnp.float32).reshape(9), (f, 9))
+        if self._cog_on:
+            cog_offset = self._cog_m * jax.random.uniform(
+                jax.random.fold_in(k_bias, 6), (f, 3), jnp.float32, -1.0, 1.0
+            )
+        else:
+            cog_offset = jnp.zeros((f, 3), jnp.float32)
+        return DRState(
+            wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max, est_bias=est_bias,
+            gyro_scale=gyro_scale, imu_offset=imu_offset, imu_mount=imu_mount,
+            cog_offset=cog_offset,
+        )
+
+    def _measure(
+        self, plant: Array, omega: Array, wind: Array, params: Array,
+        dr_state: DRState, key: Array,
+    ) -> tuple[Array, Array]:
+        """sensors.measure with this env's DomainRand corruption. The static gates keep
+        the nominal path key-free and bit-exact (sensors.py charter)."""
+        dr = self.dr
+        return sensors.measure(
+            plant, omega, wind, params,
+            key=key if self._imu_noise_on else None,
+            accel_noise_std=dr.accel_noise_mps2,
+            gyro_noise_std=dr.gyro_noise_rps,
+            imu_bias=dr_state.imu_bias if self._imu_bias_on else None,
+            imu_offset=dr_state.imu_offset if self._mount_on else None,
+            imu_mount=dr_state.imu_mount if self._mount_on else None,
+            gyro_scale=dr_state.gyro_scale if self._gscale_on else None,
+            gyro_sat_rps=dr.gyro_sat_rps,
+        )
+
+    def _observe(
+        self, plant: Array, emitted: Array, task_state: Any, imu: tuple[Array, Array],
+        last_action: Array, key: Array, *, fresh_spawn: bool,
+    ) -> tuple[Array, Any]:
+        """task.observe on the EMITTED (estimator) plant. Image tasks also receive the
+        TRUE plant as `true_plant=`: a camera is bolted to the vehicle and images from
+        where the vehicle really is; only state-derived terms carry the estimator
+        error (ERRORS.md rule: never corrupt what the agent truly knows). State-only
+        tasks keep the protocol signature untouched."""
+        if self.image_shape is not None:
+            return cast(Any, self.task).observe(
+                emitted, task_state, imu, last_action, key, fresh_spawn=fresh_spawn,
+                true_plant=plant,
+            )
+        return self.task.observe(
+            emitted, task_state, imu, last_action, key, fresh_spawn=fresh_spawn
+        )
+
+    def _corrupt_obs(self, obs: Array, key: Array) -> Array:
+        """DomainRand.obs_noise on the finalized task observation (uniform half-width);
+        applied by the env so tasks keep semantics and the env keeps corruption.
+        Image terms (ObsTerm.image) are excluded — see `_obs_noise_scale`."""
+        if self.dr.obs_noise <= 0.0:
+            return obs
+        noise = jax.random.uniform(
+            key, obs.shape, obs.dtype, -self.dr.obs_noise, self.dr.obs_noise
+        )
+        if self._obs_noise_scale is not None:
+            noise = noise * self._obs_noise_scale
+        return obs + noise
+
     # -- public API --------------------------------------------------------------------
 
     def reset(self, key: Array) -> tuple[Array, SimState]:
         """
-        Fresh fleet → (obs [F,obs_dim] f32, SimState). Per-world randomized params
-        (physics_dr_scale), task spawn, per-world delay draw; wind, delay ring and
-        episode accumulators cleared. Pure — same key, same fleet, bit for bit.
+        Fresh fleet → (obs [F,obs_dim] f32, SimState). Per-world DomainRand draws
+        (params, traits, delay), task spawn; gust state, delay ring and episode
+        accumulators cleared. Pure — same key, same fleet, bit for bit.
         """
-        cfg = self.cfg
+        if self._closed:
+            raise RuntimeError("SkyFlowEnv is closed — construct a new env")
+        dr = self.dr
         f = self.fleet
-        k_params, k_spawn, k_delay, k_obs, k_carry = jax.random.split(key, 5)
+        k_params, k_spawn, k_traits, k_delay, k_imu, k_obs, k_carry = jax.random.split(
+            key, 7
+        )
 
-        params = sample_params(k_params, self.airframe, f, cfg.physics_dr_scale)
+        params = sample_params(
+            k_params, self.airframe, f, dr.body_scale, dr.brackets, dr.factors
+        )
+        dr_state = self._draw_traits(k_traits, f)
+        if self._tw_reguard:
+            params = apply_tw_guard(params, self._nominal_row, dr_state.w_max)
+        if self._cog_on:
+            params = apply_cog_offset(params, dr_state.cog_offset)
         plant, task_state = self.task.spawn(k_spawn, f, params)
         plant = plant.astype(jnp.float32)
         delay_idx = jax.random.randint(
-            k_delay, (f,), cfg.act_delay_min, cfg.act_delay_max + 1, dtype=jnp.int32
+            k_delay, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
         )
-        wind_vel = jnp.zeros((f, 3), jnp.float32)
-        act_buf = jnp.zeros((f, cfg.act_delay_max + 1, 4), jnp.float32)
-        last_action = jnp.zeros((f, 4), jnp.float32)
+        wind_vel = jnp.zeros((f, 3), jnp.float32)  # gust deviation; total adds the mean
+        act_buf = jnp.broadcast_to(self._act_neutral, (f, self._delay_max + 1, 4))
+        last_action = jnp.broadcast_to(self._act_neutral, (f, 4))
 
-        # First observation: exact IMU with the rotors held at their spawn speeds (no
-        # command has been issued yet, so hold is the only self-consistent input).
-        imu = sensors.measure(plant, plant[:, 13:17], wind_vel, params)
-        obs, task_state = self.task.observe(
-            plant, task_state, imu, last_action, k_obs, fresh_spawn=True
+        # First observation: IMU with the rotors held at their spawn speeds (no command
+        # has been issued yet, so hold is the only self-consistent input). The task
+        # observes the ESTIMATOR's state when obs_error is on (errors.py: fresh bias
+        # trait, drift starts at zero, no dropout on the first frame).
+        k_obs_task, k_obs_dr = jax.random.split(k_obs)
+        imu = self._measure(plant, plant[:, 13:17], dr_state.wind_mean, params, dr_state, k_imu)
+        if self._est is not None:
+            emitted = errors.corrupt_plant(
+                plant, dr_state.est_bias, jnp.zeros((f, 12), jnp.float32),
+                jax.random.fold_in(k_obs, 1), self._est,
+            )
+        else:
+            emitted = plant
+        obs, task_state = self._observe(
+            plant, emitted, task_state, imu, last_action, k_obs_task, fresh_spawn=True
         )
+        obs = self._corrupt_obs(obs, k_obs_dr)
 
         if self._fw is not None:
             blob, fwstate = self._fw.fresh_firmware_state()
-            task_state = _FirmwareCarry(task=task_state, blob=blob, fwstate=fwstate)
+            task_state = FirmwareCarry(task=task_state, blob=blob, fwstate=fwstate)
 
         state = SimState(
             plant=plant,
             params=params,
             key=k_carry,
+            armed=jnp.ones(f, bool),  # every fleet starts from the armed snapshot
             wind_vel=wind_vel,
+            dr_state=dr_state,
             act_buf=act_buf,
             delay_idx=delay_idx,
+            cmd_prev=last_action,
             last_action=last_action,
+            est_ou=jnp.zeros((f, 12), jnp.float32),
+            est_hold=jnp.zeros(f, jnp.int32),
+            est_held=emitted,
+            poke_left=jnp.zeros(f, jnp.int32),
+            poke_fext=jnp.zeros((f, 3), jnp.float32),
+            poke_text=jnp.zeros((f, 3), jnp.float32),
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
@@ -381,7 +1021,7 @@ class SkyFlowEnv:
             trunc_frac=jnp.zeros((), jnp.float32),
             ep_return_ema=jnp.zeros((), jnp.float32),
             ep_len_ema=jnp.zeros((), jnp.float32),
-            task_state=task_state,
+            task_carry=task_state,
         )
         return obs, state
 
@@ -394,41 +1034,108 @@ class SkyFlowEnv:
         already respawned, with their pre-reset observation in info["final_obs"] and the
         pre-reset flags in info["terminated"] / info["truncated"].
         """
+        if self._closed:
+            raise RuntimeError("SkyFlowEnv is closed — construct a new env")
         cfg = self.cfg
+        dr = self.dr
         f = self.fleet
         af = self.airframe
-        w_min, w_max, k_thr = af.rotor_speed_min, af.rotor_speed_max, af.throttle_k
+        w_min, k_thr = af.rotor_speed_min, af.throttle_k
+        # Per-world ceiling, materialized [F,4]: the battery-sag trait. Exact per-rotor
+        # shape — the generated throttle map is elementwise and must see no implicit
+        # rank growth. sag=0 draws the airframe constant, so numerics do not change.
+        w_max_now = state.dr_state.w_max
+        if self._sag_rate > 0.0:
+            # Within-episode discharge: the ceiling slides down with flight time,
+            # floored at the idle speed (a dying pack, honestly priced).
+            w_max_now = jnp.maximum(
+                w_max_now - self._sag_rate * state.steps.astype(jnp.float32),
+                self.airframe.rotor_speed_min,
+            )
+        w_max = jnp.broadcast_to(w_max_now[:, None], (f, 4))
         cos_tilt_min = math.cos(cfg.ground_tilt_limit_rad)
 
         if self._fw is not None:
-            ts_in, blob, fwstate = state.task_state
+            if not isinstance(state.task_carry, FirmwareCarry):
+                raise TypeError(
+                    "sticks-mode step() needs SimState.task_carry to be the firmware "
+                    f"carry, got {type(state.task_carry).__name__}. Read task fields "
+                    "through env.task_state(state); a state whose carry was replaced "
+                    "by the bare task pytree (e.g. rebuilt from a motors-mode state) "
+                    "would step the firmware on task data."
+                )
+            ts_in, blob, fwstate = state.task_carry
         else:
-            ts_in = state.task_state
+            ts_in = state.task_carry
             blob = fwstate = None  # never read in motors mode
 
         # 1. Keys; delay ring (newest first) and the per-world delayed command.
-        k_carry, k_wind, k_gate, k_poke_f, k_poke_tau, k_obs, k_reset = jax.random.split(
-            state.key, 7
-        )
+        (
+            k_carry, k_wind, k_gate, k_poke_f, k_poke_tau, k_sub, k_imu, k_obs, k_reset,
+        ) = jax.random.split(state.key, 9)
         action = jnp.clip(jnp.asarray(action, jnp.float32), -1.0, 1.0)
         act_buf = jnp.concatenate([action[:, None, :], state.act_buf[:, :-1, :]], axis=1)
         delayed = act_buf[jnp.arange(f), state.delay_idx]
+        if self._drop_on:
+            # A dropped/late frame never lands: the link holds the previous APPLIED
+            # command (the RX's ZOH), and the next success applies the newest frame
+            # — no command reordering, ever. fold_in keeps the legacy stream
+            # untouched.
+            dropped = jax.random.bernoulli(
+                jax.random.fold_in(k_gate, 102), dr.cmd_drop_prob, (f,)
+            )
+            delayed = jnp.where(dropped[:, None], state.cmd_prev, delayed)
 
-        # 3. OU wind velocity, exact discretization over dt_control: stationary std is
-        # exactly wind_std_mps per axis for any step size (decay + variance-matched kick).
-        alpha = math.exp(-self.dt_control / cfg.wind_tau_s)
-        kick = cfg.wind_std_mps * math.sqrt(1.0 - alpha * alpha)
+        # 3. OU gust deviation, exact discretization over dt_control: stationary std is
+        # exactly wind_gust_mps per axis for any step size (decay + variance-matched
+        # kick). Every consumer sees the total wind: per-episode steady mean + gust.
+        alpha = math.exp(-self.dt_control / dr.wind_tau_s)
+        kick = dr.wind_gust_mps * math.sqrt(1.0 - alpha * alpha)
         wind_vel = alpha * state.wind_vel + kick * jax.random.normal(
             k_wind, (f, 3), jnp.float32
         )
+        wind_total = state.dr_state.wind_mean + wind_vel
 
         # 4. Pokes: exogenous inputs only — the backend integrates them, velocity state
-        # is never written. Uniform-ball direction · configured magnitude ceiling.
-        poke = jax.random.bernoulli(k_gate, cfg.poke_prob, (f,))
-        f_ext = jnp.where(poke[:, None], cfg.poke_force_n * _uniform_ball(k_poke_f, f), 0.0)
-        tau_ext = jnp.where(
-            poke[:, None], cfg.poke_torque_nm * _uniform_ball(k_poke_tau, f), 0.0
-        )
+        # is never written. Uniform-ball direction · resolved magnitude ceiling (the
+        # frac knobs resolve to newtons at construction — weight-relative).
+        if not self._poke_hold:
+            poke = jax.random.bernoulli(k_gate, dr.poke_prob, (f,))
+            f_ext = jnp.where(
+                poke[:, None], self._poke_force_n * _uniform_ball(k_poke_f, f), 0.0
+            )
+            tau_ext = jnp.where(
+                poke[:, None], self._poke_torque_nm * _uniform_ball(k_poke_tau, f), 0.0
+            )
+            poke_left = state.poke_left
+            poke_fext, poke_text = state.poke_fext, state.poke_text
+        else:
+            # Held pokes (dr.poke_dur_steps > 1): poke_prob is the START rate while
+            # idle; a started poke holds its drawn vectors for an exponential-mean
+            # duration (real contacts and prop-wash hits last 50-300 ms).
+            idle = state.poke_left == 0
+            start = jax.random.bernoulli(k_gate, dr.poke_prob, (f,)) & idle
+            u_dur = jax.random.uniform(
+                jax.random.fold_in(k_gate, 103), (f,), jnp.float32, 1e-7, 1.0
+            )
+            dur = jnp.maximum(
+                jnp.ceil(-dr.poke_dur_steps * jnp.log(u_dur)), 1.0
+            ).astype(jnp.int32)
+            poke_fext = jnp.where(
+                start[:, None],
+                self._poke_force_n * _uniform_ball(k_poke_f, f), state.poke_fext,
+            )
+            poke_text = jnp.where(
+                start[:, None],
+                self._poke_torque_nm * _uniform_ball(k_poke_tau, f), state.poke_text,
+            )
+            active = start | ~idle
+            f_ext = jnp.where(active[:, None], poke_fext, 0.0)
+            tau_ext = jnp.where(active[:, None], poke_text, 0.0)
+            poke_left = jnp.where(
+                start, dur - 1, jnp.maximum(state.poke_left - 1, 0)
+            )
+            poke = active
 
         # 2 + 5. Command map, then `decimation` substeps with every input zero-order-held
         # and the §8 contact clamp after each; the pre-clamp ground-crash predicate is
@@ -442,7 +1149,7 @@ class SkyFlowEnv:
             def substep_motors(carry, _):
                 plant, impact = carry
                 raw = dynamics.substep(
-                    plant, omega_cmd, wind_vel, f_ext, tau_ext, state.params,
+                    plant, omega_cmd, wind_total, f_ext, tau_ext, state.params,
                     self.dt_physics, w_min, w_max,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
@@ -452,38 +1159,47 @@ class SkyFlowEnv:
                 substep_motors, (state.plant, jnp.zeros(f, bool)), None, length=self.decimation
             )
             omega_last = omega_cmd
+            armed = None  # no firmware, no arm state
         else:
             # Sticks (§10, normative substep order): synth FRD sensors from the generated
-            # IMU + isothermal baro → firmware tick → QUADX motors reordered by
-            # motor_perm → duties feed the throttle map as u, ZOH for this 1 ms substep.
+            # IMU + isothermal baro, corrupted per DomainRand (bias + per-sample noise —
+            # the firmware filters what the real one filters) → firmware tick → QUADX
+            # motors reordered by motor_perm → duties feed the throttle map as u, ZOH
+            # for this 1 ms substep.
             fw = self._fw
+            baro_on = dr.baro_noise_pa > 0.0
+            sub_keys = jax.random.split(k_sub, self.decimation)
 
-            def substep_sticks(carry, _):
-                plant, blob, fwstate, omega_prev, impact = carry
-                accel, gyro = sensors.measure(plant, omega_prev, wind_vel, state.params)
-                rows = jnp.concatenate(
-                    [
-                        self._flu_to_frd(gyro),
-                        self._flu_to_frd(accel),
-                        self._baro_pa(plant[:, 2:3]).astype(jnp.float32),
-                    ],
-                    axis=-1,
+            def substep_sticks(carry, k_t):
+                plant, blob, fwstate, omega_prev, impact, _ = carry
+                k_imu_t, k_baro_t = jax.random.split(k_t)
+                accel, gyro = self._measure(
+                    plant, omega_prev, wind_total, state.params, state.dr_state, k_imu_t
                 )
-                blob, fwstate, motors, _armed = fw.fw_step(blob, fwstate, delayed, rows)
+                baro = self._baro_pa(plant[:, 2:3]).astype(jnp.float32)
+                if baro_on:
+                    baro = baro + dr.baro_noise_pa * jax.random.normal(
+                        k_baro_t, baro.shape, jnp.float32
+                    )
+                rows = jnp.concatenate(
+                    [self._flu_to_frd(gyro), self._flu_to_frd(accel), baro], axis=-1
+                )
+                blob, fwstate, motors, armed = fw.fw_step(blob, fwstate, delayed, rows)
                 u = motors[:, self._motor_perm]
                 omega_cmd = dynamics.throttle_to_omega(u, w_min, w_max, k_thr).astype(
                     jnp.float32
                 )
                 raw = dynamics.substep(
-                    plant, omega_cmd, wind_vel, f_ext, tau_ext, state.params,
+                    plant, omega_cmd, wind_total, f_ext, tau_ext, state.params,
                     self.dt_physics, w_min, w_max,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
-                return (_ground_contact(raw), blob, fwstate, omega_cmd, impact), None
+                return (_ground_contact(raw), blob, fwstate, omega_cmd, impact, armed), None
 
-            init = (state.plant, blob, fwstate, state.plant[:, 13:17], jnp.zeros(f, bool))
-            (plant, blob, fwstate, omega_last, impact), _ = jax.lax.scan(
-                substep_sticks, init, None, length=self.decimation
+            init = (state.plant, blob, fwstate, state.plant[:, 13:17], jnp.zeros(f, bool),
+                    jnp.ones(f, jnp.uint8))
+            (plant, blob, fwstate, omega_last, impact, armed), _ = jax.lax.scan(
+                substep_sticks, init, sub_keys
             )
 
         # 6. Airborne latch; env crash set; task verdict on the transition.
@@ -510,9 +1226,35 @@ class SkyFlowEnv:
         truncated = (steps >= cfg.max_episode_steps) | stuck
         done = terminated | truncated
 
-        # 8. Observe the post-transition state (pre-reset: this is final_obs on done rows).
-        imu = sensors.measure(plant, omega_last, wind_vel, state.params)
-        obs, ts_out = self.task.observe(plant, ev.task_state, imu, action, k_obs, fresh_spawn=False)
+        # 8. Observe the post-transition state (pre-reset: this is final_obs on done
+        # rows). With obs_error on, the task observes the ESTIMATOR's state
+        # (errors.py): bias trait + advanced OU drift + fresh white, one small
+        # rotation on the quaternion; during a dropout hold the estimator repeats
+        # its last emitted estimate (staleness, not noise).
+        k_obs_task, k_obs_dr = jax.random.split(k_obs)
+        imu = self._measure(plant, omega_last, wind_total, state.params, state.dr_state, k_imu)
+        if self._est is not None:
+            est_ou = errors.advance_ou(
+                state.est_ou, jax.random.fold_in(k_obs, 2), self.dt_control, self._est
+            )
+            emitted = errors.corrupt_plant(
+                plant, state.dr_state.est_bias, est_ou,
+                jax.random.fold_in(k_obs, 3), self._est,
+            )
+            est_hold = state.est_hold
+            if self._est.p_drop > 0.0:
+                start = jax.random.bernoulli(
+                    jax.random.fold_in(k_obs, 4), self._est.p_drop, (f,)
+                ) & (est_hold == 0)
+                dur = errors.draw_hold(jax.random.fold_in(k_obs, 5), f, self._est)
+                est_hold = jnp.where(start, dur, jnp.maximum(est_hold - 1, 0))
+                emitted = jnp.where((est_hold > 0)[:, None], state.est_held, emitted)
+        else:
+            est_ou, est_hold, emitted = state.est_ou, state.est_hold, plant
+        obs, ts_out = self._observe(
+            plant, emitted, ev.task_state, imu, action, k_obs_task, fresh_spawn=False
+        )
+        obs = self._corrupt_obs(obs, k_obs_dr)
 
         # 10 (accumulated before the blend so done rows report full-episode stats in
         # info and feed the EMAs below).
@@ -537,60 +1279,94 @@ class SkyFlowEnv:
         ep_return_ema = ema(state.ep_return_ema, ep_return)
         ep_len_ema = ema(state.ep_len_ema, ep_len)
 
-        # 9. Auto-reset: fresh spawn + fresh DR params + fresh delay draw + cleared
-        # buffers/wind for done worlds, blended leaf-wise; live worlds pass through
-        # untouched (bit-identical).
-        k_rp, k_rs, k_rd, k_ro = jax.random.split(k_reset, 4)
-        params_new = sample_params(k_rp, af, f, cfg.physics_dr_scale)
+        # 9. Auto-reset: fresh spawn + fresh DomainRand draws (params, traits, delay) +
+        # cleared buffers/gust for done worlds, blended leaf-wise; live worlds pass
+        # through untouched (bit-identical).
+        k_rp, k_rs, k_rt, k_rd, k_ri, k_ro = jax.random.split(k_reset, 6)
+        params_new = sample_params(k_rp, af, f, dr.body_scale, dr.brackets, dr.factors)
+        dr_new = self._draw_traits(k_rt, f)
+        if self._tw_reguard:
+            params_new = apply_tw_guard(params_new, self._nominal_row, dr_new.w_max)
+        if self._cog_on:
+            params_new = apply_cog_offset(params_new, dr_new.cog_offset)
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
-        la_new = jnp.zeros((f, 4), jnp.float32)
+        la_new = jnp.broadcast_to(self._act_neutral, (f, 4))
         wind_new = jnp.zeros((f, 3), jnp.float32)
-        imu_new = sensors.measure(plant_new, plant_new[:, 13:17], wind_new, params_new)
-        obs_new, ts_fresh = self.task.observe(
-            plant_new, ts_fresh, imu_new, la_new, k_ro, fresh_spawn=True
+        k_ro_task, k_ro_dr = jax.random.split(k_ro)
+        imu_new = self._measure(
+            plant_new, plant_new[:, 13:17], dr_new.wind_mean, params_new, dr_new, k_ri
         )
+        if self._est is not None:
+            emitted_new = errors.corrupt_plant(
+                plant_new, dr_new.est_bias, jnp.zeros((f, 12), jnp.float32),
+                jax.random.fold_in(k_ro, 1), self._est,
+            )
+        else:
+            emitted_new = plant_new
+        obs_new, ts_fresh = self._observe(
+            plant_new, emitted_new, ts_fresh, imu_new, la_new, k_ro_task, fresh_spawn=True
+        )
+        obs_new = self._corrupt_obs(obs_new, k_ro_dr)
         fresh = dict(
             plant=plant_new,
             params=params_new,
             wind_vel=wind_new,
-            act_buf=jnp.zeros((f, cfg.act_delay_max + 1, 4), jnp.float32),
+            dr_state=dr_new,
+            act_buf=jnp.broadcast_to(self._act_neutral, (f, self._delay_max + 1, 4)),
             delay_idx=jax.random.randint(
-                k_rd, (f,), cfg.act_delay_min, cfg.act_delay_max + 1, dtype=jnp.int32
+                k_rd, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
             ),
+            cmd_prev=la_new,
             last_action=la_new,
+            est_ou=jnp.zeros((f, 12), jnp.float32),
+            est_hold=jnp.zeros(f, jnp.int32),
+            est_held=emitted_new,
+            poke_left=jnp.zeros(f, jnp.int32),
+            poke_fext=jnp.zeros((f, 3), jnp.float32),
+            poke_text=jnp.zeros((f, 3), jnp.float32),
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
+            armed=jnp.ones(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
             ep_len=jnp.zeros(f, jnp.int32),
-            task_state=ts_fresh,
+            task_carry=ts_fresh,
         )
         current = dict(
             plant=plant,
             params=state.params,
             wind_vel=wind_vel,
+            dr_state=state.dr_state,
             act_buf=act_buf,
             delay_idx=state.delay_idx,
+            cmd_prev=delayed,
             last_action=action,
+            est_ou=est_ou,
+            est_hold=est_hold,
+            est_held=emitted,
+            poke_left=poke_left,
+            poke_fext=poke_fext,
+            poke_text=poke_text,
             steps=steps,
             airborne=airborne,
+            armed=jnp.ones(f, bool) if armed is None else armed.astype(bool),
             ep_return=ep_return,
             ep_len=ep_len,
-            task_state=ts_out,
+            task_carry=ts_out,
         )
         merged = tree_where(done, fresh, current)
         obs_out = jnp.where(done[:, None], obs_new, obs)
 
-        ts_state = merged.pop("task_state")
+        ts_state = merged.pop("task_carry")
         if self._fw is not None:
             # The fleet masks internally (types.FirmwareFleet.reset), so the pair is
             # taken whole rather than tree_where-blended (CPU placeholders are [0]).
             blob, fwstate = self._fw.reset(blob, fwstate, done.astype(jnp.uint8))
-            ts_state = _FirmwareCarry(task=ts_state, blob=blob, fwstate=fwstate)
+            ts_state = FirmwareCarry(task=ts_state, blob=blob, fwstate=fwstate)
 
         state_out = SimState(
             key=k_carry,
-            task_state=ts_state,
+            task_carry=ts_state,
             crash_frac=crash_frac,
             success_frac=success_frac,
             trunc_frac=trunc_frac,
@@ -599,28 +1375,32 @@ class SkyFlowEnv:
             **merged,
         )
         # cast: the task's ev.info keys ride along beyond the typed StepInfo contract.
-        info = cast(
-            "StepInfo",
-            {
-                **ev.info,
-                "terminated": terminated,
-                "truncated": truncated,
-                "final_obs": obs,
-                "poke_active": poke,
-                "ep_return": ep_return,
-                "ep_len": ep_len,
-            },
-        )
+        info_dict = {
+            **ev.info,
+            "terminated": terminated,
+            "truncated": truncated,
+            "final_obs": obs,
+            "poke_active": poke,
+            "ep_return": ep_return,
+            "ep_len": ep_len,
+        }
+        if armed is not None:
+            # sticks mode: the firmware's arm flag after the last substep. A world
+            # that disarms mid-episode (failsafe, runaway-takeoff) free-falls with
+            # motors at zero — without this flag that reads as a policy failure.
+            info_dict["armed"] = armed.astype(bool)
+        info = cast("StepInfo", info_dict)
         return obs_out, state_out, reward, done, info
 
     def task_state(self, state: SimState) -> Any:
         """
-        The task's OWN pytree for this state. In sticks mode `SimState.task_state` is
+        The task's OWN pytree for this state. In sticks mode `SimState.task_carry` is
         the firmware carry (§10) with the task's pytree inside it; every consumer that
         wants task fields (metrics, viewers, recorders) must read through this accessor
         instead of unwrapping the carry itself.
         """
-        return state.task_state.task if self._fw is not None else state.task_state
+        ts = state.task_carry
+        return ts.task if isinstance(ts, FirmwareCarry) else ts
 
     def metrics(self, state: SimState) -> dict[str, Array]:
         """
@@ -642,7 +1422,12 @@ class SkyFlowEnv:
             "ep_return_mean": jnp.mean(state.ep_return),
             "ep_len_mean": jnp.mean(state.ep_len.astype(jnp.float32)),
             "airborne_frac": jnp.mean(state.airborne.astype(jnp.float32)),
-            "wind_speed_mean": jnp.mean(jnp.linalg.norm(state.wind_vel, axis=-1)),
+            # sticks: fraction of the fleet the firmware holds armed (a failsafe or
+            # runaway-takeoff disarm drops it); motors mode reports 1.0
+            "armed_frac": jnp.mean(state.armed.astype(jnp.float32)),
+            "wind_speed_mean": jnp.mean(
+                jnp.linalg.norm(state.dr_state.wind_mean + state.wind_vel, axis=-1)
+            ),
         }
         for name, value in self.task.metrics(ts).items():
             out[name] = jnp.mean(value.astype(jnp.float32))

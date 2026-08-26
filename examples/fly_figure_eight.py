@@ -1,18 +1,26 @@
 """
-Scripted figure-eight fly-through — no policy, no training, no dynamics.
+Figure-eight demo — the benchmark env booted from a drone config, plus a course tracer.
 
-A kinematic tracer follows pre/post-gate waypoints around the shipped figure-eight
-course at constant speed and feeds each transition to `GateCourseTask.evaluate` — the
-same pass/crash/centering machinery the env applies to real flight. Prints every gate
-pass with its centering and the final tally.
+Default mode is the real thing: SimConfig(task="figure_eight", control="sticks")
+boots the Betaflight CPU SITL from a CLI `dump all` file (default: the repo's stock
+dump — the pinned firmware's own defaults; examples/configs/README.md) through the
+version-gated render, then flies open loop — climb, hold, report altitude and the
+task tally. No policy lives in the examples, so no gates get passed; this shows the
+benchmark env exactly as a trainer constructs it, drone-config seam included. Point
+--dump at a real drone's dump (plus its sim_overrides.txt) to fly that config.
+Needs the firmware extra (skyflow[firmware]; the pyproject pins the floor).
 
-`--save-masks N` additionally renders N camera coverage masks along the tour (the
-analytic ray-cast renderer the vision-obs variant uses) and writes them as PNGs when
-matplotlib is available, `.npy` arrays otherwise.
+--trace runs the kinematic course tracer instead — no dynamics, no firmware: a
+constant-speed tour through pre/post-gate waypoints fed to `GateCourseTask.evaluate`,
+the same pass/crash/centering machinery the env applies to real flight, printing
+every gate pass. `--save-masks N` renders N camera coverage masks along the tour
+(PNGs when matplotlib is available, `.npy` otherwise); it and `--view` imply --trace.
 
 Run from the repo root:
 
     uv run python examples/fly_figure_eight.py
+    uv run python examples/fly_figure_eight.py --dump my_dump.txt --overrides my_pins.txt
+    uv run python examples/fly_figure_eight.py --trace
     uv run python examples/fly_figure_eight.py --save-masks 6 --outdir masks
     uv run python examples/fly_figure_eight.py --view      # live viewer (skyflow[viz])
 
@@ -30,6 +38,54 @@ import numpy as np
 
 from skyflow.tasks.gate_course import GateCourseTask, GateTaskState
 from skyflow.vision.gates import figure_eight
+
+# Open-loop AETR flight plan for the sim mode (nominal plant, no policy).
+CLIMB_STICKS = (0.0, 0.0, 0.60, 0.0)  # level, throttle above hover
+HOLD_STICKS = (0.0, 0.0, 0.45, 0.0)  # level, near-hover throttle
+CLIMB_S = 1.0
+
+
+def fly_sim(args) -> None:
+    """Boot the benchmark env from the CLI dump and fly the open-loop plan."""
+    from skyflow import DomainRand, SimConfig, SkyFlowEnv
+
+    cfg = SimConfig(
+        num_envs=1,
+        task="figure_eight",
+        control="sticks",
+        firmware="cpu",  # self-contained: single instance, no CUDA needed
+        eeprom=str(args.dump),
+        eeprom_overrides=str(args.overrides) if args.overrides else None,
+        dr=DomainRand().off(),  # nominal vehicle: this demo shows the config seam
+    )
+    print(f"rendering {args.dump.name} (version-gated) and booting the CPU firmware…")
+    env = SkyFlowEnv(cfg)
+    print(f"  version gate passed — boot image: {env.eeprom_image}")
+
+    _obs, state = env.reset(jax.random.PRNGKey(args.seed))
+    jstep = jax.jit(env.step)
+    n_steps = round(args.seconds * cfg.control_hz)
+    n_climb = round(CLIMB_S * cfg.control_hz)
+    climb = jnp.asarray([CLIMB_STICKS], jnp.float32)
+    hold = jnp.asarray([HOLD_STICKS], jnp.float32)
+
+    z_max, passes = 0.0, 0
+    for t in range(1, n_steps + 1):
+        _obs, state, _reward, done, info = jstep(state, climb if t <= n_climb else hold)
+        z_max = max(z_max, float(state.plant[0, 2]))
+        passes += int(float(info.get("gate_passed", jnp.zeros(1))[0]) > 0.0)
+        if bool(done.any()):
+            # after an auto-reset the firmware re-arms only on LOW throttle — this
+            # open-loop plan never lowers it, so stop instead of flying a dead world
+            print(f"  done fired at step {t} — stopping (episode cull or task end)")
+            break
+        if t % int(cfg.control_hz / 2) == 0:
+            print(f"  t={t / cfg.control_hz:4.1f} s  z {float(state.plant[0, 2]):.2f} m")
+
+    print(f"peak altitude {z_max:.2f} m, gates passed {passes} (open loop — none expected)")
+    if z_max < 0.05:
+        raise SystemExit("firmware never lifted — check the dump and overrides")
+    print("the env flew the rendered drone config — seam OK")
 
 
 def waypoint_path(gates, step_m: float) -> np.ndarray:
@@ -90,23 +146,8 @@ def save_masks(gates, path: np.ndarray, count: int, outdir: Path) -> None:
         print(f"  wrote {target if imsave else target.with_suffix('.npy')}")
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[1])
-    ap.add_argument("--speed", type=float, default=2.0, help="tracer speed, m/s")
-    ap.add_argument("--dt", type=float, default=0.02, help="control step, s")
-    ap.add_argument("--save-masks", type=int, default=0, metavar="N",
-                    help="render N coverage masks along the tour")
-    ap.add_argument("--outdir", type=Path, default=Path("figure_eight_masks"),
-                    help="directory for --save-masks output")
-    ap.add_argument("--gates-per-lobe", type=int, default=3,
-                    help="k gates per lemniscate lobe (course has 2k gates)")
-    ap.add_argument("--view", action="store_true",
-                    help="open the live viewer, wall-clock paced (needs skyflow[viz])")
-    ap.add_argument("--headless", action="store_true", help="viewer on the SDL dummy driver")
-    ap.add_argument("--frames", type=int, default=None, help="close the viewer after N frames")
-    ap.add_argument("--shot", default=None, help="screenshot path saved when --frames ends")
-    args = ap.parse_args()
-
+def trace(args) -> None:
+    """The kinematic course tracer: waypoints → GateCourseTask.evaluate, no dynamics."""
     gates = figure_eight(args.gates_per_lobe)
     task = GateCourseTask(gates)
     path = waypoint_path(gates, step_m=args.speed * args.dt)
@@ -168,6 +209,38 @@ def main() -> None:
 
     if args.save_masks > 0:
         save_masks(gates, path, args.save_masks, args.outdir)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[1])
+    default_dump = Path(__file__).parent / "configs" / "stock_dump.txt"
+    ap.add_argument("--dump", type=Path, default=default_dump,
+                    help="sim mode: Betaflight CLI `dump all` file (default: stock dump)")
+    ap.add_argument("--overrides", type=Path, default=None,
+                    help="sim mode: sim-only CLI lines appended after the dump")
+    ap.add_argument("--seconds", type=float, default=2.0, help="sim mode: flight time, s")
+    ap.add_argument("--seed", type=int, default=0, help="sim mode: reset PRNG seed")
+    ap.add_argument("--trace", action="store_true",
+                    help="run the kinematic course tracer instead of the sim flight")
+    ap.add_argument("--speed", type=float, default=2.0, help="tracer speed, m/s")
+    ap.add_argument("--dt", type=float, default=0.02, help="tracer control step, s")
+    ap.add_argument("--save-masks", type=int, default=0, metavar="N",
+                    help="tracer: render N coverage masks along the tour (implies --trace)")
+    ap.add_argument("--outdir", type=Path, default=Path("figure_eight_masks"),
+                    help="directory for --save-masks output")
+    ap.add_argument("--gates-per-lobe", type=int, default=3,
+                    help="tracer: k gates per lemniscate lobe (course has 2k gates)")
+    ap.add_argument("--view", action="store_true",
+                    help="tracer: live viewer, wall-clock paced (implies --trace)")
+    ap.add_argument("--headless", action="store_true", help="viewer on the SDL dummy driver")
+    ap.add_argument("--frames", type=int, default=None, help="close the viewer after N frames")
+    ap.add_argument("--shot", default=None, help="screenshot path saved when --frames ends")
+    args = ap.parse_args()
+
+    if args.trace or args.view or args.save_masks > 0:
+        trace(args)
+    else:
+        fly_sim(args)
 
 
 if __name__ == "__main__":

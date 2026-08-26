@@ -5,7 +5,8 @@ The same window fed from a file: scrub (←/→ while paused), pause, 0.125-8x s
 pilot cam re-rendered from poses at whatever resolution you ask for — footage quality is
 chosen at watch time, not record time. Geometry replays exactly (the renderer is pure);
 the policy pane stays hidden because observations are not logged. `--mp4` exports through
-imageio when importable (soft dependency, like matplotlib in the examples).
+imageio when importable (soft dependency, like matplotlib in the examples); the export is
+resampled to `--mp4-fps` so it always plays wall-clock realtime whatever the capture rate.
 """
 
 import argparse
@@ -98,8 +99,14 @@ def replay(
     frames: int | None = None,
     shot: str | None = None,
     mp4: str | None = None,
+    mp4_fps: float = 60.0,
 ) -> None:
-    """Scrub/replay a flight.npz; `mp4` renders every logged row offscreen instead."""
+    """Scrub/replay a flight.npz; `mp4` renders the log offscreen to a video instead.
+
+    The mp4 is resampled onto a fixed `mp4_fps` playback clock, so it always plays
+    wall-clock realtime regardless of the log's capture Hz or stride: a denser log
+    drops rows, a sparser log holds frames.
+    """
     log = FlightLog.load(path)
     total = len(log)
 
@@ -108,16 +115,32 @@ def replay(
             import imageio.v3 as iio  # pyright: ignore[reportMissingImports] — soft dep: only the export path needs it
         except ImportError as e:
             raise ImportError("mp4 export needs imageio: pip install 'imageio[ffmpeg]'") from e
+        if mp4_fps <= 0.0:
+            raise ValueError(f"mp4_fps must be positive, got {mp4_fps}")
+        fps = float(mp4_fps)
+        n_out = max(1, round(total * log.dt * fps))
+        rows = np.minimum(np.round(np.arange(n_out) / (fps * log.dt)).astype(int), total - 1)
         viewer = viewer_for_log(log, pilot=pilot, headless=True, threaded=False)
-        grabs = []
-        for i in range(total):
-            viewer.push(_frame_at(log, i), force=True)
-            if not viewer.open:
-                break
-            grabs.append(viewer.grab())
+        grabs: list[np.ndarray] = []
+        last_row, grab = -1, None
+        for r in rows:
+            if int(r) != last_row:
+                viewer.push(_frame_at(log, int(r)), force=True)
+                if not viewer.open:
+                    break
+                grab = viewer.grab()
+                last_row = int(r)
+            if grab is not None:
+                grabs.append(grab)
         viewer.close()
-        iio.imwrite(mp4, np.stack(grabs), fps=round(1.0 / log.dt), codec="libx264")
-        print(f"wrote {mp4}: {len(grabs)} frames at {round(1.0 / log.dt)} fps")
+        if not grabs:
+            print(f"wrote nothing: viewer closed before the first frame of {mp4}")
+            return
+        iio.imwrite(mp4, np.stack(grabs), fps=fps, codec="libx264")
+        print(
+            f"wrote {mp4}: {len(grabs)} frames at {fps:g} fps "
+            f"({total} logged rows, {total * log.dt:.2f}s realtime)"
+        )
         return
 
     # synchronous: the scrub cursor needs every push drawn exactly once, in this thread
@@ -150,6 +173,9 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--frames", type=int, default=None, help="auto-close after N frames")
     ap.add_argument("--shot", default=None, help="screenshot path saved when --frames ends")
     ap.add_argument("--mp4", default=None, help="export the whole log to this mp4 instead")
+    ap.add_argument("--mp4-fps", type=float, default=60.0,
+                    help="mp4 playback fps; the video always plays realtime — "
+                         "log rows are resampled onto this clock")
     args = ap.parse_args(argv)
     pilot = None
     if args.pilot_cam:
@@ -164,6 +190,7 @@ def main(argv: list[str] | None = None) -> None:
         frames=args.frames,
         shot=args.shot,
         mp4=args.mp4,
+        mp4_fps=args.mp4_fps,
     )
 
 

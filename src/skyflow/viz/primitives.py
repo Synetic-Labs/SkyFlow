@@ -29,6 +29,7 @@ default scenes without importing skyflow.viz. This module is pure numpy: no pyga
 
 import dataclasses
 import json
+import warnings
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -232,13 +233,38 @@ class Marker:
         return dataclasses.replace(self, center=_vec(value, 3))
 
 
+#: sentinel: the bind PATH did not resolve (an attribute was absent) — distinct
+#: from a bind that resolved to a legitimate None (which means "hide me").
+_MISSING = object()
+
+#: bind paths already warned about (once per path per process, any frame source)
+_WARNED_PATHS: set[str] = set()
+
+
 def _lookup(frame: Any, path: str) -> Any:
     obj = frame
     for part in path.split("."):
-        obj = getattr(obj, part, None)
+        if not hasattr(obj, part):
+            return _MISSING
+        obj = getattr(obj, part)
         if obj is None:
             return None
     return obj
+
+
+def warn_missing_bind(path: str, root: Any) -> None:
+    """One warning per bind path per process: a path that does not resolve used to
+    hide its primitive with no signal — the wrong-pytree failure mode."""
+    if path in _WARNED_PATHS:
+        return
+    _WARNED_PATHS.add(path)
+    warnings.warn(
+        f"scene bind {path!r} does not resolve on {type(root).__name__} — the bound "
+        "primitive is HIDDEN. A typo, a renamed task-state field, or a raw sticks-mode "
+        "SimState.task_state (use env.task_state(state)) all land here.",
+        RuntimeWarning,
+        stacklevel=3,
+    )
 
 
 def resolve(prim: Any, frame: Any) -> Any | None:
@@ -246,12 +272,16 @@ def resolve(prim: Any, frame: Any) -> Any | None:
     The primitive to draw this frame: `prim` itself when unbound, else the bind result
     applied — None hides, a dict overrides fields, any other value goes to the
     primitive's own `_apply_bind`. Fleet-leading `[W, ...]` values take the focused
-    world's row first.
+    world's row first. An unresolvable PATH also hides, but warns once per path —
+    silence here shipped a six-vanishing-gates bug.
     """
     bind = prim.bind
     if bind is None:
         return prim
     val = bind(frame) if callable(bind) else _lookup(frame, bind)
+    if val is _MISSING:
+        warn_missing_bind(str(bind), frame)
+        return None
     if val is None:
         return None
     if isinstance(val, dict):

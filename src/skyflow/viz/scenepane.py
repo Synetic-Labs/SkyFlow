@@ -7,10 +7,13 @@ identical. The pane is a fixed wireframe projection (projection.py); primitives 
 already bind-resolved as data (primitives.py); glyphs come straight from the plant rows.
 
 The glyph is one visual language at every scale: a bright X-frame with four rotor rings
-whose accent arcs sweep with each rotor's actual speed, an accent heading wedge, and a
-plumb line + ground ring for altitude (the focused world only). Below ~12 px of arm length
-it collapses to the fleet mark — a dot with a heading tick — which is also what the
-whole-fleet scatter draws.
+whose accent power arcs grow just inside each ring out of its arm point (a full circle
+at full power), an accent heading line with an up-flag at the tip (body +z, 1/4 of the line:
+it breaks roll symmetry), and a plumb line + ground ring for altitude (the focused world
+only). Watched but unfocused worlds draw the fleet mark — a dot with the same heading
+line + up-flag — at EVERY zoom; `show_glyphs` (the viewer's X key) promotes them to full
+glyphs. The focused world always draws the full glyph (arm length floored for
+readability). The whole-fleet scatter draws bare dots.
 """
 
 import itertools
@@ -59,8 +62,8 @@ _BOX_EDGES = (
     (0, 4), (1, 5), (2, 6), (3, 7),
 )
 
-#: Arm length in pixels below which the glyph collapses to the fleet mark.
-_LOD_PX = 12.0
+#: Readability floor for a full glyph's arm length in pixels.
+_GLYPH_MIN_PX = 12.0
 #: Nominal glyph arm length in world metres (display size, not the physical airframe).
 _GLYPH_M = 0.35
 
@@ -154,20 +157,26 @@ def _draw_glyph(
     omg: np.ndarray,
     *,
     focus: bool,
+    full: bool,
 ) -> None:
     alpha = 1.0 if focus else 0.4
     body = palette.dim(palette.BRIGHT, alpha)
     accent = palette.dim(palette.ACCENT, alpha)
-    arm_px = float(np.clip(_GLYPH_M * proj.ppm, 4.0, 44.0))
     x, y = proj.point(pos)
 
     rot = quat_to_rot(quat)
-    if arm_px < _LOD_PX:  # fleet mark: dot + heading tick
-        heading = proj.points(np.stack([pos, pos + rot @ np.array([0.5, 0.0, 0.0])]))
+    if not full:
+        # fleet mark: dot + heading tick + an up-flag at the tip (body +z, 1/4 of the
+        # tick) — without the flag the mark is roll-symmetric and a roll reads as nothing
+        tip = pos + rot @ np.array([0.5, 0.0, 0.0])
+        flag = tip + rot @ np.array([0.0, 0.0, 0.125])
+        pts = proj.points(np.stack([pos, tip, flag]))
         pygame.draw.circle(surface, body, (x, y), 2.6)
-        pygame.draw.aaline(surface, body, tuple(heading[0]), tuple(heading[1]))
+        pygame.draw.aaline(surface, body, tuple(pts[0]), tuple(pts[1]))
+        pygame.draw.aaline(surface, body, tuple(pts[1]), tuple(pts[2]))
         return
 
+    arm_px = float(np.clip(_GLYPH_M * proj.ppm, _GLYPH_MIN_PX, 44.0))
     arm_m = arm_px / proj.ppm
     if focus:  # altitude cue: plumb line down to a ground ring
         gx, gy = proj.point((pos[0], pos[1], 0.0))
@@ -181,25 +190,26 @@ def _draw_glyph(
     for rw in rotors_w:
         seg = proj.points(np.stack([pos, rw]))
         pygame.draw.line(surface, body, tuple(seg[0]), tuple(seg[1]), 2)
-    for rw, o in zip(rotors_w, np.clip(omg, 0.0, 1.0), strict=True):
+    for d, rw, o in zip(_ROTORS, rotors_w, np.clip(omg, 0.0, 1.0), strict=True):
         ring = proj.points(rw + (_RING * (0.55 * arm_m)) @ rot.T)
         _polyline(surface, ring, body)
-        sweep = float(o) * 2.0 * math.pi * 0.92
-        if sweep > 0.05:
-            angles = np.linspace(-math.pi / 2.0, -math.pi / 2.0 + sweep, max(3, int(o * 20)))
+        if float(o) > 0.02:
+            # power arc just INSIDE the prop ring: it grows both ways out of the point
+            # where the arm meets the ring, and closes into a full circle at full power
+            a0 = math.atan2(-d[1], -d[0])
+            half = float(o) * math.pi
+            angles = np.linspace(a0 - half, a0 + half, max(3, int(o * 25)))
             arc_body = np.stack(
                 [np.cos(angles), np.sin(angles), np.zeros_like(angles)], axis=-1
             )
             arc = proj.points(rw + (arc_body * (0.36 * arm_m)) @ rot.T)
             _polyline(surface, arc, accent, width=2)
-    # heading wedge
+    # heading: the same forward line + up-flag the fleet mark carries (accent here)
     tip = pos + rot @ np.array([1.55 * arm_m, 0.0, 0.0])
-    b1 = pos + rot @ np.array([1.15 * arm_m, 0.18 * arm_m, 0.0])
-    b2 = pos + rot @ np.array([1.15 * arm_m, -0.18 * arm_m, 0.0])
-    head = proj.points(np.stack([pos, tip, b1, tip, b2]))
+    flag = tip + rot @ np.array([0.0, 0.0, 0.25 * 1.55 * arm_m])
+    head = proj.points(np.stack([pos, tip, flag]))
     pygame.draw.line(surface, accent, tuple(head[0]), tuple(head[1]), 2)
     pygame.draw.line(surface, accent, tuple(head[1]), tuple(head[2]), 2)
-    pygame.draw.line(surface, accent, tuple(head[3]), tuple(head[4]), 2)
     pygame.draw.circle(surface, body, (x, y), 3)
 
 
@@ -214,12 +224,16 @@ def draw_scene(
     omega_max: float | None = None,
     label: str | None = None,
     font=None,
+    show_glyphs: bool = False,
+    show_fleet: bool = True,
 ) -> None:
     """
     Draw the whole scene pane into `rect`: primitives (bind-resolved from `frame`,
     dispatched through the public registry), optional whole-fleet scatter, trails, then
     one glyph per watched world. `omega_max` normalises the rotor arcs (falls back to
-    the frame's own max). This function holds no task knowledge — accents and live
+    the frame's own max). `show_glyphs` draws full glyphs for every watched world;
+    the default keeps unfocused worlds as fleet marks at every zoom. `show_fleet`
+    gates the whole-fleet scatter even when the frame carries positions (the G key). This function holds no task knowledge — accents and live
     geometry arrive already resolved on the primitives themselves.
     """
     surface.set_clip(pygame.Rect(rect))
@@ -229,7 +243,7 @@ def draw_scene(
             color = palette.STYLES.get(prim.style, palette.WIRE)
             draw_fn_for(prim)(surface, proj, prim, color)
 
-        if frame.positions is not None:  # whole-fleet scatter (subsampled, fleet marks)
+        if show_fleet and frame.positions is not None:  # whole-fleet scatter dots
             stride = max(1, frame.positions.shape[0] // 4000)
             for p in proj.points(frame.positions[::stride]):
                 pygame.draw.circle(surface, palette.WIRE, (float(p[0]), float(p[1])), 2)
@@ -256,6 +270,7 @@ def draw_scene(
                 frame.quat[w],
                 omg[w] / norm,
                 focus=(w == frame.focus),
+                full=(w == frame.focus) or show_glyphs,
             )
             if frame.done is not None and bool(frame.done[w]):
                 x, y = proj.point(frame.pos[w])

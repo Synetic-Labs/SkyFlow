@@ -9,22 +9,27 @@ Config source of truth is CLI text. The eeprom `.bin` is a derived
 artifact: render it at use time and never commit it. Rendering is strict
 — any line the firmware rejects fails the render and is named.
 
-Render and boot a fleet (needs cudaflight >= 0.5.0):
+The env renders for you — point `SimConfig.eeprom` at the dump
+(`control="sticks"`, needs cudaflight >= 0.6.0, the pyproject floor):
 
 ```python
-from pathlib import Path
-import tempfile
+from skyflow import SimConfig, SkyFlowEnv
 
-import cudaflight
-from skyflow.firmware import GpuFirmwareFleet
-
-image = cudaflight.render_eeprom(Path(__file__).parent / "stock_dump.txt")
-with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-    f.write(image)
-    f.flush()
-    fw = GpuFirmwareFleet(4096, eeprom=f.name)
+env = SkyFlowEnv(SimConfig(
+    num_envs=4096,
+    control="sticks",
+    eeprom="examples/configs/stock_dump.txt",
+    eeprom_overrides="my_sim_overrides.txt",  # optional sim-only CLI lines
+))
+print(env.eeprom_image)  # the rendered boot image (temp file), for run logs
 ```
+
+Both fleet backends receive the same image; `examples/fly_figure_eight.py`
+(default mode) is the end-to-end demo. `eeprom_overrides` holds sim-only pins a real
+drone's dump needs on the SITL build (for example `set blackbox_device =
+NONE` — the sim has no SPI flash chip). The stock dump needs none.
 
 Why never commit a `.bin`: an image one parameter-group version behind
 the firmware does not fail at boot — Betaflight factory-resets the whole
-config, silently, and the fleet flies stock defaults.
+config, silently, and the fleet flies stock defaults. The render's
+version gate turns that silence into a construction-time error.

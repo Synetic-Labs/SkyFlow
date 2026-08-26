@@ -21,8 +21,8 @@ a nearer frame, marks the pixel either way. The mask is exact up to rasterizatio
 
 Frame contract (DESIGN.md §3): public entry points take the world z-up FLU pose —
 ``pos`` [F, 3] z-up metres, ``quat`` [F, 4] wxyz Hamilton body FLU → world — and per-world
-gate geometry in z-up world coordinates; the conversion to the NED/FRD internals
-happens exactly once per call (vision._ned, §3a). The camera looks along body +x pitched
+gate geometry in z-up world coordinates; poses convert to the NED/FRD internals
+through vision._ned at the entry points, and camera-axis rows flip inline below (§3a). The camera looks along body +x pitched
 by its mount; its image frame is the standard pinhole convention (x right, y down,
 z forward / optical axis).
 

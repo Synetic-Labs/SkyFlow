@@ -62,14 +62,14 @@ src/skyflow/
     replay.py           # python -m skyflow.viz.replay: scrub/replay host + mp4 export
 examples/
   fly_hover.py          # tiny PD hover demo (examples are demos, not package code)
-  fly_figure_eight.py   # scripted course fly-through + optional mask dump
+  fly_figure_eight.py   # benchmark env from a drone config (default) + course tracer (--trace)
   fly_teleop.py         # hand-fly control="sticks": keyboard / joystick / UDP + viewer
 tests/                  # pytest; §11 lists the required suites
 ```
 
 Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: the public git
 URL). Extras: `cuda` → `jax[cuda13]`;
-`firmware` → `cudaflight>=0.3.3` (public GitHub release-wheel URL source); `viz` → nothing but
+`firmware` → `cudaflight>=0.6.0` (public GitHub release-wheel URL source); `viz` → nothing but
 `pygame-ce>=2.5` (§13; the maintained fork, imports as `pygame`). Dev group: `pytest>=9`,
 `ruff>=0.16`. License MIT. Version 0.2.0.
 
@@ -89,8 +89,11 @@ URL). Extras: `cuda` → `jax[cuda13]`;
 ## 4. types.py (frozen)
 
 ```python
-class ObsTerm(NamedTuple): name: str; dim: int
+class ObsTerm(NamedTuple): name: str; dim: int; units: str = ""  # units+frame string; "" keeps 2-field call sites valid
 class ObsSpec(tuple[ObsTerm, ...]):        # .dim (sum), .layout (name→slice)
+class DRState(NamedTuple):   # per-episode DomainRand trait draws (§7); new traits go HERE, never as new SimState leaves
+    wind_mean: Array         # [F,3] f32 steady wind velocity, world frame, z = 0
+    imu_bias: Array          # [F,6] f32 additive IMU bias: accel(3) m/s², gyro(3) rad/s
 class TaskEval(NamedTuple):
     reward: Array            # [F] f32
     success: Array           # [F] bool
@@ -116,7 +119,9 @@ class Task(Protocol):
 plant [F,17] f32      # spec layout: x(3) v(3) q_wxyz(4) ω(3) Ω(4) rad/s
 params [F,P] f32      # per-world randomized flat spec params (pack_params order)
 key                   # jax PRNG key (env-owned; split every step)
-wind_vel [F,3]        # OU wind velocity state (world frame) — fed to statedot as v_wind
+wind_vel [F,3]        # OU gust deviation state (world frame), zero-mean; every consumer
+                      # sees the total wind dr_state.wind_mean + wind_vel
+dr_state: DRState     # per-episode trait draws (§7), redrawn at auto-reset respawn
 act_buf [F,D+1,4]     # transport-delay ring, newest first
 delay_idx [F] int32   # per-world delay draw
 last_action [F,4]
@@ -159,16 +164,56 @@ AIRFRAMES = {"crazyflie": ...}   # from skyflow_dynamics.spec.parameters.CRAZYFL
 register_airframe(name, airframe)
 ```
 
-Domain randomization: `sample_params(key, airframe, fleet, scale) -> [F,P]` —
-multiplicative log-uniform-style jitter `1 + scale*U(-b, b)` per SCHEMA key with a bracket
-table `DR_BRACKETS = {"mass": 0.10, "inertia": 0.15, "ct0/1/2": 0.15, "cq0/1/2": 0.15,
-"tau_m": 0.20, "k_d": 0.30, "k_z": 0.30, "r_prop": 0.0, ...}`. Keys NEVER jittered:
+Domain randomization: `sample_params(key, airframe, fleet, scale, brackets=None) -> [F,P]`
+— multiplicative log-uniform-style jitter `1 + scale*U(-b, b)` per stored entry with a
+bracket table `DR_BRACKETS = {"mass": 0.10, "inertia": 0.15, "ct0/1/2": 0.15,
+"cq0/1/2": 0.15, "tau_m": 0.20, "k_d": 0.30, "k_z": 0.30, "r_prop": 0.0, ...}`. Per-rotor
+entries (ct*/cq*, rotor geometry) draw independently, so motor-to-motor asymmetry is
+covered. `brackets` overrides individual half-widths per key — a measured airframe
+shrinks the brackets on its identified parameters; unknown or structural keys fail
+loudly. `max_bracket(brackets)` reports the largest effective half-width (the env
+validates `body_scale·max_bracket < 1` so factors stay positive). Keys NEVER jittered:
 `spin`, `axis`, `grav` (masked via `param_slices`). Zero-valued nominals stay zero
-(multiplicative). Same routine used at reset and auto-reset respawn.
+(multiplicative). Same routine used at reset and auto-reset respawn, driven by the §7
+DomainRand block: `scale = dr.scale·dr.body_scale`.
 
 ## 7. env.py — the platform
 
 ```python
+@dataclass(frozen=True)
+class DomainRand:                        # ALL training-robustness randomization; one instance = one setting
+    scale: float = 1.0                   # master dial over every continuous magnitude
+    # body — the vehicle (trait, §6 sample_params)
+    body_scale: float = 1.0              # multiplies the bracket half-widths / factor limits
+    brackets: dict | None = None         # per-key half-width overrides (§6); base table is
+                                         # DR_BRACKETS, or RESIDUAL_BRACKETS once factors is on
+    factors: dict | None = None          # correlated factor stage (§6): None = off (legacy
+                                         # independent draws, bit-exact); {} = FACTOR_LIMITS
+    # world — wind and shocks
+    wind_mean_mps: float = 0.0           # trait: steady horizontal wind, magnitude ceiling, m/s
+    wind_gust_mps: float = 0.0           # process: OU gust stationary std per axis, m/s
+    wind_tau_s: float = 0.5              # OU correlation time, s (a clock — never scaled)
+    poke_prob: float = 0.0               # event rate per control step per world (never scaled)
+    poke_force_n: float = 0.0; poke_torque_nm: float = 0.0   # magnitude ceilings
+    # actuation — command transport
+    delay_steps: tuple[int, int] = (0, 0)  # trait: (min, max) control steps (never scaled)
+    cmd_drop_prob: float = 0.0           # event: dropped packet holds the previous APPLIED
+                                         # command (the RX's ZOH; never scaled)
+    battery_sag: float = 0.0             # trait: rotor-speed-ceiling factor 1 - U(0, sag)
+    # sensing — the IMU/baro rows the firmware (§10) and IMU-observing tasks consume
+    gyro_noise_rps: float = 0.0; accel_noise_mps2: float = 0.0  # process: white, per 1 kHz sample
+    gyro_bias_rps: float = 0.0; accel_bias_mps2: float = 0.0    # trait: constant per-axis half-width
+    baro_noise_pa: float = 0.0           # process: white on the sticks baro row
+    # observation — applied by the ENV after task.observe (tasks own semantics, the env owns corruption)
+    obs_noise: float = 0.0               # LEGACY stress knob: unit-blind uniform half-width
+                                         # (mask-valued terms excluded); prefer obs_error
+    obs_error: dict | None = None        # L5 estimator-error model (errors.py; ERRORS.md)
+    # initial state — task variety, not model error (never scaled)
+    spawn_scale: float = 1.0             # forwarded to task builders that name spawn_dr_scale
+    def off(self): ...                   # scale=0, delay=(0,0), cmd_drop_prob=0,
+                                         # obs_error=None: bit-exact nominal (§11 test)
+    def effective(self): ...             # scale folded into every continuous magnitude
+
 @dataclass(frozen=True)
 class SimConfig:
     num_envs: int = 1024
@@ -179,18 +224,35 @@ class SimConfig:
     control_hz: float = 100.0          # physics fixed at physics_hz
     physics_hz: float = 1000.0         # sticks mode requires exactly 1000 (§10: 1 kHz firmware tick)
     differentiable: bool = False       # raises NotImplementedError("planned") if True
-    # randomization / disturbance
-    physics_dr_scale: float = 1.0
-    wind_std_mps: float = 0.0; wind_tau_s: float = 0.5      # OU wind VELOCITY process
-    poke_prob: float = 0.0; poke_force_n: float = 0.0; poke_torque_nm: float = 0.0
-    act_delay_min: int = 0; act_delay_max: int = 0          # control steps
-    spawn_dr_scale: float = 1.0
+    dr: DomainRand = DomainRand()      # ALL randomization / disturbance — nothing else randomizes
+    eeprom: str | None = None          # sticks boot config: CLI `dump all` path, rendered
+    eeprom_overrides: str | None = None  # at construction (§10); motors mode rejects both
     # episode / safety
     max_episode_steps: int = 1000; stuck_steps: int = 200
     bounds_xy_m: float = 20.0; bounds_z_m: float = 8.0
     max_speed_mps: float = 30.0; max_rate_rps: float = 50.0
     ground_tilt_limit_rad: float = pi/3
 ```
+
+**The DomainRand contract.** Robustness training = the sim world deliberately differing
+from the nominal model, in the ways the real world differs. Rules:
+
+- Randomness enters ONLY at loop boundaries — the params row (§6), exogenous forces, the
+  delay ring, the sensor rows (§2 sensors.py), the observation vector. The ODE and the
+  firmware stay exact: the controller you will fly is never randomized, its inputs are.
+- Three draw classes: **traits** (once per episode at reset/respawn, constant within it —
+  params row, steady wind, IMU bias, delay), **processes** (fresh every sample — gusts,
+  sensor noise, obs noise) and **events** (Bernoulli per control step — pokes). Trait
+  storage is the single `SimState.dr_state` leaf (§4).
+- Every knob is a magnitude in physical units. `scale` multiplies every continuous
+  magnitude and never touches clocks, event rates, integer delays or spawn spread;
+  `scale=0` with `delay_steps=(0,0)` (= `off()`) is bit-exact nominal — a §11 invariant.
+  Defaults reproduce a plain config: body DR on, everything else off.
+- One object = one robustness setting: a curriculum ramps `scale`; an outer controller
+  (learned DR later) emits a `DomainRand` per training phase — a phase change recompiles
+  once. Per-world adaptive levels, if ever needed, move into `DRState` as traced arrays;
+  the schema stays.
+- Defaults are honest: a knob exists only if it does something (no dead fields).
 
 `SkyFlowEnv(cfg)` exposes `fleet`, `obs_spec`, `obs_dim`, `act_dim=4`, `image_shape`,
 `decimation` (=round(physics_hz/control_hz)), `dt_control`, and:
@@ -206,27 +268,67 @@ Pure functions; the caller jits. **Step pipeline (order is normative):**
 
 1. Split `state.key`. Push `action` into `act_buf`; read delayed action per `delay_idx`.
 2. Command map: motors mode → `u = (a+1)/2`, `Ω_c = throttle_to_omega(u, ...)`.
-3. Advance OU wind velocity (exact discretization: decay `exp(-dt/τ)` + kick).
-4. Poke sampling: with prob `poke_prob` per control step draw world-frame `F_ext` and
+3. Advance the OU gust deviation (exact discretization: decay `exp(-dt/τ)` + kick).
+   Every consumer sees the total wind `dr_state.wind_mean + wind_vel`.
+4. Poke sampling: with prob `dr.poke_prob` per control step draw world-frame `F_ext` and
    body `τ_ext` (uniform ball · magnitudes); else zeros. These pass through the backend's
    exogenous inputs — never write velocity state directly.
 5. `lax.scan` over `decimation` substeps: `plant = dynamics.substep(...)` (ZOH on Ω_c,
-   wind, F_ext, τ_ext) then ground contact (§8).
+   wind, F_ext, τ_ext) then ground contact (§8). Sticks mode corrupts each substep's
+   sensor rows per DomainRand (bias + fresh per-sample noise) BEFORE the firmware tick —
+   the firmware filters what the real one filters (§10).
 6. Airborne latch; crash set: flyaway (|x|,|y| > bounds_xy, z > bounds_z, speed >
    max_speed, rate > max_rate), ground crash (z < 0.05 and airborne and (descent > 1 m/s or
    tilt > limit)). Task `evaluate` on (prev_plant, plant): reward, success, task crash.
 7. `terminated = crash or task_crash or (success and success_terminates)`;
    `truncated = steps ≥ max_episode_steps or stuck`; `done = terminated or truncated`.
-8. Observe: `imu = sensors.measure(...)`; `obs, task_state = task.observe(...)`.
-9. Auto-reset in-jit: for done worlds — fresh spawn (task), fresh params (DR), fresh
-   delay draw, cleared buffers/wind, re-observe with `fresh_spawn=True`; blend all state
-   leaves with `tree_where(done, reset_leaf, leaf)`. Pre-reset obs goes to
-   `info["final_obs"]`; `info["terminated"]/["truncated"]` are the pre-reset flags.
+8. Observe: `imu = sensors.measure(...)` with DomainRand bias/noise;
+   `obs, task_state = task.observe(...)`; then the env adds `dr.obs_noise`.
+9. Auto-reset in-jit: for done worlds — fresh spawn (task), fresh DomainRand draws
+   (params §6, traits `dr_state`, delay), cleared buffers/gust, re-observe with
+   `fresh_spawn=True`; blend the per-world state leaves with
+   `tree_where(done, reset_leaf, leaf)`. Two exclusions, by design: the step-10 EMA
+   leaves (cross-episode, fleet-global) pass through unblended, and the sticks
+   firmware pair is restored whole through `FirmwareFleet.reset(mask)` — the fleet
+   masks internally. Pre-reset obs goes to `info["final_obs"]`;
+   `info["terminated"]/["truncated"]` are the pre-reset flags.
 10. Episode bookkeeping EMAs for `metrics`: on the pre-reset done rows, update the
     SimState EMA leaves (§4) — outcome fractions (crash / success-at-end / pure
     truncation) and completed-episode return/length — with the done-row means, decayed
     `0.99` per completed episode (`alpha = 0.99^n_done`; no-op when nothing finished).
     EMAs start at 0 after `reset` and warm up from there.
+
+### 7.1 DR coverage matrix (the completeness rule)
+
+Every input that crosses into the control loop gets one row: randomized, fitted
+constant, declared exact, or roadmap. "Declared exact" is an allowed answer; silence is
+not. Adding a new input to `env.step` obliges a new row.
+
+| Real-world variation | Knob | Status |
+|---|---|---|
+| mass, inertia, thrust/torque curves, motor τ, aero terms | `body_scale` × brackets (§6) | randomized (default on) |
+| motor-to-motor asymmetry (worn/weak motor) | per-rotor ct*/cq* entries draw independently (§6) | randomized |
+| per-motor response spread | — (`tau_m` is one scalar) | roadmap (spec change via Dynamics INTAKE) |
+| steady wind | `wind_mean_mps` | randomized |
+| gusts | `wind_gust_mps`, `wind_tau_s` | randomized |
+| turbulence spectrum (Dryden / von Kármán) | — | roadmap |
+| collisions, bumps, prop wash from others | `poke_prob/force/torque` | randomized (crude, by design) |
+| command transport delay | `delay_steps` | randomized |
+| dropped command packets (link) | `cmd_drop_prob` (hold-last, the RX's ZOH) | randomized |
+| firmware code + tune | none | declared exact — the §10 point; inputs get randomized, never the controller |
+| IMU white noise | `gyro_noise_rps`, `accel_noise_mps2` | randomized |
+| IMU constant bias | `gyro_bias_rps`, `accel_bias_mps2` | randomized (firmware gyro-cal absorbs gyro bias at boot, like hardware) |
+| IMU bias walk, staleness, scale/misalignment | — | roadmap |
+| RPM-tracked vibration harmonics + RPM filter | — | roadmap (researched, parked in ROADMAP.md) |
+| baro noise | `baro_noise_pa` | randomized (sticks) |
+| battery voltage sag | `battery_sag` (per-episode rotor-speed-ceiling draw) | randomized |
+| state-estimate error at the policy | `obs_error` (L5 model, ERRORS.md); `obs_noise` legacy | randomized (env-applied) |
+| initial state spread | `spawn_scale` (+ task spawn kwargs) | randomized — task variety, outside `scale` |
+| gravity, geometry, spin signs, thrust axes | NEVER_JITTER (§6) | declared exact |
+
+Sensing knobs bite where sensors are consumed: always in sticks mode (the firmware
+reads the rows every substep); in motors mode only for tasks that observe the IMU
+(hover observes exact state).
 
 ## 8. Ground contact (harness bookkeeping, not physics)
 
@@ -239,18 +341,24 @@ the spec later.
 
 **hover** — spawn on ground pad (motors near idle) with jittered XY; goal setpoint drawn
 in a box, resampled every `goal_hold_s`; obs = `[rel_pos(3), vel(3), rot_matrix(9),
-last_action(4)]` = 19, with optional uniform obs noise; reward per control step:
+last_action(4)]` = 19 (observation corruption is env-side: §7 `DomainRand.obs_noise` —
+tasks own semantics, the env owns corruption); reward per control step:
 `w_pos·exp(-3·d) + w_hold·exp(-50·d) - w_vel·|v| - w_rate·|ω| + progress(d_prev² - d²)`;
 success `d < 0.1 m` (does not terminate); task crash: leaving the safe box.
 
 **figure_eight** — the registered name of the generic `GateCourseTask`; course = `GateSet`
-from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder: the
-research-canonical figure-8 — a GERONO lemniscate (x = a·sin t, y = ½a·sin 2t, 2:1
-footprint, round lobes) through 2·k gates, alternating crossing directions at the center.
-The 6-gate default (k = 3) reproduces the standard layout — one apex gate per lobe plus
-four gates on the crossover diagonals (cf. the 6-gate Figure-8 of Xing et al., RA-L 2025;
-same curve as crazyflow's figure-eight trajectory). Spawn: podium behind gate 1 or spread
-across gates (curriculum knob). Active-gate
+from `vision/gates.py`, defaulting to the shipped `figure_eight(...)` builder: two
+ellipse lobes (semi-axes `lobe_radius_m` x `lobe_half_width_m`) tangent at a gate-free
+crossover, 2·k gates tangent-yawed at the ellipse angles φ = j·2π/(k+1) per lobe,
+alternating crossing directions at the center. The 6-gate default is the nav-jax
+FigureEight map EXACTLY (z-up from its NED rows, nav-jax tests/test_gate_spawn.py):
+shoulders (±5, ∓3) m flown straight along ±x, apexes (±10, 0) flown along +y, 1.5 m
+altitude, 20 x 6 m footprint; gate 1 is the right lobe's lower shoulder. Spawn: podium pad ON
+THE GROUND (z = 0, resting, airborne latch cold — arm at idle, spool, lift; a raised pad
+free-falls during spool-up and trips the §7 ground-impact terminal) facing gate 1 — the
+shipped course pads the centre of the cluster OPPOSITE gate 1 (the canonical start;
+`podium_pos_m` / `podium_height_m` override, custom courses default behind gate 1) — or
+spread across gates (curriculum knob). Active-gate
 progress: `r = w_prog·(d_prev - d)` toward the pre-gate point + pass credit
 `w_gate·centering` on crossing (from `classify_crossings`; miss/frame-hit = task crash),
 minus rate penalty. Obs (state mode): `[gate_rel(3), gate_normal(3), next_gate_rel(3),
@@ -294,11 +402,33 @@ SkyFlow therefore ships:
   falling back to CPU with a `warnings.warn` when GPU construction fails.
 - Injection: `SkyFlowEnv(cfg, firmware_fleet=...)` accepts any FirmwareFleet and
   overrides `cfg.firmware`.
+- Boot config (`SimConfig.eeprom` / `eeprom_overrides`): `eeprom` is a path to a drone's
+  Betaflight CLI `dump all` text — the config source of truth (examples/configs/README.md).
+  `_build_fleet` renders it at construction via `cudaflight.render_eeprom` (version-gated
+  strict round-trip on one throwaway CPU boot, BEFORE the fleet exists — the CPU library
+  allows one live fleet per process) and hands the image to either backend.
+  `eeprom_overrides` is an optional file of sim-only CLI lines appended after the dump
+  (e.g. `blackbox_device = NONE`). A stale or foreign dump fails at construction — never a
+  silent factory reset to stock defaults. The rendered temp-file path lands on
+  `env.eeprom_image` for run logs. Fail-loud guards: overrides without a dump, eeprom in
+  motors mode, eeprom plus an injected `firmware_fleet` (that fleet already booted its own
+  config), missing files. `eeprom=None` boots the wheel's stock defaults. The dump header
+  also SELECTS the firmware base (cudaflight >= 0.6.0): a dump built from another
+  Betaflight base than the installed wheel picks its (libcpuflight.so, fw.fatbin) pair
+  from the cudaflight bundle cache — fetched once with `python -m cudaflight.bases <rev>`;
+  a cache miss fails at construction naming that command. A norevision dump or the
+  installed base uses the wheel's embedded binaries. Provenance: `env.firmware_base`.
 
 Sticks substep order (normative): synth sensors
 (FLU→FRD flip; baro from z-up altitude, isothermal 101325 Pa / 8434 m — a harness-side
-sensor model, documented as such) → optional inverse board-align yaw rotation →
+sensor model, documented as such) →
 `fw_step` → motors [0,1] reordered by `motor_perm` → motor duties feed the throttle map
+(the inverse board-align pre-rotation is PLANNED, not implemented — TECH_DEBT F8: a
+dump whose effective `align_board_*` is nonzero WARNS at construction, because the
+firmware may then read rotated sensor rows; pin it to 0 in `eeprom_overrides` for the
+craft-aligned virtual board. `yaw_motors_reversed = ON` is accepted as-is — the plant's
+spin signs must match the physical prop direction; a consistency check against the
+airframe is open, TECH_DEBT C13/F9)
 as u (ZOH for that 1 ms substep). `control="sticks"` requires `physics_hz == 1000`: each
 physics substep pairs one plant step with exactly one 1 kHz firmware tick (the firmware's
 virtual clock advances 1 ms per tick, unconditionally), so any other rate would silently
@@ -315,9 +445,17 @@ cudaflight importable → ImportError with install guidance at construction.
   rollout); done semantics; final_obs correctness (pre-reset obs); auto-reset isolation
   (non-done worlds bit-identical); delay buffer (action takes effect exactly k steps
   late, k=delay); ZOH (constant action ⇒ constant Ω_c across substeps).
-- `test_disturbances.py` — OU wind stationary std ≈ configured; poke rate ≈ poke_prob;
+- `test_disturbances.py` — OU gust stationary std ≈ configured; poke rate ≈ poke_prob;
   wind actually enters aerodynamics (drag response differs with wind on a vehicle with
   c_D > 0), zeros when disabled.
+- `test_domainrand.py` — off()/scale=0 are bit-exact nominal (params, traits, rollout);
+  effective() folds the master scale into magnitudes only; bracket overrides pin keys
+  and reject unknown/structural keys; body positivity guard; steady-wind trait is
+  horizontal, bounded, reaches the aerodynamics, and is redrawn at respawn (with IMU
+  bias); sensors.measure bias/noise hooks; obs noise is env-applied and bounded; sticks
+  mode — corrupted rows reach the firmware boundary (recorder fleet): exact ⇒ zero gyro
+  rows on the pad, noise varies per sample, bias holds within an episode, baro noise
+  varies.
 - `test_ground.py` — no penetration; resting vehicle stays; spawned-on-pad hover task
   takes off under full throttle.
 - `test_task_hover.py` / `test_task_gate.py` — hover: spawn/obs/reward shapes, reward increases as distance falls;
@@ -331,6 +469,12 @@ cudaflight importable → ImportError with install guidance at construction.
 - `test_firmware.py` — skipped unless cudaflight importable; arm→spin-up→hover smoke.
   GPU-fleet twin marked `gpu` (skipped without a CUDA device): same smoke through
   `GpuFirmwareFleet`, plus snapshot restore determinism and the `firmware="auto"` pick.
+- `test_eeprom.py` — own module (test_firmware.py keeps a module-scoped fleet open, and
+  the render needs a fleet-free process): construction-time guards (overrides without a
+  dump, eeprom in motors mode, eeprom + injected fleet, missing file); stock dump renders,
+  boots, and climbs (`env.eeprom_image` set); version gate rejects a foreign-release dump;
+  base resolution (installed base / norevision → embedded binaries, foreign base → bundle
+  cache or a construction error naming the fetch command).
 - `test_jit.py` — one jitted 50-step rollout, no NaN; second call does not retrace
   (jit cache check); vision task jitted rollout smoke.
 - `test_viz.py` — pygame-free half: primitive serde round-trip (bind is live-only);
@@ -339,6 +483,20 @@ cudaflight importable → ImportError with install guidance at construction.
 - `test_viz_panes.py` — pygame half (skipped unless pygame importable; SDL dummy video
   driver): scene/HUD builders draw onto a plain surface; headless Viewer smoke over a real
   hover rollout with a screenshot; headless replay smoke from a saved flight.npz.
+- `test_registry.py` — task/airframe registry contracts (unknown names, double register).
+- `test_domainrand_factors.py` — correlated factor stage (§6): limits, guards, structure.
+- `test_battery_sag.py` — sag trait draw, thrust-to-weight guard re-run, off ⇒ bit-exact.
+- `test_delay_link.py` / `test_obs_error.py` — L3 link (drops) and L5 estimator error
+  (ERRORS.md): off-knobs bit-exact, on-knobs shaped and bounded.
+- `test_lifecycle.py` — close()/context manager; one-CPU-fleet guard; use-after-close
+  raises; eeprom image reaping.
+- `test_task_carry.py` — SimState.task_state raises on the sticks carry; the accessor
+  unwraps in both modes; sticks step rejects a bare task pytree.
+- `test_config_guards.py` — negative construction tests (num_envs, firmware value,
+  negative DR magnitudes, act_dim mismatch, motor_perm).
+- `test_sticks_axis.py` — the production axis: sticks + gate task on the real CPU SITL,
+  multi-step jitted with auto-reset; FlightLog bind round-trip; snapshot through the
+  accessor (and the raw-carry read raising); both-control-modes contract fixture.
 
 ## 12. Deferred (roadmap, do not build now)
 
@@ -367,7 +525,8 @@ Boundary: viz SHOWS what the vehicle did and sensed — it never decides it. Nor
 Four layers, strict about what each may know:
 
 1. **Vehicle truth — always drawn.** Pose, attitude, rotor speeds, trails, glyphs, the
-   fixed HUD instruments (sticks/action, motors, attitude, heading, speed/altitude). All from
+   fixed HUD instruments (sticks/action + arm lamp, motors, attitude, heading, speed and
+   climb dials, episode-length bars). All from
    `plant` and the step outputs. No task knowledge.
 2. **World geometry — always data.** Scene primitives. Tasks and users contribute them;
    the pane only draws. Extension is public: `register_primitive(cls, draw_fn)` — the
