@@ -51,6 +51,7 @@ import jax.numpy as jnp
 from skyflow import dynamics, errors, sensors
 from skyflow.params import (
     AIRFRAMES,
+    apply_cog_offset,
     apply_tw_guard,
     factor_floor,
     max_bracket,
@@ -110,14 +111,30 @@ class DomainRand:
     # independent draws, bit-exact); {} = on with FACTOR_LIMITS defaults;
     # {group: (lo, hi)} overrides one group's limits. Measured 2026-08-22: at equal
     # ±20% width on ct2+cq2 the factor structure flies 0.88, independent draws 0.12.
+    cog_offset_m: float = 0.0  # trait: CoG shift half-width per axis, m — applied as a
+    # COMMON-MODE translation of all rotor positions (battery placement, the most
+    # common real asymmetry). Never per-rotor jitter. Parallel-axis inertia change is
+    # second order at mm-cm scale and stays unmodeled (ERRORS.md).
 
     # -- world: wind and shocks ------------------------------------------------------
     wind_mean_mps: float = 0.0  # trait: steady horizontal wind, magnitude ceiling, m/s
     wind_gust_mps: float = 0.0  # process: OU gust stationary std per axis, m/s
     wind_tau_s: float = 0.5  # OU gust correlation time, s (a clock — never scaled)
-    poke_prob: float = 0.0  # event rate per control step per world (never scaled)
-    poke_force_n: float = 0.0  # world-frame poke force magnitude ceiling, N
+    poke_prob: float = 0.0  # event rate per control step per world (never scaled).
+    # With poke_dur_steps > 1 this is the START rate while no poke is active.
+    poke_force_n: float = 0.0  # world-frame poke force magnitude ceiling, N (absolute —
+    # prefer poke_force_frac below: the same newtons are a different disturbance class
+    # on every airframe)
     poke_torque_nm: float = 0.0  # body-frame poke torque magnitude ceiling, N·m
+    poke_force_frac: float = 0.0  # weight-relative ceiling: fraction of the NOMINAL
+    # airframe weight m·g. One value is the same physical shove on ANY quadrotor.
+    # Exclusive with poke_force_n (setting both raises).
+    poke_torque_frac: float = 0.0  # fraction of m·g·r_arm (nominal mean rotor radius);
+    # exclusive with poke_torque_nm
+    poke_dur_steps: float = 1.0  # mean poke duration, control steps (exponential draw,
+    # min 1). 1 = the legacy single-step impulse, bit-exact. Real contacts and prop-wash
+    # hits last 50-300 ms; a 10 ms impulse is mostly absorbed by the rotor spool.
+    # A clock — never scaled.
 
     # -- actuation: command transport (trait) ----------------------------------------
     delay_steps: tuple[int, int] = (0, 0)  # (min, max) control steps (never scaled)
@@ -135,6 +152,16 @@ class DomainRand:
     # command over 3.71->3.30 V; ~13% across a full pack. The firmware sees nothing —
     # full stick simply buys less rotor speed, exactly like a tired pack.
     battery_sag: float = 0.0
+    # start-charge skew: sag_start = battery_sag * U(0,1)**shape. shape > 1 weights
+    # episodes toward a FULL pack (sag near 0) with rare deep-sag starts — most real
+    # flights begin on a fresh charge. 1 = legacy uniform, bit-exact. Never scaled
+    # (a distribution shape).
+    battery_sag_shape: float = 1.0
+    # within-episode discharge: the per-world ceiling declines by this fraction of
+    # rotor_speed_max per FLIGHT SECOND, floored at rotor_speed_min. Measured Air75 II
+    # battery_hover: -9.6% over 282 s hover ≈ 3.4e-4 /s. The T/W guard prices the
+    # START ceiling only — a long flight may honestly sag below hover.
+    battery_sag_rate_ps: float = 0.0
 
     # -- sensing: the IMU/baro rows the firmware and IMU-observing tasks consume ------
     gyro_noise_rps: float = 0.0  # process: white per-sample std, rad/s
@@ -142,6 +169,19 @@ class DomainRand:
     gyro_bias_rps: float = 0.0  # trait: constant per-axis bias half-width, rad/s
     accel_bias_mps2: float = 0.0  # trait: constant per-axis bias half-width, m/s²
     baro_noise_pa: float = 0.0  # process: white per-sample std on the baro row, Pa
+    gyro_sat_rps: float = 0.0  # gyro full-scale clip, rad/s (0 = off). The BMI270 at
+    # Betaflight's ±2000 dps range saturates at 34.9 rad/s; crash tumbles and yaw spins
+    # exceed it, so the real firmware sees a clipped, useless gyro there while an
+    # unclipped sim gyro can "see" recoveries no real vehicle can fly. A hardware
+    # constant — never scaled.
+    gyro_scale_frac: float = 0.0  # trait: per-axis gyro scale-factor error half-width
+    # (BMI270 sensitivity tolerance class ±1% -> 0.01). At a 500 dps commanded rate a
+    # 1% gain error is a 5 dps rate error the loop must absorb.
+    imu_offset_m: float = 0.0  # trait: IMU position offset from the body origin,
+    # per-axis half-width, m (real builds: mm class). The generated imu_fn prices the
+    # lever-arm terms; this trait unpins its constant.
+    imu_mount_deg: float = 0.0  # trait: IMU mounting misalignment, per-axis rotation-
+    # vector half-width, DEGREES (real builds: ~1 deg class)
 
     # -- observation: the policy vector (applied by the env after task.observe) -------
     obs_noise: float = 0.0  # process: additive uniform half-width. LEGACY stress
@@ -161,6 +201,7 @@ class DomainRand:
         """This setting with all model error and corruption off: bit-exact nominal."""
         return replace(
             self, scale=0.0, delay_steps=(0, 0), cmd_drop_prob=0.0, obs_error=None,
+            gyro_sat_rps=0.0,
         )
 
     def effective(self) -> "DomainRand":
@@ -189,6 +230,13 @@ class DomainRand:
             baro_noise_pa=s * self.baro_noise_pa,
             obs_noise=s * self.obs_noise,
             battery_sag=s * self.battery_sag,
+            battery_sag_rate_ps=s * self.battery_sag_rate_ps,
+            poke_force_frac=s * self.poke_force_frac,
+            poke_torque_frac=s * self.poke_torque_frac,
+            gyro_scale_frac=s * self.gyro_scale_frac,
+            imu_offset_m=s * self.imu_offset_m,
+            imu_mount_deg=s * self.imu_mount_deg,
+            cog_offset_m=s * self.cog_offset_m,
         )
 
 
@@ -402,8 +450,11 @@ class SkyFlowEnv:
             raise ValueError(f"dr.poke_prob must be in [0,1], got {dr.poke_prob}")
         for name in (
             "scale", "body_scale", "wind_mean_mps", "wind_gust_mps", "poke_force_n",
-            "poke_torque_nm", "gyro_noise_rps", "accel_noise_mps2", "gyro_bias_rps",
-            "accel_bias_mps2", "baro_noise_pa", "obs_noise", "spawn_scale",
+            "poke_torque_nm", "poke_force_frac", "poke_torque_frac",
+            "gyro_noise_rps", "accel_noise_mps2", "gyro_bias_rps",
+            "accel_bias_mps2", "baro_noise_pa", "gyro_sat_rps", "gyro_scale_frac",
+            "imu_offset_m", "imu_mount_deg", "cog_offset_m", "battery_sag_rate_ps",
+            "obs_noise", "spawn_scale",
         ):
             if getattr(cfg.dr, name) < 0.0:
                 raise ValueError(f"dr.{name} must be >= 0, got {getattr(cfg.dr, name)}")
@@ -424,6 +475,28 @@ class SkyFlowEnv:
             raise ValueError(
                 f"dr.scale·dr.battery_sag must be in [0, 1), got {dr.battery_sag}: "
                 "a sagged ceiling of zero or below stops every rotor"
+            )
+        if dr.battery_sag_shape <= 0.0:
+            raise ValueError(
+                f"dr.battery_sag_shape must be > 0, got {dr.battery_sag_shape}"
+            )
+        if dr.poke_dur_steps < 1.0:
+            raise ValueError(
+                f"dr.poke_dur_steps must be >= 1, got {dr.poke_dur_steps}"
+            )
+        if dr.poke_force_n > 0.0 and dr.poke_force_frac > 0.0:
+            raise ValueError(
+                "set dr.poke_force_n OR dr.poke_force_frac, not both — one truth for "
+                "the poke magnitude"
+            )
+        if dr.poke_torque_nm > 0.0 and dr.poke_torque_frac > 0.0:
+            raise ValueError(
+                "set dr.poke_torque_nm OR dr.poke_torque_frac, not both"
+            )
+        if dr.gyro_scale_frac >= 1.0:
+            raise ValueError(
+                f"dr.scale·dr.gyro_scale_frac must be < 1, got {dr.gyro_scale_frac}: "
+                "a gain of zero or below flips the rate loop"
             )
         if not 0.0 <= dr.cmd_drop_prob < 1.0:
             raise ValueError(
@@ -454,6 +527,31 @@ class SkyFlowEnv:
         # worlds that could not take off truncated as `stuck` with no diagnostic.
         # sag=0 keeps every path bit-exact (the re-run is skipped).
         self._tw_reguard = dr.battery_sag > 0.0
+        # Weight-relative pokes: the frac knobs resolve against the NOMINAL airframe
+        # (drawn mass varies per world; the expected disturbance class scales with the
+        # vehicle, not with this episode's draw). r_arm = mean planar rotor radius.
+        _v = self.airframe.values
+        _m_g = float(_v["mass"]) * abs(float(_v["grav"]))
+        _r_arm = float(
+            sum(math.hypot(r[0], r[1]) for r in _v["rotor_pos"]) / len(_v["rotor_pos"])
+        )
+        self._poke_force_n = (
+            dr.poke_force_frac * _m_g if dr.poke_force_frac > 0.0 else dr.poke_force_n
+        )
+        self._poke_torque_nm = (
+            dr.poke_torque_frac * _m_g * _r_arm
+            if dr.poke_torque_frac > 0.0 else dr.poke_torque_nm
+        )
+        self._poke_hold = dr.poke_dur_steps > 1.0
+        # Within-episode discharge rate, rad/s per control step (0 = off).
+        self._sag_rate = (
+            dr.battery_sag_rate_ps * self.airframe.rotor_speed_max
+            * (decimation / cfg.physics_hz)
+            if dr.battery_sag_rate_ps > 0.0 else 0.0
+        )
+        self._mount_on = dr.imu_offset_m > 0.0 or dr.imu_mount_deg > 0.0
+        self._gscale_on = dr.gyro_scale_frac > 0.0
+        self._cog_on = dr.cog_offset_m > 0.0
         self._nominal_row = jnp.asarray(
             dynamics.pack_params(self.airframe.values), jnp.float32
         )
@@ -730,7 +828,12 @@ class SkyFlowEnv:
         # Battery sag: one-sided ceiling factor per world (a pack only sags). sag=0
         # gives exactly the airframe ceiling, so the leaf always exists and stays inert.
         k_sag = jax.random.fold_in(k_bias, 1)
-        sag = dr.battery_sag * jax.random.uniform(k_sag, (f,), jnp.float32, 0.0, 1.0)
+        u_sag = jax.random.uniform(k_sag, (f,), jnp.float32, 0.0, 1.0)
+        if dr.battery_sag_shape != 1.0:
+            # Start-charge skew: shape > 1 concentrates mass near a FULL pack (sag ~ 0)
+            # with rare deep-sag starts. shape == 1 skips the power for bit-exactness.
+            u_sag = u_sag ** dr.battery_sag_shape
+        sag = dr.battery_sag * u_sag
         w_max = self.airframe.rotor_speed_max * (1.0 - sag)
         # Estimator-error bias trait (errors.py channel groups). fold_in keeps the
         # legacy RNG stream untouched; feature off gives exactly-zero columns.
@@ -738,8 +841,34 @@ class SkyFlowEnv:
             est_bias = errors.draw_bias(jax.random.fold_in(k_bias, 2), f, self._est)
         else:
             est_bias = jnp.zeros((f, 12), jnp.float32)
+        # L4 geometry/gain traits + L1 CoG trait — fold_in streams, inert when off.
+        if self._gscale_on:
+            gyro_scale = 1.0 + dr.gyro_scale_frac * jax.random.uniform(
+                jax.random.fold_in(k_bias, 3), (f, 3), jnp.float32, -1.0, 1.0
+            )
+        else:
+            gyro_scale = jnp.ones((f, 3), jnp.float32)
+        if self._mount_on:
+            imu_offset = dr.imu_offset_m * jax.random.uniform(
+                jax.random.fold_in(k_bias, 4), (f, 3), jnp.float32, -1.0, 1.0
+            )
+            rotvec = math.radians(dr.imu_mount_deg) * jax.random.uniform(
+                jax.random.fold_in(k_bias, 5), (f, 3), jnp.float32, -1.0, 1.0
+            )
+            imu_mount = errors.rotvec_to_mat(rotvec)
+        else:
+            imu_offset = jnp.zeros((f, 3), jnp.float32)
+            imu_mount = jnp.broadcast_to(jnp.eye(3, dtype=jnp.float32).reshape(9), (f, 9))
+        if self._cog_on:
+            cog_offset = dr.cog_offset_m * jax.random.uniform(
+                jax.random.fold_in(k_bias, 6), (f, 3), jnp.float32, -1.0, 1.0
+            )
+        else:
+            cog_offset = jnp.zeros((f, 3), jnp.float32)
         return DRState(
-            wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max, est_bias=est_bias
+            wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max, est_bias=est_bias,
+            gyro_scale=gyro_scale, imu_offset=imu_offset, imu_mount=imu_mount,
+            cog_offset=cog_offset,
         )
 
     def _measure(
@@ -755,6 +884,10 @@ class SkyFlowEnv:
             accel_noise_std=dr.accel_noise_mps2,
             gyro_noise_std=dr.gyro_noise_rps,
             imu_bias=dr_state.imu_bias if self._imu_bias_on else None,
+            imu_offset=dr_state.imu_offset if self._mount_on else None,
+            imu_mount=dr_state.imu_mount if self._mount_on else None,
+            gyro_scale=dr_state.gyro_scale if self._gscale_on else None,
+            gyro_sat_rps=dr.gyro_sat_rps,
         )
 
     def _observe(
@@ -810,6 +943,8 @@ class SkyFlowEnv:
         dr_state = self._draw_traits(k_traits, f)
         if self._tw_reguard:
             params = apply_tw_guard(params, self._nominal_row, dr_state.w_max)
+        if self._cog_on:
+            params = apply_cog_offset(params, dr_state.cog_offset)
         plant, task_state = self.task.spawn(k_spawn, f, params)
         plant = plant.astype(jnp.float32)
         delay_idx = jax.random.randint(
@@ -855,6 +990,9 @@ class SkyFlowEnv:
             est_ou=jnp.zeros((f, 12), jnp.float32),
             est_hold=jnp.zeros(f, jnp.int32),
             est_held=emitted,
+            poke_left=jnp.zeros(f, jnp.int32),
+            poke_fext=jnp.zeros((f, 3), jnp.float32),
+            poke_text=jnp.zeros((f, 3), jnp.float32),
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
@@ -887,7 +1025,15 @@ class SkyFlowEnv:
         # Per-world ceiling, materialized [F,4]: the battery-sag trait. Exact per-rotor
         # shape — the generated throttle map is elementwise and must see no implicit
         # rank growth. sag=0 draws the airframe constant, so numerics do not change.
-        w_max = jnp.broadcast_to(state.dr_state.w_max[:, None], (f, 4))
+        w_max_now = state.dr_state.w_max
+        if self._sag_rate > 0.0:
+            # Within-episode discharge: the ceiling slides down with flight time,
+            # floored at the idle speed (a dying pack, honestly priced).
+            w_max_now = jnp.maximum(
+                w_max_now - self._sag_rate * state.steps.astype(jnp.float32),
+                self.airframe.rotor_speed_min,
+            )
+        w_max = jnp.broadcast_to(w_max_now[:, None], (f, 4))
         cos_tilt_min = math.cos(cfg.ground_tilt_limit_rad)
 
         if self._fw is not None:
@@ -932,12 +1078,45 @@ class SkyFlowEnv:
         wind_total = state.dr_state.wind_mean + wind_vel
 
         # 4. Pokes: exogenous inputs only — the backend integrates them, velocity state
-        # is never written. Uniform-ball direction · configured magnitude ceiling.
-        poke = jax.random.bernoulli(k_gate, dr.poke_prob, (f,))
-        f_ext = jnp.where(poke[:, None], dr.poke_force_n * _uniform_ball(k_poke_f, f), 0.0)
-        tau_ext = jnp.where(
-            poke[:, None], dr.poke_torque_nm * _uniform_ball(k_poke_tau, f), 0.0
-        )
+        # is never written. Uniform-ball direction · resolved magnitude ceiling (the
+        # frac knobs resolve to newtons at construction — weight-relative).
+        if not self._poke_hold:
+            poke = jax.random.bernoulli(k_gate, dr.poke_prob, (f,))
+            f_ext = jnp.where(
+                poke[:, None], self._poke_force_n * _uniform_ball(k_poke_f, f), 0.0
+            )
+            tau_ext = jnp.where(
+                poke[:, None], self._poke_torque_nm * _uniform_ball(k_poke_tau, f), 0.0
+            )
+            poke_left = state.poke_left
+            poke_fext, poke_text = state.poke_fext, state.poke_text
+        else:
+            # Held pokes (dr.poke_dur_steps > 1): poke_prob is the START rate while
+            # idle; a started poke holds its drawn vectors for an exponential-mean
+            # duration (real contacts and prop-wash hits last 50-300 ms).
+            idle = state.poke_left == 0
+            start = jax.random.bernoulli(k_gate, dr.poke_prob, (f,)) & idle
+            u_dur = jax.random.uniform(
+                jax.random.fold_in(k_gate, 103), (f,), jnp.float32, 1e-7, 1.0
+            )
+            dur = jnp.maximum(
+                jnp.ceil(-dr.poke_dur_steps * jnp.log(u_dur)), 1.0
+            ).astype(jnp.int32)
+            poke_fext = jnp.where(
+                start[:, None],
+                self._poke_force_n * _uniform_ball(k_poke_f, f), state.poke_fext,
+            )
+            poke_text = jnp.where(
+                start[:, None],
+                self._poke_torque_nm * _uniform_ball(k_poke_tau, f), state.poke_text,
+            )
+            active = start | ~idle
+            f_ext = jnp.where(active[:, None], poke_fext, 0.0)
+            tau_ext = jnp.where(active[:, None], poke_text, 0.0)
+            poke_left = jnp.where(
+                start, dur - 1, jnp.maximum(state.poke_left - 1, 0)
+            )
+            poke = active
 
         # 2 + 5. Command map, then `decimation` substeps with every input zero-order-held
         # and the §8 contact clamp after each; the pre-clamp ground-crash predicate is
@@ -1089,6 +1268,8 @@ class SkyFlowEnv:
         dr_new = self._draw_traits(k_rt, f)
         if self._tw_reguard:
             params_new = apply_tw_guard(params_new, self._nominal_row, dr_new.w_max)
+        if self._cog_on:
+            params_new = apply_cog_offset(params_new, dr_new.cog_offset)
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
         la_new = jnp.broadcast_to(self._act_neutral, (f, 4))
@@ -1122,6 +1303,9 @@ class SkyFlowEnv:
             est_ou=jnp.zeros((f, 12), jnp.float32),
             est_hold=jnp.zeros(f, jnp.int32),
             est_held=emitted_new,
+            poke_left=jnp.zeros(f, jnp.int32),
+            poke_fext=jnp.zeros((f, 3), jnp.float32),
+            poke_text=jnp.zeros((f, 3), jnp.float32),
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
             armed=jnp.ones(f, bool),
@@ -1141,6 +1325,9 @@ class SkyFlowEnv:
             est_ou=est_ou,
             est_hold=est_hold,
             est_held=emitted,
+            poke_left=poke_left,
+            poke_fext=poke_fext,
+            poke_text=poke_text,
             steps=steps,
             airborne=airborne,
             armed=jnp.ones(f, bool) if armed is None else armed.astype(bool),

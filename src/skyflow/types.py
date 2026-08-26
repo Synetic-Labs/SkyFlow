@@ -73,6 +73,10 @@ class DRState(NamedTuple):
     w_max: Array  # [F] f32 per-world rotor-speed ceiling, rad/s (battery-sag trait)
     est_bias: Array  # [F,12] f32 estimator-error bias trait: pos(3) m, vel(3) m/s,
     # att rotation-vector(3) rad, rate(3) rad/s (errors.py channel groups)
+    gyro_scale: Array  # [F,3] f32 per-axis gyro scale-factor multiplier (1.0 = exact)
+    imu_offset: Array  # [F,3] f32 IMU position offset from the body origin, m
+    imu_mount: Array  # [F,9] f32 IMU mount rotation, row-major (identity = exact)
+    cog_offset: Array  # [F,3] f32 CoG shift, m — applied as -offset on every rotor position
 
 
 class TaskEval(NamedTuple):
@@ -218,6 +222,10 @@ class SimState:
     est_ou: Array  # [F,12] f32 OU drift state, errors.py channel groups
     est_hold: Array  # [F] int32 dropout hold steps remaining (0 = tracking)
     est_held: Array  # [F,17] f32 the estimate emitted during a dropout hold
+    # -- poke-duration event state (inert zeros at dr.poke_dur_steps = 1) -------------
+    poke_left: Array  # [F] int32 poke steps remaining after this one (0 = idle)
+    poke_fext: Array  # [F,3] f32 the held world-frame poke force, N
+    poke_text: Array  # [F,3] f32 the held body-frame poke torque, N·m
     steps: Array  # [F] int32
     airborne: Array  # [F] bool
     armed: Array  # [F] bool — sticks: the firmware's arm flag after the last substep

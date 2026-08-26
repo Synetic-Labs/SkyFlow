@@ -242,6 +242,17 @@ def factor_floor(factors=None) -> float:
     return float(np.abs(limits[:, 0]).max())
 
 
+def apply_cog_offset(rows, offset):
+    """CoG-shift trait: translate EVERY rotor position by -offset [F,3] m (moving the
+    CoG by +offset relative to the rotor plane — the battery-placement asymmetry).
+    Common-mode by construction: one vector per world, never per-rotor jitter. The
+    parallel-axis inertia change is second order at mm-cm offsets and stays unmodeled
+    (documented in ERRORS.md). Zero offsets return the rows bit-identical."""
+    sl = param_slices(N_ROTORS)["rotor_pos"]
+    pos = rows[:, sl].reshape(rows.shape[0], N_ROTORS, 3) - offset[:, None, :]
+    return rows.at[:, sl].set(pos.reshape(rows.shape[0], 3 * N_ROTORS))
+
+
 def apply_tw_guard(rows, nominal, w_max):
     """
     Clamp the mass entries of drawn parameter rows [F,P] so the drawn thrust at the

@@ -182,6 +182,28 @@ def advance_ou(ou: Array, key: Array, dt: float, spec: ObsErrorSpec) -> Array:
     return alpha * ou + kick * jax.random.normal(key, ou.shape, jnp.float32)
 
 
+def rotvec_to_mat(v: Array) -> Array:
+    """Rotation vectors [F,3] rad -> rotation matrices [F,9] row-major (Rodrigues,
+    small-angle safe). Shared by the L4 IMU-mount trait and any pose-error model."""
+    ang = jnp.linalg.norm(v, axis=-1, keepdims=True)
+    small = ang < 1e-8
+    axis = v / jnp.where(small, 1.0, ang)
+    c = jnp.cos(ang)[:, 0]
+    s = jnp.sin(ang)[:, 0]
+    one_c = 1.0 - c
+    x, y, z = axis[:, 0], axis[:, 1], axis[:, 2]
+    rows = jnp.stack(
+        [
+            c + x * x * one_c, x * y * one_c - z * s, x * z * one_c + y * s,
+            y * x * one_c + z * s, c + y * y * one_c, y * z * one_c - x * s,
+            z * x * one_c - y * s, z * y * one_c + x * s, c + z * z * one_c,
+        ],
+        axis=-1,
+    )
+    eye = jnp.broadcast_to(jnp.eye(3, dtype=v.dtype).reshape(9), rows.shape)
+    return jnp.where(small, eye, rows)
+
+
 def _quat_mul(a: Array, b: Array) -> Array:
     """Hamilton product [F,4] wxyz."""
     aw, ax, ay, az = a[:, 0], a[:, 1], a[:, 2], a[:, 3]

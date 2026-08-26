@@ -91,7 +91,20 @@ sensor model, the policy eats the estimator model.
   2026-08-24: it reorders commands, which no real link does, and the reordered
   stick stream through the firmware's RC feedforward kills takeoff (0.003
   airborne vs 0.91 for drops, whoop 10M probes) — a live example of rule 6.
-- L4 IMU: white noise + per-episode bias (`sensors.measure`); baro white noise.
+- L4 IMU: white noise + per-episode bias, per-axis scale-factor trait
+  (`gyro_scale_frac`), full-scale saturation clip (`gyro_sat_rps` — the BMI270 at
+  ±2000 dps clips at 34.9 rad/s; crash tumbles exceed it), and the per-world mount
+  pose trait (`imu_offset_m`/`imu_mount_deg` — the generated imu_fn priced the
+  lever arm all along; the trait unpins its constants). Baro white noise.
+- L1 geometry: CoG offset trait (`cog_offset_m`) — a common-mode translation of
+  all rotor positions (battery placement), never per-rotor jitter.
+- L2 pokes: weight-relative ceilings (`poke_force_frac` of m·g,
+  `poke_torque_frac` of m·g·r_arm — one value is the same shove on any
+  quadrotor) and held durations (`poke_dur_steps`, exponential-mean — real
+  contacts last 50-300 ms; the legacy 10 ms impulse is absorbed by the spool).
+- L3 battery: start-charge shape (`battery_sag_shape` — episodes weight toward a
+  FULL pack, rare deep-sag starts) and within-episode discharge
+  (`battery_sag_rate_ps`, ceiling declines with flight time, floored at idle).
 - L1/L2: factor-stage body DR (`params.py`), OU gusts, steady wind, pokes.
 
 `DomainRand.obs_noise` (unit-blind white on the finalized obs vector) is a
@@ -99,7 +112,12 @@ LEGACY stress knob kept for compatibility; realism arms use `obs_error`.
 
 ## Queued (approved audit backlog, 2026-08-23)
 
-P1: gyro saturation clip + scale factor (sensors.py); IMU mount pose trait
-(INTAKE); CoG offset as a rotor_pos common-mode factor group (params.py);
-weight-relative pokes. P2: vibration injection, anisotropic gusts, poke
-duration, within-episode sag ramp.
+P1 SHIPPED 2026-08-26 (see Current models): gyro saturation + scale factor,
+IMU mount pose (no INTAKE needed — the spec seam existed, the harness unpinned
+it), CoG offset, weight-relative pokes; plus P2 items poke duration, sag shape,
+sag ramp. Still queued: vibration injection (needs the firmware's anti-vibration
+stack live: eRPM into the RPM filter and the dyn-notch settings honored — a
+cudaflight seam, its own work item); anisotropic gusts (deliberately left, James
+2026-08-26); baro prop-wash (acro ignores baro; the Air75 has none).
+Aerodynamic prop-wash/ground-effect/wake terms are deterministic plant physics —
+SkyFlow-Dynamics INTAKE proposals, not error models.
