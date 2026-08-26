@@ -125,7 +125,13 @@ class Task(Protocol):
         key: Array,
         fresh_spawn: bool,
     ) -> tuple[Array, Any]:
-        """Obs rows [n, obs_spec.dim] f32 and the (possibly advanced) task_state."""
+        """Obs rows [n, obs_spec.dim] f32 and the (possibly advanced) task_state.
+
+        `plant` is the ESTIMATOR's state (corrupted under dr.obs_error). Tasks with
+        `image_shape` set additionally receive the keyword `true_plant` (the real
+        pose) and must render their image from it — a camera images from where the
+        vehicle really is. State-only tasks never see the keyword.
+        """
         ...
 
     def evaluate(self, prev_plant: Array, plant: Array, task_state: Any) -> TaskEval:

@@ -757,6 +757,24 @@ class SkyFlowEnv:
             imu_bias=dr_state.imu_bias if self._imu_bias_on else None,
         )
 
+    def _observe(
+        self, plant: Array, emitted: Array, task_state: Any, imu: tuple[Array, Array],
+        last_action: Array, key: Array, *, fresh_spawn: bool,
+    ) -> tuple[Array, Any]:
+        """task.observe on the EMITTED (estimator) plant. Image tasks also receive the
+        TRUE plant as `true_plant=`: a camera is bolted to the vehicle and images from
+        where the vehicle really is; only state-derived terms carry the estimator
+        error (ERRORS.md rule: never corrupt what the agent truly knows). State-only
+        tasks keep the protocol signature untouched."""
+        if self.image_shape is not None:
+            return cast(Any, self.task).observe(
+                emitted, task_state, imu, last_action, key, fresh_spawn=fresh_spawn,
+                true_plant=plant,
+            )
+        return self.task.observe(
+            emitted, task_state, imu, last_action, key, fresh_spawn=fresh_spawn
+        )
+
     def _corrupt_obs(self, obs: Array, key: Array) -> Array:
         """DomainRand.obs_noise on the finalized task observation (uniform half-width);
         applied by the env so tasks keep semantics and the env keeps corruption.
@@ -814,8 +832,8 @@ class SkyFlowEnv:
             )
         else:
             emitted = plant
-        obs, task_state = self.task.observe(
-            emitted, task_state, imu, last_action, k_obs_task, fresh_spawn=True
+        obs, task_state = self._observe(
+            plant, emitted, task_state, imu, last_action, k_obs_task, fresh_spawn=True
         )
         obs = self._corrupt_obs(obs, k_obs_dr)
 
@@ -1035,8 +1053,8 @@ class SkyFlowEnv:
                 emitted = jnp.where((est_hold > 0)[:, None], state.est_held, emitted)
         else:
             est_ou, est_hold, emitted = state.est_ou, state.est_hold, plant
-        obs, ts_out = self.task.observe(
-            emitted, ev.task_state, imu, action, k_obs_task, fresh_spawn=False
+        obs, ts_out = self._observe(
+            plant, emitted, ev.task_state, imu, action, k_obs_task, fresh_spawn=False
         )
         obs = self._corrupt_obs(obs, k_obs_dr)
 
@@ -1086,8 +1104,8 @@ class SkyFlowEnv:
             )
         else:
             emitted_new = plant_new
-        obs_new, ts_fresh = self.task.observe(
-            emitted_new, ts_fresh, imu_new, la_new, k_ro_task, fresh_spawn=True
+        obs_new, ts_fresh = self._observe(
+            plant_new, emitted_new, ts_fresh, imu_new, la_new, k_ro_task, fresh_spawn=True
         )
         obs_new = self._corrupt_obs(obs_new, k_ro_dr)
         fresh = dict(

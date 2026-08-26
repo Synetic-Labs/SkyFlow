@@ -309,7 +309,7 @@ collision direction, F12 injected-fleet size, F13 fork/thread guards, F14
 sticky CPU-fleet failure, F16 settle_ms/device_index, F17 sticks-only knobs
 inert in motors, F18 checkpoint doc, C26 EMA decay at fleet 1024, T5, T9,
 T13/T14, T17, V7-V21, V38, T16 check_task_hooks); §7 items D1-D4, D6-D9,
-D12-D24.
+D12-D24. D3 is closed as user responsibility.
 
 Cross-author note 2026-08-24: ruff/pyright are now enforced repo-wide (CI), which
 required mechanical fixes in the OTHER session's files: en-dashes in errors.py
@@ -326,17 +326,17 @@ stage, battery_sag, cmd_drop_prob and the L5 estimator model against the six
 roots. Nothing here is fixed yet; James decides what to take.
 
 Silent-wrong-behavior traps
-- **D1** env.py: with `obs_error` on, the vision task renders the gate MASK
+- **D1** DONE 2026-08-26 (image tasks receive `true_plant=`; the mask renders from the true pose). Was: env.py: with `obs_error` on, the vision task renders the gate MASK
   from the ESTIMATED pose (`corrupt_plant` output feeds `task.observe`, which
   calls `render_masks`). A real camera images from the true pose; only derived
   state is wrong. Violates ERRORS.md "never corrupt what the agent truly
   knows". No test runs vision + obs_error. Fix: render from `plant`.
-- **D2** errors.py:225 quaternion renormalization is NOT bit-exact at zero
+- **D2** DONE 2026-08-26 (zero attitude widths skip the compose). Was: errors.py:225 quaternion renormalization is NOT bit-exact at zero
   widths (1.19e-7 measured on non-identity quats); contradicts the "none
   profile leaves values bit-identical" claim. The pinning test hovers at
   identity attitude, so it cannot see it. Fix: skip the rotation compose when
   attitude widths are 0.
-- **D3** params.py:293 + env.py `_tw_reguard`: the shipped default
+- **D3** WILL NOT FIX (James 2026-08-26: the user owns thrust-to-weight sanity). Was: params.py:293 + env.py `_tw_reguard`: the shipped default
   (factors=None, battery_sag=0, body DR on) still runs NO thrust-to-weight
   guard — [C6] is half-closed. A low-T/W airframe or a `brackets={"mass":..}`
   override yields worlds that truncate as `stuck`. Fix: always re-guard.

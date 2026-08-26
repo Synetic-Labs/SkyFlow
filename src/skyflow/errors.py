@@ -221,8 +221,15 @@ def corrupt_plant(plant: Array, bias: Array, ou: Array, key: Array, spec: ObsErr
     e = bias + ou + white
     pos = plant[:, 0:3] + e[:, 0:3]
     vel = plant[:, 3:6] + e[:, 3:6]
-    quat = _quat_mul(_rotvec_quat(e[:, 6:9]), plant[:, 6:10])
-    quat = quat / jnp.linalg.norm(quat, axis=-1, keepdims=True)
+    # Attitude: compose only when some attitude width is nonzero. The renormalization
+    # after a zero rotation is NOT bit-exact (1e-7 on non-identity quats), and a zero
+    # width promises the true value untouched (ERRORS.md rule 4).
+    att_widths = (*spec.bias[6:9], *spec.ou_sigma[6:9], *spec.white[6:9])
+    if any(w != 0.0 for w in att_widths):
+        quat = _quat_mul(_rotvec_quat(e[:, 6:9]), plant[:, 6:10])
+        quat = quat / jnp.linalg.norm(quat, axis=-1, keepdims=True)
+    else:
+        quat = plant[:, 6:10]
     omega = plant[:, 10:13] + e[:, 9:12]
     rel = spec.rotor_rel * jax.random.uniform(
         k_rotor, (plant.shape[0], 4), jnp.float32, -1.0, 1.0

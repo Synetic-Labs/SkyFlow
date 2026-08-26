@@ -10,6 +10,7 @@ saw, so corruption is asserted at the exact boundary the real firmware consumes.
 
 import copy
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -324,3 +325,46 @@ def test_obs_noise_skips_mask_terms(key):
         # the mask block is untouched by obs_noise; the numeric tail is corrupted
         np.testing.assert_array_equal(np.asarray(obs_n[:, :d]), np.asarray(obs_c[:, :d]))
         assert float(np.abs(np.asarray(obs_n[:, d:] - obs_c[:, d:])).max()) > 0.0
+
+
+def test_obs_error_camera_images_from_the_true_pose(key):
+    """dr.obs_error corrupts the ESTIMATE the policy reads. A camera is bolted to the
+    vehicle: the rendered mask must come from the true pose, so the image block is
+    identical with the estimator error on or off (TECH_DEBT §7 D1)."""
+    kw: dict = {"num_envs": 2, "task": "figure_eight", "task_kwargs": {"vision": True}}
+    err = {"profile": "mocap", "bias_frac": 50.0}  # a metre-class pose error
+    with SkyFlowEnv(SimConfig(dr=DomainRand(body_scale=0.0), **kw)) as clean, \
+         SkyFlowEnv(SimConfig(dr=DomainRand(body_scale=0.0, obs_error=err), **kw)) as est:
+        d = clean.obs_spec[0].dim
+        obs_c, _ = clean.reset(key)
+        obs_e, _ = est.reset(key)
+        np.testing.assert_array_equal(np.asarray(obs_e[:, :d]), np.asarray(obs_c[:, :d]))
+        assert float(np.abs(np.asarray(obs_e[:, d:] - obs_c[:, d:])).max()) > 0.0
+
+
+def test_obs_error_zero_attitude_widths_keep_the_quaternion_bit_exact():
+    """A zero attitude width promises the true attitude untouched — no rotation
+    compose, no renormalization (TECH_DEBT §7 D2; the old path moved non-identity
+    quaternions by ~1e-7)."""
+    import dataclasses
+
+    from skyflow import errors
+
+    spec = errors.resolve_obs_error({"profile": "mocap"})
+    assert spec is not None
+
+    def zero_att(t):
+        return tuple(0.0 if 6 <= i < 9 else v for i, v in enumerate(t))
+
+    spec = dataclasses.replace(
+        spec, bias=zero_att(spec.bias), ou_sigma=zero_att(spec.ou_sigma),
+        white=zero_att(spec.white),
+    )
+    q = jax.random.normal(jax.random.PRNGKey(4), (16, 4), jnp.float32)
+    q = q / jnp.linalg.norm(q, axis=-1, keepdims=True)  # random unit quaternions
+    plant = jnp.zeros((16, 17), jnp.float32).at[:, 6:10].set(q)
+    bias = errors.draw_bias(jax.random.PRNGKey(5), 16, spec)
+    est = errors.corrupt_plant(plant, bias, jnp.zeros((16, 12), jnp.float32),
+                               jax.random.PRNGKey(6), spec)
+    np.testing.assert_array_equal(np.asarray(est[:, 6:10]), np.asarray(q))
+    assert float(np.abs(np.asarray(est[:, 0:3])).max()) > 0.0  # position still corrupted

@@ -271,13 +271,18 @@ class GateCourseTask:
         last_action: Array,
         key: Array,
         fresh_spawn: bool,
+        true_plant: Array | None = None,
     ) -> tuple[Array, GateTaskState]:
         """Obs rows [n, obs_spec.dim] f32; task_state passes through unchanged.
 
-        `imu`, `key` and `fresh_spawn` are unused: this task observes exact state (the
-        IMU packaging stays in sensors.py), and the persistent mask-corruption families
-        for vision obs are deferred work (DESIGN.md §12). rot_matrix flattens row-major
-        (tasks.base.quat_to_rot).
+        `plant` is what the policy's estimator reports (the env corrupts it under
+        dr.obs_error); `true_plant` is the real pose, passed by the env to image tasks.
+        The camera is bolted to the vehicle: the mask renders from the TRUE pose, and
+        only the state-derived terms carry the estimator error (ERRORS.md: never
+        corrupt what the agent truly knows). `imu`, `key` and `fresh_spawn` are unused:
+        this task observes exact state (the IMU packaging stays in sensors.py), and the
+        persistent mask-corruption families for vision obs are deferred work
+        (DESIGN.md §12). rot_matrix flattens row-major (tasks.base.quat_to_rot).
         """
         del imu, key, fresh_spawn
         pos = plant[:, 0:3]
@@ -290,7 +295,8 @@ class GateCourseTask:
         if self.vision:
             camera = self._camera
             assert camera is not None  # __init__ always builds one in vision mode
-            mask = self._render_masks(camera, self.gates, pos, quat)
+            cam = plant if true_plant is None else true_plant
+            mask = self._render_masks(camera, self.gates, cam[:, 0:3], cam[:, 6:10])
             head = [mask.reshape(pos.shape[0], -1)]
         else:
             # clip, don't trust: JAX gathers clamp OOB indices silently, and a bad
