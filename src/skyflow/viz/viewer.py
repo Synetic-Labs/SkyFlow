@@ -15,8 +15,8 @@ video need frame-exact draws in the caller's thread.
 Keys (always listed in a bar along the window's bottom edge): Space pause · ←/→
 step/scrub (replay) · [ ] speed · Tab focus world · V iso/top/profile (a switch lands on
 a fresh fit) · C follow the focused world · X full glyphs for all watched worlds ·
-G fleet scatter · drag pan · wheel zoom · P screenshot · R reset request (only hosts
-that consume take_reset) · Esc quit.
+G fleet scatter · left-drag orbit · right-drag pan · wheel zoom · P screenshot · R reset
+request (only hosts that consume take_reset) · Esc quit.
 """
 
 import os
@@ -51,6 +51,34 @@ __all__ = ["Viewer"]
 _PILOT_RES = (192, 256)  # (H, W) of the default pilot cam pane
 _TOP_H, _HUD_H, _FPV_W, _KEYBAR_H = 30, 150, 336, 20
 _TRAIL_LEN = 300
+
+
+class _EpTrace:
+    """A growing trace that always fits its panel: values append in bins of `bin`
+    (mean); when the stored row hits `cap` it halves pairwise and `bin` doubles, so
+    the WHOLE history stays visible at bounded cost. Used for the episode-length
+    bars and the per-episode channel graphs."""
+
+    def __init__(self, cap: int = 512) -> None:
+        self.vals: list[float] = []
+        self.bin = 1
+        self.cap = int(cap)
+        self._part: list[float] = []
+
+    def add(self, v: float) -> None:
+        self._part.append(float(v))
+        if len(self._part) >= self.bin:
+            self.vals.append(sum(self._part) / len(self._part))
+            self._part.clear()
+            if len(self.vals) >= self.cap:
+                pairs = zip(self.vals[::2], self.vals[1::2], strict=True)
+                self.vals = [(a + b) / 2.0 for a, b in pairs]
+                self.bin *= 2
+
+    def clear(self) -> None:
+        self.vals.clear()
+        self._part.clear()
+        self.bin = 1
 
 
 class _Mailbox:
@@ -173,15 +201,14 @@ class Viewer:
         self._proj_kind = "iso"
         self._projs: dict[str, Projection] = {}
         self._focus = 0
-        self._drag = False  # scene-pane mouse pan in progress
+        self._drag: str | None = None  # scene-pane mouse mode: "orbit" | "pan"
         self.follow = False  # C: keep the focused world centred in the scene pane
         self.show_glyphs = False  # X: full glyphs for ALL watched worlds, not just focus
         self._gauges: dict[str, float] = {}  # HUD dial full-scales (grow-only)
         self._fed_t: deque[float] = deque(maxlen=120)  # feed timestamps → health fps
         self._drawn_t: deque[float] = deque(maxlen=120)  # fresh-draw timestamps
-        self._ep_lens: list[float] = []  # finished-episode lengths, focused world
-        self._ep_partial: list[float] = []  # bin under construction (after compression)
-        self._ep_bin = 1  # episodes per bar; doubles when the chart compresses
+        self._eps = _EpTrace(cap=2048)  # steps-per-episode bars, focused world
+        self._ep_base: int | None = None  # step at the current episode's first sighting
         self._ep_last_step: int | None = None
         self._scene_rect = (
             8, _TOP_H + 8, size[0] - _FPV_W - 24, size[1] - _TOP_H - _HUD_H - _KEYBAR_H - 16
@@ -191,7 +218,7 @@ class Viewer:
         self._last_fleet: tuple[float, np.ndarray | None] = (0.0, None)
         self._last_vf: ViewFrame | None = None
         self._trails: dict[int, deque] = {i: deque(maxlen=_TRAIL_LEN) for i in range(len(self.watch))}
-        self._hists: dict[str, deque] = {}  # one trace per channel, focused world
+        self._hists: dict[str, _EpTrace] = {}  # one per-episode trace per channel, focused world
 
         # render thread: owns the window and every pygame call after this point
         self._running = True
@@ -488,32 +515,33 @@ class Viewer:
         """Rate over a timestamp window; 0 until two samples exist."""
         return 0.0 if len(ts) < 2 else (len(ts) - 1) / max(ts[-1] - ts[0], 1e-6)
 
-    def _ep_done(self, length: float) -> None:
-        """Record one finished episode; compress pairwise so the whole run fits."""
-        self._ep_partial.append(float(length))
-        if len(self._ep_partial) >= self._ep_bin:
-            self._ep_lens.append(sum(self._ep_partial) / len(self._ep_partial))
-            self._ep_partial.clear()
-            if len(self._ep_lens) >= 2048:
-                pairs = zip(self._ep_lens[::2], self._ep_lens[1::2], strict=True)
-                self._ep_lens = [(a + b) / 2.0 for a, b in pairs]
-                self._ep_bin *= 2
-
     def _track(self, vf: ViewFrame) -> None:
-        # episode lengths, focused world: a done flag closes an episode at the current
-        # step; a step DROP between drawn frames reveals a missed done (frames drop by
-        # design, so the flag alone would undercount)
+        # STEPS-PER-EPISODE, focused world. Lengths are step DIFFS against the
+        # episode's first seen step, so a global counter (training viz) and a
+        # per-episode counter (eval) both read correctly. A step DROP between drawn
+        # frames reveals a missed done (frames drop by design).
         step = int(vf.step)
-        if vf.done is not None and bool(vf.done[vf.focus]):
-            length = step if step > 0 else (self._ep_last_step or 0)
+        boundary = False
+        if self._ep_last_step is not None and step < self._ep_last_step:
+            length = self._ep_last_step - (self._ep_base or 0)
             if length > 0:
-                self._ep_done(length)
+                self._eps.add(length)
+            self._ep_base = 0  # a resetting counter is already inside the next episode
+            boundary = True
+        if self._ep_base is None:
+            self._ep_base = step  # first sighting: the episode is already in progress
+        if vf.done is not None and bool(vf.done[vf.focus]):
+            length = step - self._ep_base
+            if length > 0:
+                self._eps.add(length)
+            self._ep_base = None  # re-base on the next frame, whatever the counter does
             self._ep_last_step = None
-        elif self._ep_last_step is not None and step < self._ep_last_step:
-            self._ep_done(self._ep_last_step)
-            self._ep_last_step = step
+            boundary = True
         else:
             self._ep_last_step = step
+        if boundary:
+            for trace in self._hists.values():
+                trace.clear()  # channel graphs span ONE episode, compressed to fit
         for w in range(vf.plant.shape[0]):
             trail = self._trails.setdefault(w, deque(maxlen=_TRAIL_LEN))
             if vf.done is not None and bool(vf.done[w]):
@@ -521,7 +549,7 @@ class Viewer:
             else:
                 trail.append(np.asarray(vf.pos[w], np.float64))
         for name, values in vf.channels.items():
-            self._hists.setdefault(name, deque(maxlen=240)).append(float(values[vf.focus]))
+            self._hists.setdefault(name, _EpTrace()).add(float(values[vf.focus]))
 
     def _events(self) -> None:
         for ev in pygame.event.get():
@@ -529,11 +557,13 @@ class Viewer:
                 self.close()
             elif ev.type == pygame.KEYDOWN:
                 self._key(ev.key)
-            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and self._in_scene(ev.pos):
-                self._drag = True
-            elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
-                self._drag = False
-            elif ev.type == pygame.MOUSEMOTION and self._drag:
+            elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 2, 3) and self._in_scene(ev.pos):
+                self._drag = "orbit" if ev.button == 1 else "pan"
+            elif ev.type == pygame.MOUSEBUTTONUP and ev.button in (1, 2, 3):
+                self._drag = None
+            elif ev.type == pygame.MOUSEMOTION and self._drag == "orbit":
+                self._proj(self._scene_rect).orbit(ev.rel[0] * 0.4, ev.rel[1] * 0.4)
+            elif ev.type == pygame.MOUSEMOTION and self._drag == "pan":
                 self._proj(self._scene_rect).pan(*ev.rel)
             elif ev.type == pygame.MOUSEWHEEL:
                 pos = pygame.mouse.get_pos()
@@ -552,6 +582,7 @@ class Viewer:
             self._focus = (self._focus + 1) % len(self.watch)
             self._hists.clear()
             self._ep_last_step = None  # the bars persist; the step baseline must not
+            self._ep_base = None
         elif key == pygame.K_v:
             self._proj_kind = KINDS[(KINDS.index(self._proj_kind) + 1) % len(KINDS)]
             self._projs.pop(self._proj_kind, None)  # a view switch lands on a fresh fit
@@ -583,7 +614,8 @@ class Viewer:
         ("C", "follow"),
         ("X", "glyphs"),
         ("G", "fleet"),
-        ("drag", "pan"),
+        ("drag", "orbit"),
+        ("Rdrag", "pan"),
         ("wheel", "zoom"),
         ("P", "shot"),
         ("R", "reset"),
@@ -676,10 +708,13 @@ class Viewer:
         # panes
         scene_rect = self._scene_rect
         proj = self._proj(scene_rect)
-        if self.follow:  # keep the focused world centred; pan/zoom still compose
+        if self.follow:  # keep the focused world centred; orbit/zoom still compose
             px, py = proj.point(vf.pos[vf.focus])
             proj.pan(scene_rect[0] + scene_rect[2] / 2.0 - px,
                      scene_rect[1] + scene_rect[3] / 2.0 - py)
+        label = f"SCENE · {self._proj_kind.upper()}"
+        if proj.orbited:
+            label += f" · ORBIT {proj.azim:+.0f}°/{proj.elev:+.0f}°"
         draw_scene(
             screen,
             scene_rect,
@@ -688,7 +723,7 @@ class Viewer:
             vf,
             trails={k: list(v) for k, v in self._trails.items()},
             omega_max=self.omega_max,
-            label=f"SCENE · {self._proj_kind.upper()}",
+            label=label,
             font=self._small,
             show_glyphs=self.show_glyphs,
         )
@@ -736,10 +771,10 @@ class Viewer:
             vf,
             control=self.control,
             omega_max=self.omega_max,
-            histories={k: list(v) for k, v in self._hists.items()},
+            histories={k: list(v.vals) for k, v in self._hists.items()},
             armed=armed,
             ranges=self._gauges,
-            episodes=self._ep_lens or None,
+            episodes=self._eps.vals or None,
             font=self._font,
             small=self._small,
         )

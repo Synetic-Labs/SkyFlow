@@ -3,10 +3,10 @@ Instrument-strip builder (DESIGN.md §13) — vehicle truth plus user-selected c
 
 Left to right: stick crosses (AETR in sticks mode, four action bars in motors mode) with
 an arm lamp under them (when the caller passes `armed`), rotor speed bars from
-plant[13:17], an attitude horizon and a heading compass from the quaternion, a speed
-dial and a signed climb dial, an episode-length bar chart (when the caller tracks one),
-then one graph per named channel — reward drawn last, stretched into the remaining
-width. The fixed instruments are vehicle truth —
+plant[13:17], an attitude horizon (roll/pitch printed under it) and a heading compass
+(heading printed under it), a speed dial and a cockpit-style climb dial (zero at the
+left, needle up = climb), an episode-length bar chart (when the caller tracks one),
+then one graph per named channel — reward drawn last. The fixed instruments are vehicle truth —
 valid for any quadrotor use case. Channels are whatever the caller traces (reward, goal
 distance, estimator error, ...); this module knows no channel names and no task fields.
 A builder, not a host: draws onto the given surface, owns no window.
@@ -120,10 +120,12 @@ def _nice_ceil(v: float) -> float:
 
 def _dial(surface, cx: float, cy: float, r: int, value: float, full: float,
           signed: bool = False, font=None, small=None) -> None:
-    """One round gauge: a 270° arc with its gap at the bottom and ONE printed number
-    (the value, under the dial). Unsigned: needle sweeps 0..full. Signed: the needle
-    rests straight up at zero and deflects right for +value, left for -value."""
-    t0, sweep = 0.75 * math.pi, 1.5 * math.pi
+    """One round gauge with ONE printed number (the value, under the dial).
+    Unsigned: 270° arc, gap at the bottom, needle sweeps 0..full clockwise. Signed
+    (a cockpit vertical-speed dial): gap at the RIGHT, the needle rests sideways at
+    the left for zero and tilts up for +value, down for -value."""
+    t0 = 0.25 * math.pi if signed else 0.75 * math.pi
+    sweep = 1.5 * math.pi
     arc = [
         (cx + math.cos(t0 + t * sweep) * r, cy + math.sin(t0 + t * sweep) * r)
         for t in np.linspace(0.0, 1.0, 25)
@@ -240,11 +242,23 @@ def draw_hud(
     x = end + 30
 
     r = box // 2
+    rot = quat_to_rot(frame.quat[f])
     _horizon(surface, x + r, top + r, r, frame.quat[f])
+    if small:  # numeric read-back under the ball, same angles the ball draws
+        pitch = -math.degrees(math.asin(float(np.clip(rot[2, 0], -1.0, 1.0))))
+        roll = math.degrees(math.atan2(float(rot[2, 1]), float(rot[2, 2])))
+        img = small.render(f"R{roll:+.0f} P{pitch:+.0f}", True, palette.MUTED)
+        surface.blit(img, (x + r - img.get_width() / 2, top + 2 * r + 3))
     caption(x, "ATTITUDE")
     x += 2 * r + 26
 
     _compass(surface, x + r, top + r, r, frame.quat[f], font=small)
+    if small:
+        fwd = rot[:, 0]
+        if math.hypot(float(fwd[0]), float(fwd[1])) >= 1e-6:
+            hdg = (math.degrees(math.atan2(-float(fwd[1]), float(fwd[0]))) + 360.0) % 360.0
+            img = small.render(f"{hdg:03.0f}°", True, palette.MUTED)
+            surface.blit(img, (x + r - img.get_width() / 2, top + 2 * r + 3))
     caption(x, "HEADING")
     x += 2 * r + 26
 
@@ -269,7 +283,8 @@ def draw_hud(
         x += 170
 
     named = dict(histories or {})
-    reward = named.pop("reward", None)  # reward draws LAST, stretched (below)
+    if "reward" in named:
+        named["reward"] = named.pop("reward")  # reorder only: reward draws last
     graph_w = 150
     for name, values in named.items():
         if x + graph_w > rect[0] + rect[2] - 10:
@@ -277,9 +292,4 @@ def draw_hud(
         _graph(surface, x, top, graph_w, box, name, values, font=small)
         caption(x, name.upper())
         x += graph_w + 20
-    if reward is not None:
-        w_r = rect[0] + rect[2] - 14 - x
-        if w_r >= 120:
-            _graph(surface, x, top, w_r, box, "reward", reward, font=small)
-            caption(x, "REWARD")
     surface.set_clip(None)

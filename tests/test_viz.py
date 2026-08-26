@@ -116,6 +116,29 @@ class TestProjection:
             proj = Projection(kind, 10.0, (0, 0))
             assert proj.point((0, 0, 2))[1] < proj.point((0, 0, 0))[1]
 
+    def test_preset_bases(self):
+        top = Projection("top", 10.0, (0, 0))
+        np.testing.assert_allclose(top.points(np.array([[1.0, 0, 0]]))[0], [10, 0], atol=1e-9)
+        np.testing.assert_allclose(top.points(np.array([[0, 1.0, 0]]))[0], [0, -10], atol=1e-9)
+        prof = Projection("profile", 10.0, (0, 0))
+        np.testing.assert_allclose(prof.points(np.array([[0, 0, 1.0]]))[0], [0, -10], atol=1e-9)
+
+    def test_orbit_keeps_pivot_anchored(self):
+        proj = Projection("iso", 10.0, (50, 50))
+        pivot = (1.0, 2.0, 0.5)
+        before = proj.points(np.asarray(pivot).reshape(1, 3))[0].copy()
+        proj.orbit(37.0, -12.0, pivot=pivot)
+        after = proj.points(np.asarray(pivot).reshape(1, 3))[0]
+        np.testing.assert_allclose(after, before, atol=1e-9)
+        assert proj.orbited
+
+    def test_orbit_clamps_elevation(self):
+        proj = Projection("profile", 10.0, (0, 0))
+        proj.orbit(0.0, 500.0)
+        assert proj.elev == 89.0
+        proj.orbit(0.0, -500.0)
+        assert proj.elev == -89.0
+
     def test_pan_shifts_pixels(self):
         proj = Projection("top", 10.0, (50, 50))
         before = proj.point((1, 2, 0))

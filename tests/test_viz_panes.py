@@ -273,13 +273,30 @@ class TestViewer:
                 f.done = np.array([done, False])
                 return f
 
-            # done closes one episode at step 12; a step DROP (4 -> 2) reveals a
-            # missed done between drawn frames and closes one at 4
-            for f in (vf_at(5), vf_at(9), vf_at(12, done=True), vf_at(4), vf_at(2)):
+            # GLOBAL step counter (training viz): lengths are diffs across dones
+            for f in (vf_at(100), vf_at(105), vf_at(110, done=True),
+                      vf_at(111), vf_at(118, done=True)):
                 viewer._track(f)
-            assert viewer._ep_lens == [12.0, 4.0]
+            assert viewer._eps.vals == [10.0, 7.0]
+
+            # PER-EPISODE counter (eval): the drop 9 -> 1 reveals a missed done
+            viewer._eps.clear()
+            viewer._ep_base = None
+            viewer._ep_last_step = None
+            for f in (vf_at(3), vf_at(9), vf_at(1), vf_at(5), vf_at(8, done=True)):
+                viewer._track(f)
+            assert viewer._eps.vals == [6.0, 8.0]
         finally:
             viewer.close()
+
+    def test_ep_trace_compresses_pairwise(self):
+        from skyflow.viz.viewer import _EpTrace
+
+        tr = _EpTrace(cap=8)
+        for i in range(32):
+            tr.add(float(i))
+        assert tr.bin == 8 and len(tr.vals) == 4
+        assert tr.vals[0] == pytest.approx(3.5)  # mean of the first bin, 0..7
 
     def test_follow_centers_the_focused_world(self):
         from skyflow.viz.primitives import Grid, Scene

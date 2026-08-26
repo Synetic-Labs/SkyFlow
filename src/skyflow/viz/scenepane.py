@@ -7,8 +7,8 @@ identical. The pane is a fixed wireframe projection (projection.py); primitives 
 already bind-resolved as data (primitives.py); glyphs come straight from the plant rows.
 
 The glyph is one visual language at every scale: a bright X-frame with four rotor rings
-whose accent power arcs grow around each ring out of its arm point (a full circle at
-full power), an accent heading line with an up-flag at the tip (body +z, 1/4 of the line:
+whose accent power arcs grow just inside each ring out of its arm point (a full circle
+at full power), an accent heading line with an up-flag at the tip (body +z, 1/4 of the line:
 it breaks roll symmetry), and a plumb line + ground ring for altitude (the focused world
 only). Watched but unfocused worlds draw the fleet mark — a dot with the same heading
 line + up-flag — at EVERY zoom; `show_glyphs` (the viewer's X key) promotes them to full
@@ -194,15 +194,15 @@ def _draw_glyph(
         ring = proj.points(rw + (_RING * (0.55 * arm_m)) @ rot.T)
         _polyline(surface, ring, body)
         if float(o) > 0.02:
-            # power arc ON the prop ring: it grows both ways out of the point where the
-            # arm meets the ring, and closes into a full accent circle at full power
+            # power arc just INSIDE the prop ring: it grows both ways out of the point
+            # where the arm meets the ring, and closes into a full circle at full power
             a0 = math.atan2(-d[1], -d[0])
             half = float(o) * math.pi
             angles = np.linspace(a0 - half, a0 + half, max(3, int(o * 25)))
             arc_body = np.stack(
                 [np.cos(angles), np.sin(angles), np.zeros_like(angles)], axis=-1
             )
-            arc = proj.points(rw + (arc_body * (0.55 * arm_m)) @ rot.T)
+            arc = proj.points(rw + (arc_body * (0.36 * arm_m)) @ rot.T)
             _polyline(surface, arc, accent, width=2)
     # heading: the same forward line + up-flag the fleet mark carries (accent here)
     tip = pos + rot @ np.array([1.55 * arm_m, 0.0, 0.0])
