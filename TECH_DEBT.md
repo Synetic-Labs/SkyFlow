@@ -279,15 +279,14 @@ Most findings are instances of six patterns. Fixing a pattern kills its class.
    mention gone, hud advances from _bars' return. NOT deduped (canonical home
    declared, transcriptions left): plant-layout restatements in comments/tests.
 6. **M-sized correctness: DONE 2026-08-24 (two deliberate partials)** —
-   [F8] board-align: REJECTED, not implemented — _render_eeprom scans the dump
-   (+overrides) and raises on nonzero align_board_*; DESIGN §10 updated.
-   [C13/F9] DECIDED 2026-08-25 (James): NO check. Props in/out is airframe
-   information — the airframe's `spin` table and the vehicle's own CLI dump
-   (`yaw_motors_reversed`) are measured facts from the same real drone; the
-   whoop is props-out and its tune correctly sets ON. The interim ON-rejection
-   blocked the real vehicle's config and the trained policy's eval; removed.
-   No motor_perm derivation wanted. [C8] obs_noise now skips
-   image-valued terms (units prefixed "[0,1]"/"{0,1}", env._is_image_units) via a per-dim scale; numeric terms bit-exact
+   [F8] board-align — REVISED 2026-08-25: the wave-6 rejection was WRONG. The
+   Air75 factory CLI dump carries align_board_yaw = -135 and yaw_motors_reversed
+   = ON; a real config must never be refused. Now: the effective align_board_*
+   (overrides win) WARNS once when nonzero; the inverse pre-rotation stays
+   planned (implement + verify against a real SITL hover). yaw_motors_reversed
+   is accepted with no check; [C13/F9] the airframe-spin consistency check and
+   the motor_perm derivation stay OPEN. [C8] obs_noise now skips
+   image terms (ObsTerm.image=True) via a per-dim scale; numeric terms bit-exact
    legacy. [T3] gates is a property whose setter re-derives ALL cached geometry —
    the reward/collision chimera is impossible. [T15] one crossing solve:
    gates._crossing_point shared by classify_crossings and the new
@@ -302,14 +301,15 @@ Most findings are instances of six patterns. Fixing a pattern kills its class.
    draw time) — the carry no longer rides into it after wave 3, so the GPU
    sticks blob pull is gone.
 
-Still open after wave 6: full motor_perm derivation [C13/F9]; armed_frac metric
-+ nav live-viz armed flag (wave-1 deferral); Q9 private-attr coupling in the
-older tests; example smoke tests; the §2/§3/§4 trap-list items not named in
+Still open after wave 6: motor_perm derivation + airframe-spin consistency
+[C13/F9]; the inverse board-align pre-rotation [F8]; Q9 private-attr coupling in
+the older tests; example smoke tests; the §2/§3/§4 trap-list items not named in
 any wave (C7 control_hz desync, C10 name-matched task kwargs, C11 info-key
 collision direction, F12 injected-fleet size, F13 fork/thread guards, F14
 sticky CPU-fleet failure, F16 settle_ms/device_index, F17 sticks-only knobs
 inert in motors, F18 checkpoint doc, C26 EMA decay at fleet 1024, T5, T9,
-T13/T14, T17, V7-V21, V38, T16 check_task_hooks).
+T13/T14, T17, V7-V21, V38, T16 check_task_hooks); §7 items D1-D4, D6-D9,
+D12-D24.
 
 Cross-author note 2026-08-24: ruff/pyright are now enforced repo-wide (CI), which
 required mechanical fixes in the OTHER session's files: en-dashes in errors.py
@@ -343,7 +343,7 @@ Silent-wrong-behavior traps
 - **D4** "scale=0 with delay (0,0) is bit-exact nominal" (env.py docstring,
   DESIGN §7) is now false: `effective()` never scales `cmd_drop_prob` or
   obs_error `p_drop`. Restate as an `off()`-only invariant.
-- **D5** env.py `_is_image_units`: the obs_noise image exclusion keys on a
+- **D5** DONE 2026-08-25 (ObsTerm.image flag replaces the units-prefix key). Was: env.py `_is_image_units`: the obs_noise image exclusion keys on a
   free-form units prefix. `ObsTerm.units` defaults to ""; a vision task that
   omits units gets metre-scale noise on every pixel again. Fix: an explicit
   image marker (ObsTerm field, or the task's image term name), not a string.
@@ -358,9 +358,9 @@ Silent-wrong-behavior traps
   battery_sag with scale=0 folds to -0.0 and passes. Validate raw fields.
 
 Untested axes
-- **D10** No test runs sticks mode with battery_sag, cmd_drop_prob, obs_error
+- **D10** DONE 2026-08-25 (tests/test_sticks_dr.py). Was: no test runs sticks mode with battery_sag, cmd_drop_prob, obs_error
   or factors — the knobs justified by sticks-mode evidence (R4).
-- **D11** Estimator leaves (est_ou/est_hold/est_bias) untested through the
+- **D11** DONE 2026-08-25 (test_sticks_dr.py). Was: estimator leaves (est_ou/est_hold/est_bias) untested through the
   auto-reset path.
 - **D12** `test_scale_zero_disables_every_continuous_knob` omits the four new
   knobs (and would fail for two, see D4).
@@ -394,3 +394,7 @@ Dead / self-contradicting
 - **D24** env.py hold logic: a hold cannot extend or restart on its exit step,
   so realized dropout law is exactly draw_hold's, not the documented
   restart-capable process. Document or allow restarts.
+
+Wave-1 deferrals closed 2026-08-25: `SimState.armed` leaf ([F] bool; motors all
+True) + `metrics()["armed_frac"]`; nav's live-viz tap now carries info["armed"]
+so the HUD ARMED caption works during training.

@@ -423,8 +423,12 @@ Sticks substep order (normative): synth sensors
 (FLU→FRD flip; baro from z-up altitude, isothermal 101325 Pa / 8434 m — a harness-side
 sensor model, documented as such) →
 `fw_step` → motors [0,1] reordered by `motor_perm` → motor duties feed the throttle map
-(no board-align rotation exists: a dump with `align_board_*` set, or with
-`yaw_motors_reversed = ON`, is REJECTED at construction — the packaging cannot honor it)
+(the inverse board-align pre-rotation is PLANNED, not implemented — TECH_DEBT F8: a
+dump whose effective `align_board_*` is nonzero WARNS at construction, because the
+firmware may then read rotated sensor rows; pin it to 0 in `eeprom_overrides` for the
+craft-aligned virtual board. `yaw_motors_reversed = ON` is accepted as-is — the plant's
+spin signs must match the physical prop direction; a consistency check against the
+airframe is open, TECH_DEBT C13/F9)
 as u (ZOH for that 1 ms substep). `control="sticks"` requires `physics_hz == 1000`: each
 physics substep pairs one plant step with exactly one 1 kHz firmware tick (the firmware's
 virtual clock advances 1 ms per tick, unconditionally), so any other rate would silently

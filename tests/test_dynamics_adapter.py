@@ -211,6 +211,7 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         est_held=jnp.zeros((f, dynamics.STATE_DIM), jnp.float32),
         steps=jnp.zeros(f, jnp.int32),
         airborne=jnp.zeros(f, bool),
+        armed=jnp.ones(f, bool),
         ep_return=jnp.zeros(f, jnp.float32),
         ep_len=jnp.zeros(f, jnp.int32),
         crash_frac=jnp.zeros((), jnp.float32),

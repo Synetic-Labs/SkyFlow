@@ -45,41 +45,63 @@ def test_bad_motor_perm_rejected():
         )
 
 
-# -- eeprom dump settings the sensor packaging cannot honor (F8, C13/F9) ---------------
-# The scans run before any cudaflight import, so these tests run everywhere.
+# -- eeprom board alignment: SkyFlow applies no inverse sensor rotation (F8) ----------
+# The scan runs before any cudaflight import, so these tests run everywhere. A real
+# dump (the Air75 factory CLI) carries align_board_yaw = -135 — it must WARN, never be
+# rejected: the sim runs the real config.
 
 
-def _sticks_cfg(dump_path) -> SimConfig:
-    return SimConfig(num_envs=1, control="sticks", firmware="cpu", eeprom=str(dump_path))
+def _sticks_cfg(dump_path, overrides=None) -> SimConfig:
+    return SimConfig(
+        num_envs=1, control="sticks", firmware="cpu", eeprom=str(dump_path),
+        eeprom_overrides=None if overrides is None else str(overrides),
+    )
 
 
-def test_board_align_dump_rejected(tmp_path):
-    dump = tmp_path / "dump.txt"
-    dump.write_text("set align_board_yaw = 90\nset motor_pwm_protocol = PWM\n")
-    with pytest.raises(ValueError, match="align_board_yaw"):
-        SkyFlowEnv(_sticks_cfg(dump))
-
-
-def test_zero_board_align_dump_passes_the_scan(tmp_path):
-    """align_board_* = 0 (every stock dump) must NOT trip the guard — construction
-    proceeds to the render/boot stage (whose errors are cudaflight-dependent)."""
-    dump = tmp_path / "dump.txt"
-    dump.write_text("set align_board_roll = 0\nset align_board_yaw = 0\n")
+def _construct_past_the_scan(cfg: SimConfig) -> None:
+    """Construction proceeds to the render/boot stage; its errors there are
+    cudaflight-dependent (missing wheel, unrenderable stub dump) and not under test."""
     try:
-        env = SkyFlowEnv(_sticks_cfg(dump))
-        env.close()  # only reached with cudaflight present AND the dump renderable
+        env = SkyFlowEnv(cfg)
+        env.close()
     except ValueError as e:
         assert "align_board" not in str(e)
     except Exception:
-        pass  # ImportError / render failures are fine — the scan let it through
+        pass
 
 
-def test_board_align_in_overrides_rejected(tmp_path):
+def test_board_align_dump_warns_not_rejects(tmp_path):
     dump = tmp_path / "dump.txt"
-    dump.write_text("set align_board_yaw = 0\n")
+    dump.write_text("set align_board_yaw = -135\nset yaw_motors_reversed = ON\n")
+    with pytest.warns(RuntimeWarning, match="align_board_yaw"):
+        _construct_past_the_scan(_sticks_cfg(dump))
+
+
+def test_zero_board_align_dump_is_silent(tmp_path):
+    import warnings
+
+    dump = tmp_path / "dump.txt"
+    dump.write_text("set align_board_roll = 0\nset align_board_yaw = 0\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        try:
+            _construct_past_the_scan(_sticks_cfg(dump))
+        except RuntimeWarning as w:  # pragma: no cover - the assertion we want to fail
+            raise AssertionError(f"zero alignment must not warn: {w}") from w
+
+
+def test_overrides_zero_the_dump_alignment(tmp_path):
+    """The overrides file wins (as in the render): pinning align_board_yaw = 0 there
+    silences the warning a nonzero dump value would raise."""
+    import warnings
+
+    dump = tmp_path / "dump.txt"
+    dump.write_text("set align_board_yaw = -135\n")
     ov = tmp_path / "overrides.txt"
-    ov.write_text("set align_board_pitch = -45\n")
-    cfg = SimConfig(num_envs=1, control="sticks", firmware="cpu",
-                    eeprom=str(dump), eeprom_overrides=str(ov))
-    with pytest.raises(ValueError, match="align_board_pitch"):
-        SkyFlowEnv(cfg)
+    ov.write_text("set align_board_yaw = 0\n")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        try:
+            _construct_past_the_scan(_sticks_cfg(dump, ov))
+        except RuntimeWarning as w:  # pragma: no cover
+            raise AssertionError(f"overridden alignment must not warn: {w}") from w

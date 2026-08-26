@@ -107,7 +107,7 @@ def test_metrics_are_scalars_with_the_exact_documented_keys(key):
     m = env.metrics(state)
     assert set(m) == {
         "crash_frac", "success_frac", "trunc_frac", "ep_return_ema", "ep_len_ema",
-        "ep_return_mean", "ep_len_mean", "airborne_frac", "wind_speed_mean",
+        "ep_return_mean", "ep_len_mean", "airborne_frac", "armed_frac", "wind_speed_mean",
         "hover/dist", "hover/goal_hold",
     }
     for v in m.values():

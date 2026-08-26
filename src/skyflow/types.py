@@ -35,6 +35,10 @@ class ObsTerm(NamedTuple):
     name: str
     dim: int
     units: str = ""
+    # True for an image block (a rendered mask): env-side corruption that assumes
+    # metric numbers (dr.obs_noise) must skip it. An explicit flag, not a units
+    # string convention — a task that forgets units still gets the right behavior.
+    image: bool = False
 
 
 class ObsSpec(tuple[ObsTerm, ...]):
@@ -210,6 +214,8 @@ class SimState:
     est_held: Array  # [F,17] f32 the estimate emitted during a dropout hold
     steps: Array  # [F] int32
     airborne: Array  # [F] bool
+    armed: Array  # [F] bool — sticks: the firmware's arm flag after the last substep
+    # (a failsafe/runaway disarm shows here and in metrics armed_frac); motors: all True
     ep_return: Array  # [F]
     ep_len: Array  # [F] int32
     # -- §7 step 10 episode-bookkeeping EMAs (0-d f32, fleet-global by design): updated

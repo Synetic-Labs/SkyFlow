@@ -62,6 +62,9 @@ def test_sticks_gate_multistep_with_auto_reset(sticks_gate_env):
 
     ts = env.task_state(state)
     assert ts.active_gate.shape == (FLEET,)
+    # the armed leaf feeds a fleet metric; every world stays armed on this flight
+    m = env.metrics(state)
+    assert m["armed_frac"].shape == () and float(m["armed_frac"]) == 1.0
 
 
 def test_sticks_record_binds_resolve(tmp_path, sticks_gate_env):

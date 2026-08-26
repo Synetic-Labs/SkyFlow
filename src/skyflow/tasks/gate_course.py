@@ -171,7 +171,7 @@ class GateCourseTask:
             self._render_masks = render_masks
             h, w = int(self._camera.height), int(self._camera.width)
             self.image_shape: tuple[int, int, int] | None = (h, w, 1)
-            self.obs_spec = ObsSpec((ObsTerm("mask", h * w, "[0,1] coverage HxW row-major"), *tail))
+            self.obs_spec = ObsSpec((ObsTerm("mask", h * w, "[0,1] coverage HxW row-major", image=True), *tail))
         else:
             self._camera = None
             self.image_shape = None

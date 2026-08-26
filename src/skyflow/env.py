@@ -289,12 +289,6 @@ def tree_where(done: Array, fresh: Any, current: Any) -> Any:
     return jax.tree.map(sel, fresh, current)
 
 
-def _is_image_units(units: str) -> bool:
-    """True for ObsTerm units that declare a bounded image block ("[0,1] coverage ...",
-    "{0,1} ..."): dr.obs_noise must not touch those pixels (TECH_DEBT C8)."""
-    return units.startswith(("[0,1]", "{0,1}"))
-
-
 def _uniform_ball(key: Array, n: int) -> Array:
     """[n,3] f32 points uniform in the unit ball (direction · radius^(1/3) law)."""
     k_dir, k_r = jax.random.split(key)
@@ -482,15 +476,12 @@ class SkyFlowEnv:
         self.image_shape = self.task.image_shape
         # dr.obs_noise is unit-blind (the LEGACY stress knob): one half-width sane
         # for metres DESTROYS mask pixels riding in the same vector. Zero the noise
-        # on image-valued terms (units declared "[0,1] ..." or "{0,1} ..."); numeric
-        # terms keep the blanket, so state-only tasks stay bit-exact against legacy
-        # draws (same key, same shape).
+        # on image terms (ObsTerm.image=True); numeric terms keep the blanket, so
+        # state-only tasks stay bit-exact against legacy draws (same key, same shape).
         self._obs_noise_scale: Array | None = None
-        if any(_is_image_units(t.units) for t in self.obs_spec):
+        if any(t.image for t in self.obs_spec):
             self._obs_noise_scale = jnp.concatenate([
-                jnp.zeros(t.dim, jnp.float32)
-                if _is_image_units(t.units)
-                else jnp.ones(t.dim, jnp.float32)
+                jnp.zeros(t.dim, jnp.float32) if t.image else jnp.ones(t.dim, jnp.float32)
                 for t in self.obs_spec
             ])
 
@@ -640,29 +631,33 @@ class SkyFlowEnv:
                     f"cfg.eeprom_overrides: no such CLI file: {overrides}"
                 )
 
-        # Settings SkyFlow's sensor packaging cannot honor — refuse the dump before
-        # it boots. Both scans cover the overrides file too (it merges in).
-        text = dump.read_text(errors="replace")
-        if overrides is not None:
-            text += "\n" + overrides.read_text(errors="replace")
-        # DESIGN §10 once named an inverse board-align rotation; no such step exists,
-        # so a dump aligned for a rotated FC board would fly with sensors the
-        # firmware misreads — silently (TECH_DEBT F8: reject, not implement).
-        for m in re.finditer(
-            r"^\s*set\s+(align_board_(?:roll|pitch|yaw))\s*=\s*(-?\d+)", text, re.M
-        ):
-            if int(m.group(2)) != 0:
-                raise ValueError(
-                    f"cfg.eeprom: {m.group(1)} = {m.group(2)} — board-align "
-                    "rotations are not implemented in SkyFlow's sensor packaging, "
-                    "so the firmware would misread every sensor row. Re-dump with "
-                    "align_board_* = 0 (mount alignment belongs to the real "
-                    "vehicle, not the sim)."
-                )
-        # yaw_motors_reversed is NOT checked (decided 2026-08-25): props in/out is
-        # airframe information — the airframe's `spin` table and the vehicle's own
-        # CLI dump are both measured facts from the same real drone (the props-out
-        # whoop correctly sets ON). TECH_DEBT C13/F9.
+        # Board alignment: Betaflight rotates its raw sensor rows by align_board_*
+        # before use. SkyFlow hands the firmware sensors already in the craft frame
+        # and implements NO inverse pre-rotation (DESIGN §10 names it as planned —
+        # TECH_DEBT F8), so a nonzero EFFECTIVE alignment (overrides win over the
+        # dump, as in the render) may leave the firmware reading rotated sensors.
+        # Real dumps carry these values (the Air75 factory CLI: yaw -135), so this
+        # is a warning, never a rejection — the sim must run the real config.
+        align: dict[str, int] = {}
+        for src in (dump, overrides):
+            if src is None:
+                continue
+            for m in re.finditer(
+                r"^\s*set\s+(align_board_(?:roll|pitch|yaw))\s*=\s*(-?\d+)",
+                src.read_text(errors="replace"),
+                re.M,
+            ):
+                align[m.group(1)] = int(m.group(2))  # later files override earlier
+        nonzero = {k: v for k, v in align.items() if v != 0}
+        if nonzero:
+            warnings.warn(
+                f"cfg.eeprom: board alignment {nonzero} is set and SkyFlow applies no "
+                "inverse sensor rotation — the firmware may read rotated sensor rows. "
+                "Verify a hover before trusting this config, or pin align_board_* = 0 "
+                "in eeprom_overrides (the sim's virtual board is craft-aligned).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
 
         import cudaflight  # deferred like the fleet import: only this seam needs it
 
@@ -765,7 +760,7 @@ class SkyFlowEnv:
     def _corrupt_obs(self, obs: Array, key: Array) -> Array:
         """DomainRand.obs_noise on the finalized task observation (uniform half-width);
         applied by the env so tasks keep semantics and the env keeps corruption.
-        Image-valued terms ("[0,1]"/"{0,1}" units) are excluded — see `_obs_noise_scale`."""
+        Image terms (ObsTerm.image) are excluded — see `_obs_noise_scale`."""
         if self.dr.obs_noise <= 0.0:
             return obs
         noise = jax.random.uniform(
@@ -832,6 +827,7 @@ class SkyFlowEnv:
             plant=plant,
             params=params,
             key=k_carry,
+            armed=jnp.ones(f, bool),  # every fleet starts from the armed snapshot
             wind_vel=wind_vel,
             dr_state=dr_state,
             act_buf=act_buf,
@@ -1110,6 +1106,7 @@ class SkyFlowEnv:
             est_held=emitted_new,
             steps=jnp.zeros(f, jnp.int32),
             airborne=jnp.zeros(f, bool),
+            armed=jnp.ones(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
             ep_len=jnp.zeros(f, jnp.int32),
             task_carry=ts_fresh,
@@ -1128,6 +1125,7 @@ class SkyFlowEnv:
             est_held=emitted,
             steps=steps,
             airborne=airborne,
+            armed=jnp.ones(f, bool) if armed is None else armed.astype(bool),
             ep_return=ep_return,
             ep_len=ep_len,
             task_carry=ts_out,
@@ -1200,6 +1198,9 @@ class SkyFlowEnv:
             "ep_return_mean": jnp.mean(state.ep_return),
             "ep_len_mean": jnp.mean(state.ep_len.astype(jnp.float32)),
             "airborne_frac": jnp.mean(state.airborne.astype(jnp.float32)),
+            # sticks: fraction of the fleet the firmware holds armed (a failsafe or
+            # runaway-takeoff disarm drops it); motors mode reports 1.0
+            "armed_frac": jnp.mean(state.armed.astype(jnp.float32)),
             "wind_speed_mean": jnp.mean(
                 jnp.linalg.norm(state.dr_state.wind_mean + state.wind_vel, axis=-1)
             ),
