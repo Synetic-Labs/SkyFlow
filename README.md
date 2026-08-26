@@ -2,6 +2,8 @@
 
 An accurate and fast quadrotor simulator in JAX. Advanced physics, massive parallel training.
 
+![SkyFlow viewer](skyflow_viewer.png)
+
 The dynamics is generated from the [SkyFlow-Dynamics](https://github.com/Synetic-Labs/SkyFlow-Dynamics).
 That maintains the symbolic spec, and SkyFlow is the harness.
 
