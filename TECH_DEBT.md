@@ -283,7 +283,7 @@ Most findings are instances of six patterns. Fixing a pattern kills its class.
    [C13/F9] partial: yaw_motors_reversed=ON dumps now raise (motor_perm cannot
    compensate a spin-table flip); full motor_perm derivation from the mixer
    table stays OPEN (needs cudaflight introspection). [C8] obs_noise now skips
-   mask-valued terms ({0,1} units) via a per-dim scale; numeric terms bit-exact
+   image-valued terms (units prefixed "[0,1]"/"{0,1}", env._is_image_units) via a per-dim scale; numeric terms bit-exact
    legacy. [T3] gates is a property whose setter re-derives ALL cached geometry —
    the reward/collision chimera is impossible. [T15] one crossing solve:
    gates._crossing_point shared by classify_crossings and the new
@@ -312,3 +312,81 @@ required mechanical fixes in the OTHER session's files: en-dashes in errors.py
 comments, Optional-narrowing asserts + one deliberate-invalid-call ignore in
 test_obs_error.py/test_delay_link.py, and one possibly-unbound `done` init.
 Behavior unchanged; separate these hunks at commit if authorship matters.
+
+---
+
+## 7. DR-area review — 2026-08-25 (the five DR commits e03b597..531a477)
+
+Requested by James after waves 1-6 landed. Read-only review of the factor
+stage, battery_sag, cmd_drop_prob and the L5 estimator model against the six
+roots. Nothing here is fixed yet; James decides what to take.
+
+Silent-wrong-behavior traps
+- **D1** env.py: with `obs_error` on, the vision task renders the gate MASK
+  from the ESTIMATED pose (`corrupt_plant` output feeds `task.observe`, which
+  calls `render_masks`). A real camera images from the true pose; only derived
+  state is wrong. Violates ERRORS.md "never corrupt what the agent truly
+  knows". No test runs vision + obs_error. Fix: render from `plant`.
+- **D2** errors.py:225 quaternion renormalization is NOT bit-exact at zero
+  widths (1.19e-7 measured on non-identity quats); contradicts the "none
+  profile leaves values bit-identical" claim. The pinning test hovers at
+  identity attitude, so it cannot see it. Fix: skip the rotation compose when
+  attitude widths are 0.
+- **D3** params.py:293 + env.py `_tw_reguard`: the shipped default
+  (factors=None, battery_sag=0, body DR on) still runs NO thrust-to-weight
+  guard — [C6] is half-closed. A low-T/W airframe or a `brackets={"mass":..}`
+  override yields worlds that truncate as `stuck`. Fix: always re-guard.
+- **D4** "scale=0 with delay (0,0) is bit-exact nominal" (env.py docstring,
+  DESIGN §7) is now false: `effective()` never scales `cmd_drop_prob` or
+  obs_error `p_drop`. Restate as an `off()`-only invariant.
+- **D5** env.py `_is_image_units`: the obs_noise image exclusion keys on a
+  free-form units prefix. `ObsTerm.units` defaults to ""; a vision task that
+  omits units gets metre-scale noise on every pixel again. Fix: an explicit
+  image marker (ObsTerm field, or the task's image term name), not a string.
+- **D6** params.py:176 `base.get(name, 0.0)`: a SCHEMA key missing from
+  DR_BRACKETS/RESIDUAL_BRACKETS is silently never jittered (an override for it
+  raises). Fix: assert table keys == schema keys minus NEVER_JITTER.
+- **D7** params.py:307 factor groups combine additively; disjointness is a
+  comment, not a check. Fix: validate in `_factor_tables`.
+- **D8** params.py:242 `factor_floor` bounds only the low side;
+  `factors={"mass": (0, 50)}` constructs. Fix: bound `hi`.
+- **D9** env.py negativity loop omits battery_sag/cmd_drop_prob; a negative
+  battery_sag with scale=0 folds to -0.0 and passes. Validate raw fields.
+
+Untested axes
+- **D10** No test runs sticks mode with battery_sag, cmd_drop_prob, obs_error
+  or factors — the knobs justified by sticks-mode evidence (R4).
+- **D11** Estimator leaves (est_ou/est_hold/est_bias) untested through the
+  auto-reset path.
+- **D12** `test_scale_zero_disables_every_continuous_knob` omits the four new
+  knobs (and would fail for two, see D4).
+- **D13** obs_error never tested x delay_steps (the measured lethal pair), x
+  the gate task, x obs_noise on top.
+
+Duplicate truths / disagreements
+- **D14** DESIGN §4 SimState block still names `task_state`, lists no
+  cmd_prev/est_* leaves; DRState block omits w_max/est_bias.
+- **D15** DESIGN §4 "new traits go HERE, never as new SimState leaves" vs
+  ERRORS.md "drift state in SimState" — charter conflict.
+- **D16** types.py:201 dr_state comment stale (missing w_max/est_bias) while
+  the DRState docstring above it is correct.
+- **D17** DESIGN §6 omits `factors` from sample_params and the whole factor
+  stage (RESIDUAL_BRACKETS, FACTOR_GROUPS, FACTOR_LIMITS, TW_FLOOR, guards).
+- **D18** Three draw classes (DESIGN, env.py docstring) vs four in ERRORS.md
+  (drift); the new knobs are classified nowhere in env.py.
+- **D19** env.py normative pipeline (steps 1, 8) and DESIGN §7 never mention
+  the drop hold or the L5 plant corruption/dropout hold.
+
+Dead / self-contradicting
+- **D20** errors.py:124 "must be a dict or None" is unreachable through
+  SkyFlowEnv — `effective()` does `dict(obs_error)` first and raises a bare
+  ValueError.
+- **D21** errors.py:95 comment says "beyond profile" above a tuple starting
+  with "profile".
+- **D22** errors.py:227 rotor error is a uniform half-width but is documented
+  and scaled as a white std.
+- **D23** env.py draws `draw_hold` and runs `advance_ou` every step even when
+  inert (dead hot-step work; numerically harmless).
+- **D24** env.py hold logic: a hold cannot extend or restart on its exit step,
+  so realized dropout law is exactly draw_hold's, not the documented
+  restart-capable process. Document or allow restarts.
