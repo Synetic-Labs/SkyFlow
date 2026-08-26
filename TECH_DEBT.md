@@ -398,3 +398,13 @@ Dead / self-contradicting
 Wave-1 deferrals closed 2026-08-25: `SimState.armed` leaf ([F] bool; motors all
 True) + `metrics()["armed_frac"]`; nav's live-viz tap now carries info["armed"]
 so the HUD ARMED caption works during training.
+- **D25** (idea, James 2026-08-26) camera-extrinsics trait for the vision task:
+  per-world per-episode mount-ANGLE error on the camera (degree-class roll/
+  pitch/yaw half-widths, e.g. `dr.camera_mount_deg`). Mount angle dominates —
+  1 deg of tilt shifts a gate 10 m out by ~0.17 m in the image; mount POSITION
+  error is mm-class against metres of gate distance, skip it. A trait draw
+  like body DR, constant within an episode. Blocker: render_masks uses ONE
+  shared CameraModel for the whole fleet — per-world mount rotations need a
+  small (vmappable) renderer change. Distinct from D1 (fixed): the camera uses
+  the TRUE pose plus its own fixed mount error. No urgency: nothing trains on
+  the vision task today.
