@@ -314,6 +314,45 @@ class TestViewer:
         finally:
             viewer.close()
 
+    def test_mailbox_reports_replaced_frames(self):
+        from skyflow.viz.viewer import _Mailbox
+
+        dropped = []
+        mb = _Mailbox(on_drop=dropped.append)
+        mb.put("a")
+        mb.put("b")  # "a" was never taken: it drops
+        assert dropped == ["a"]
+        assert mb.take(0.1)[0] == "b"
+        mb.put("c")  # "b" WAS taken: no drop
+        assert dropped == ["a"]
+
+    def test_dropped_done_frame_still_clears_the_trail(self):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            a = _frame()
+            a.plant[0, 0:3] = (3.0, 0.0, 1.0)
+            a.step = 5
+            b = _frame()
+            b.plant[0, 0:3] = (3.1, 0.0, 1.0)
+            b.step = 6
+            viewer.push(a, force=True)
+            viewer.push(b, force=True)
+            assert len(viewer._trails[0]) == 2
+            crash = _frame()
+            crash.step = 7
+            crash.done = np.array([True, False])
+            viewer._stash_done(crash)  # the crash frame itself was dropped whole
+            respawn = _frame()  # back at the origin
+            respawn.plant[0, 0:3] = (0.0, 0.0, 1.0)
+            respawn.step = 0
+            viewer.push(respawn, force=True)
+            # the carried done must clear the trail: no crash→origin streak
+            assert len(viewer._trails[0]) == 0
+        finally:
+            viewer.close()
+
     def test_render_thread_owns_drawing(self, tmp_path):
         """A threaded viewer draws, screenshots, and closes with NO further pushes:
         the render thread keeps the last frame alive and burns the frames budget."""

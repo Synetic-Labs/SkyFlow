@@ -86,17 +86,22 @@ class _Mailbox:
     """
     Latest-wins single-slot handoff to the render thread; old frames drop by design.
     Carries either a prebuilt ViewFrame (push) or a raw (state, ...) tuple whose
-    snapshot the render thread takes itself (frame).
+    snapshot the render thread takes itself (frame). `on_drop` fires (under the lock,
+    keep it cheap) for every never-taken item a put replaces — the viewer uses it to
+    keep the dropped frame's done flags, so a respawn is never lost.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_drop: Callable[[Any], None] | None = None) -> None:
         self._lock = threading.Lock()
         self._new = threading.Event()
         self._item: Any = None
         self._seq = 0
+        self._on_drop = on_drop
 
     def put(self, item: Any) -> int:
         with self._lock:
+            if self._new.is_set() and self._item is not None and self._on_drop is not None:
+                self._on_drop(self._item)  # replaced before ever being taken
             self._item = item
             self._seq += 1
             self._new.set()
@@ -208,6 +213,9 @@ class Viewer:
         self._gauges: dict[str, float] = {}  # HUD dial full-scales (grow-only)
         self._fed_t: deque[float] = deque(maxlen=120)  # feed timestamps → health fps
         self._drawn_t: deque[float] = deque(maxlen=120)  # fresh-draw timestamps
+        # done flags of DROPPED frames (mailbox latest-wins, display throttle): folded
+        # into the next drawn frame, so a crash→respawn jump never draws as a trail
+        self._lost_dones: deque[tuple[bool, Any]] = deque(maxlen=32)
         self._eps = _EpTrace(cap=2048)  # steps-per-episode bars, focused world
         self._ep_base: int | None = None  # step at the current episode's first sighting
         self._ep_last_step: int | None = None
@@ -227,7 +235,7 @@ class Viewer:
         self._init_error: Exception | None = None
         self._shot_req: tuple[str, threading.Event] | None = None
         if threaded:
-            self._mail = _Mailbox()
+            self._mail = _Mailbox(on_drop=self._stash_done)
             self._cond = threading.Condition()
             self._drawn = 0
             self._ready = threading.Event()
@@ -273,6 +281,7 @@ class Viewer:
                 if item is not None:
                     vf = item if isinstance(item, ViewFrame) else self._snap(*item)
                     if vf is not None:
+                        self._merge_lost_dones(vf)
                         self._process(vf, force=True)
                     with self._cond:
                         self._drawn = seq
@@ -380,6 +389,7 @@ class Viewer:
         now = time.perf_counter()
         self._fed_t.append(now)  # health: the true feed rate, counted before the throttle
         if now - self._last_submit < self._display_dt:
+            self._stash_done((state, obs, action, reward, channels, done, info))
             return
         self._last_submit = now
         if self._thread is not None:
@@ -387,6 +397,7 @@ class Viewer:
             return
         vf = self._snap(state, obs, action, reward, channels, done, info)
         if vf is not None:
+            self._merge_lost_dones(vf)
             self._process(vf)
 
     def _snap(self, state, obs, action, reward, channels, done, info) -> ViewFrame | None:
@@ -472,6 +483,7 @@ class Viewer:
                         lambda: self._drawn >= seq or not self._open, timeout=5.0
                     )
             return
+        self._merge_lost_dones(vf)
         self._process(vf, force)
 
     def _process(self, vf: ViewFrame, force: bool = False) -> None:
@@ -510,6 +522,31 @@ class Viewer:
         return np.transpose(pygame.surfarray.array3d(self._screen), (1, 0, 2))
 
     # -- internals ---------------------------------------------------------------------
+
+    def _stash_done(self, item: Any) -> None:
+        """A frame is being dropped whole (mailbox latest-wins or the display
+        throttle) — keep its done flags. Without this a respawn between drawn frames
+        is invisible: the trail draws a crash→respawn streak and the episode stats
+        miss the boundary."""
+        is_vf = isinstance(item, ViewFrame)
+        done = item.done if is_vf else item[5]
+        if done is not None:
+            self._lost_dones.append((is_vf, done))
+
+    def _merge_lost_dones(self, vf: ViewFrame) -> None:
+        """Fold dropped frames' done flags into the frame that IS drawn."""
+        while self._lost_dones:
+            is_vf, d = self._lost_dones.popleft()
+            try:
+                rows = np.asarray(d)  # raw path: pulls the device array
+                if not is_vf:
+                    rows = rows[list(self.watch)]  # [F] fleet rows → watch rows
+                rows = rows.reshape(-1).astype(bool)
+            except Exception:
+                continue  # donated/freed device buffer: that signal is gone
+            if vf.done is not None and rows.shape != vf.done.shape:
+                continue
+            vf.done = rows if vf.done is None else np.logical_or(vf.done, rows)
 
     @staticmethod
     def _fps(ts: "deque[float]") -> float:
