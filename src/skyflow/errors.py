@@ -30,10 +30,11 @@ and a DROPOUT event: with p_drop per step the estimator repeats its last emitted
 estimate for a geometric-mean duration (mocap occlusion, VIO tracking loss) —
 staleness, not noise.
 
-Profile values are LITERATURE-CLASS: right order of magnitude for the named
-estimator, sourced below. Replace them with measured values when deploy residual
-logs and the sit-still Allan bench exist — the fields map one-to-one (Allan
-white-noise density -> white, bias instability -> bias, flat-region knee -> tau).
+Profile values are literature-class EXCEPT where marked measured (the rate group
+carries the 2026-08-26 Air75 II Freestyle sit-still Allan bench). Replace the
+rest with measured values as deploy residual logs exist — the fields map
+one-to-one (Allan white-noise density -> white, bias instability -> bias,
+flat-region knee -> tau).
 
 The determinism charter holds: nothing here runs inside the ODE or the firmware
 path, every draw enters through explicitly passed keys, and obs_error=None (or
@@ -76,7 +77,10 @@ PROFILES: dict[str, dict] = {
         "pos": dict(bias=0.002, ou=(0.0005, 30.0), white=0.001),  # m
         "vel": dict(bias=0.0, ou=(0.0, 1.0), white=0.02),  # m/s
         "att": dict(bias=0.005, ou=(0.0, 1.0), white=0.004),  # rad (~0.3 / 0.23 deg)
-        "rate": dict(bias=0.001, ou=(0.0, 1.0), white=0.005),  # rad/s, post-arm-cal gyro
+        # rate white: MEASURED Air75 II Freestyle sit-still bench 2026-08-26 —
+        # electronic floor 0.0072 rad/s @100 Hz worst axis (900 s Allan); bias:
+        # post-arm-cal class, measured in-run instability 7e-5 + cal/temp margin.
+        "rate": dict(bias=0.001, ou=(0.0, 1.0), white=0.008),  # rad/s, measured
         "rotor_rel": 0.01,  # eRPM telemetry ~1 %
         "p_drop": 0.005,  # ~one occlusion per 2 s at 100 Hz
         "drop_mean_steps": 10.0,  # ~100 ms holds
@@ -85,7 +89,7 @@ PROFILES: dict[str, dict] = {
         "pos": dict(bias=0.01, ou=(0.02, 3.0), white=0.005),  # m — cm class + drift
         "vel": dict(bias=0.01, ou=(0.02, 3.0), white=0.02),  # m/s
         "att": dict(bias=0.01, ou=(0.01, 5.0), white=0.005),  # rad — yaw drift dominates
-        "rate": dict(bias=0.001, ou=(0.0, 1.0), white=0.005),  # rad/s
+        "rate": dict(bias=0.001, ou=(0.0, 1.0), white=0.008),  # rad/s, measured (bench)
         "rotor_rel": 0.01,
         "p_drop": 0.01,
         "drop_mean_steps": 20.0,  # ~200 ms tracking hiccups
