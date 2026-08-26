@@ -28,7 +28,7 @@ def _env(obs_error, scale: float = 1.0, **dr_kwargs):
 def test_unknown_profile_and_keys_raise():
     with pytest.raises(ValueError, match="profile"):
         errors.resolve_obs_error({"profile": "gps"})
-    with pytest.raises(ValueError, match="unknown dr.obs_error keys"):
+    with pytest.raises(ValueError, match=r"unknown dr\.obs_error keys"):
         errors.resolve_obs_error({"profile": "mocap", "sigma": 1.0})
     with pytest.raises(ValueError, match="bias_frac"):
         errors.resolve_obs_error({"profile": "mocap", "bias_frac": -1.0})
@@ -40,6 +40,7 @@ def test_unknown_profile_and_keys_raise():
 def test_fracs_scale_the_profile_widths():
     base = errors.resolve_obs_error({"profile": "mocap"})
     half = errors.resolve_obs_error({"profile": "mocap", "white_frac": 0.5})
+    assert base is not None and half is not None
     np.testing.assert_allclose(np.asarray(half.white), 0.5 * np.asarray(base.white))
     assert half.rotor_rel == pytest.approx(0.5 * base.rotor_rel)
     assert half.bias == base.bias  # other components untouched
@@ -47,6 +48,7 @@ def test_fracs_scale_the_profile_widths():
 
 def test_master_scale_folds_into_the_fracs():
     dr = DomainRand(scale=0.5, obs_error={"profile": "mocap"}).effective()
+    assert dr.obs_error is not None
     assert dr.obs_error["white_frac"] == pytest.approx(0.5)
     assert dr.obs_error["bias_frac"] == pytest.approx(0.5)
     # event knobs never scale
@@ -58,6 +60,7 @@ def test_master_scale_folds_into_the_fracs():
 
 def test_corrupted_quaternion_is_a_unit_quaternion():
     spec = errors.resolve_obs_error({"profile": "vio", "bias_frac": 5.0})
+    assert spec is not None
     key = jax.random.PRNGKey(0)
     plant = jnp.zeros((64, 17), jnp.float32).at[:, 6].set(1.0)  # identity quats
     bias = errors.draw_bias(jax.random.PRNGKey(1), 64, spec)
@@ -70,6 +73,7 @@ def test_corrupted_quaternion_is_a_unit_quaternion():
 
 def test_rotor_estimate_is_relative_and_floored():
     spec = errors.resolve_obs_error({"profile": "mocap"})
+    assert spec is not None
     plant = jnp.zeros((32, 17), jnp.float32).at[:, 6].set(1.0).at[:, 13:17].set(2000.0)
     est = errors.corrupt_plant(
         plant, jnp.zeros((32, 12)), jnp.zeros((32, 12)), jax.random.PRNGKey(2), spec
@@ -86,6 +90,7 @@ def test_rotor_estimate_is_relative_and_floored():
 
 def test_ou_stationary_std_matches_sigma():
     spec = errors.resolve_obs_error({"profile": "vio"})
+    assert spec is not None
     ou = jnp.zeros((256, 12), jnp.float32)
     key = jax.random.PRNGKey(3)
     for i in range(4000):  # 40 s at 100 Hz >> max tau 5 s
@@ -123,6 +128,7 @@ def test_bias_is_a_per_episode_trait():
     assert np.abs(bias0).max() > 0.0
     step = jax.jit(env.step)
     a = jnp.zeros((FLEET, 4), jnp.float32)
+    done = jnp.zeros(FLEET, bool)
     for _ in range(3):
         _, state, _, done, _ = step(state, a)
     assert not bool(np.asarray(done).any())

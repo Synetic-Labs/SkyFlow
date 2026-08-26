@@ -53,9 +53,9 @@ GROUPS = ("pos", "vel", "att", "rate")
 
 #: Per-group error tables. Sources (literature class, to be replaced by measured):
 #:   mocap — Vicon/OptiTrack rigid-body class, indoor volume: marker-centroid
-#:     jitter 0.2–1 mm RMS (white pos), wand-calibration + marker-frame offset
-#:     1–3 mm / 0.2–0.4 deg (bias pos/att), differentiated-position velocity
-#:     1–3 cm/s (white vel); rate error = post-arm-cal FC gyro (BMI270 class).
+#:     jitter 0.2-1 mm RMS (white pos), wand-calibration + marker-frame offset
+#:     1-3 mm / 0.2-0.4 deg (bias pos/att), differentiated-position velocity
+#:     1-3 cm/s (white vel); rate error = post-arm-cal FC gyro (BMI270 class).
 #:     Occlusion: brief marker loss, ~100 ms holds.
 #:   vio — cm-class onboard visual-inertial odometry on small quads: cm position
 #:     with seconds-scale drift (OU), yaw drift dominates attitude, tracking

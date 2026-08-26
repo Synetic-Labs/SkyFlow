@@ -32,7 +32,9 @@ def test_validation_rejects_bad_knobs():
     with pytest.raises(ValueError, match="cmd_drop_prob"):
         _env(cmd_drop_prob=1.0)
     with pytest.raises(TypeError):
-        DomainRand(delay_jitter_steps=1)  # removed 2026-08-24 — reordering is unphysical
+        # the param was removed 2026-08-24 (reordering is unphysical) — the call is
+        # deliberately invalid, which is exactly what pyright flags
+        DomainRand(delay_jitter_steps=1)  # pyright: ignore[reportCallIssue]
 
 
 def test_zero_knob_is_bit_exact_with_the_plain_env():
