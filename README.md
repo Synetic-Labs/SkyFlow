@@ -73,6 +73,70 @@ log.extend(plant_buf, action=action_buf)               # one host pull per chunk
 log.save("runs/042/flight.npz")
 ```
 
+#### Window controls
+
+| input | action |
+|---|---|
+| left-drag | orbit the camera about the scene centre (the near side follows the cursor) |
+| right/middle-drag | pan |
+| wheel | zoom about the cursor |
+| `Space` | pause / resume |
+| `Tab` | focus the next watched world |
+| `V` | view preset: iso / top / profile (each switch lands on a fresh fit) |
+| `C` | follow the focused world (keeps it centred; orbit/zoom still apply) |
+| `X` | full glyphs for ALL watched worlds (default: unfocused worlds are dots) |
+| `G` | whole-fleet scatter on/off (a dot per world, strided on device) |
+| `P` | print a screenshot to the working directory |
+| `R` | reset request (consumed by hosts that call `take_reset`) |
+| `←` `→` | scrub one step (replay, paused) |
+| `[` `]` | playback speed |
+| `Esc` | quit |
+
+The key list is always visible in a bar along the window's bottom edge. The top bar
+shows the clock, the step, drawn/fed fps, and the snapshot-drop count.
+
+#### Viewer options
+
+`Viewer.for_env(env, watch=(0,), **kw)` wires everything below from the env; pass any
+of them to override. `Viewer(scene, **kw)` takes the same options directly.
+
+| option | default | meaning |
+|---|---|---|
+| `scene` | task's `viz_scene()` + `Grid` | the display world (primitives) |
+| `watch` | `(0,)` | fleet rows to snapshot and draw (`Tab` cycles them) |
+| `camera` | task's `camera` | lens/mount for the FPV panes |
+| `gates` | task's `gates` | gate geometry for the pilot cam; `None` = floor/horizon |
+| `image_shape`, `obs_layout` | from env (vision tasks) | enable the verbatim policy-obs pane |
+| `image_term` | `"mask"` | name of the image block inside the obs layout |
+| `omega_max` | airframe's `rotor_speed_max` | rotor-speed normaliser for arcs and bars |
+| `control` | env's | `"sticks"` (AETR crosses + arm lamp) or `"motors"` (action bars) |
+| `dt` | env's control period | turns steps into the clock readout |
+| `task_state_of` | `env.task_state` | state → task pytree (scene binds resolve against it) |
+| `title` | task · control | window caption |
+| `size` | `(1280, 800)` | window size in pixels |
+| `display_hz` | `60.0` | draw-rate cap; `frame()` calls beyond it return without drawing |
+| `headless` | `False` | SDL dummy driver (CI, screenshots, export) |
+| `frames` | `None` | auto-close after N drawn frames |
+| `shot` | `None` | screenshot path written when `frames` runs out |
+| `threaded` | `True` | render thread owns the window; `False` = frame-exact draws (replay/export) |
+| `pilot`, `policy_floor` | analytic renderers | FPV renderer overrides (`.camera` + `.render(pos, quat)`) |
+
+#### Replay CLI
+
+`python -m skyflow.viz.replay <flight.npz>` opens the viewer on a saved log:
+
+| option | default | meaning |
+|---|---|---|
+| `path` | — | `flight.npz` written by `FlightLog.save` |
+| `--pilot-cam WxH` | `256x192` | pilot-cam resolution |
+| `--speed` | `1.0` | initial playback speed (`[` `]` at runtime) |
+| `--start` | `0` | first logged row to show |
+| `--headless` | off | SDL dummy driver (CI) |
+| `--frames N` | — | auto-close after N frames |
+| `--shot PATH` | — | screenshot saved when `--frames` ends |
+| `--mp4 PATH` | — | export the whole log to mp4 instead of opening a window |
+| `--mp4-fps` | `60.0` | mp4 playback fps; rows resample onto this clock (realtime playback) |
+
 ## Install
 
 ```bash
