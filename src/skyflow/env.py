@@ -114,7 +114,14 @@ class DomainRand:
     cog_offset_m: float = 0.0  # trait: CoG shift half-width per axis, m — applied as a
     # COMMON-MODE translation of all rotor positions (battery placement, the most
     # common real asymmetry). Never per-rotor jitter. Parallel-axis inertia change is
-    # second order at mm-cm scale and stays unmodeled (ERRORS.md).
+    # second order at mm-cm scale and stays unmodeled (ERRORS.md). Prefer the
+    # arm-relative knob below for anything but a single known vehicle.
+    cog_offset_frac: float = 0.0  # trait: CoG shift half-width as a FRACTION of the
+    # nominal mean rotor arm — the same relative asymmetry on ANY airframe (5 mm is
+    # a big shift on a whoop's ~40 mm arm and nothing on a 5-inch's ~120 mm).
+    # Measured (whoop 10M ladder 2026-08-26): 0.125 of arm trains 0.86, 0.25 half-dead
+    # 0.44, 0.5 unflyable 0.01 — the cliff is trim authority, honest physics.
+    # Exclusive with cog_offset_m (setting both raises).
 
     # -- world: wind and shocks ------------------------------------------------------
     wind_mean_mps: float = 0.0  # trait: steady horizontal wind, magnitude ceiling, m/s
@@ -237,6 +244,7 @@ class DomainRand:
             imu_offset_m=s * self.imu_offset_m,
             imu_mount_deg=s * self.imu_mount_deg,
             cog_offset_m=s * self.cog_offset_m,
+            cog_offset_frac=s * self.cog_offset_frac,
         )
 
 
@@ -453,7 +461,8 @@ class SkyFlowEnv:
             "poke_torque_nm", "poke_force_frac", "poke_torque_frac",
             "gyro_noise_rps", "accel_noise_mps2", "gyro_bias_rps",
             "accel_bias_mps2", "baro_noise_pa", "gyro_sat_rps", "gyro_scale_frac",
-            "imu_offset_m", "imu_mount_deg", "cog_offset_m", "battery_sag_rate_ps",
+            "imu_offset_m", "imu_mount_deg", "cog_offset_m", "cog_offset_frac",
+            "battery_sag_rate_ps",
             "obs_noise", "spawn_scale",
         ):
             if getattr(cfg.dr, name) < 0.0:
@@ -492,6 +501,11 @@ class SkyFlowEnv:
         if dr.poke_torque_nm > 0.0 and dr.poke_torque_frac > 0.0:
             raise ValueError(
                 "set dr.poke_torque_nm OR dr.poke_torque_frac, not both"
+            )
+        if dr.cog_offset_m > 0.0 and dr.cog_offset_frac > 0.0:
+            raise ValueError(
+                "set dr.cog_offset_m OR dr.cog_offset_frac, not both — one truth for "
+                "the CoG shift"
             )
         if dr.gyro_scale_frac >= 1.0:
             raise ValueError(
@@ -551,7 +565,12 @@ class SkyFlowEnv:
         )
         self._mount_on = dr.imu_offset_m > 0.0 or dr.imu_mount_deg > 0.0
         self._gscale_on = dr.gyro_scale_frac > 0.0
-        self._cog_on = dr.cog_offset_m > 0.0
+        # CoG width in meters: the frac knob resolves against the nominal mean rotor
+        # arm (the same r_arm the weight-relative pokes use) — airframe-portable.
+        self._cog_m = (
+            dr.cog_offset_frac * _r_arm if dr.cog_offset_frac > 0.0 else dr.cog_offset_m
+        )
+        self._cog_on = self._cog_m > 0.0
         self._nominal_row = jnp.asarray(
             dynamics.pack_params(self.airframe.values), jnp.float32
         )
@@ -860,7 +879,7 @@ class SkyFlowEnv:
             imu_offset = jnp.zeros((f, 3), jnp.float32)
             imu_mount = jnp.broadcast_to(jnp.eye(3, dtype=jnp.float32).reshape(9), (f, 9))
         if self._cog_on:
-            cog_offset = dr.cog_offset_m * jax.random.uniform(
+            cog_offset = self._cog_m * jax.random.uniform(
                 jax.random.fold_in(k_bias, 6), (f, 3), jnp.float32, -1.0, 1.0
             )
         else:

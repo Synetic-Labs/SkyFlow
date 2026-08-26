@@ -127,6 +127,14 @@ def test_cog_trait_reaches_the_params_row():
 
 # -- L2: pokes -------------------------------------------------------------------------
 
+def test_cog_frac_resolves_against_the_nominal_arm():
+    r_arm = float(np.mean([np.hypot(r[0], r[1]) for r in CF.values["rotor_pos"]]))
+    env = _env(cog_offset_frac=0.125)
+    assert env._cog_m == pytest.approx(0.125 * r_arm)
+    with pytest.raises(ValueError, match="not both"):
+        _env(cog_offset_m=0.005, cog_offset_frac=0.125)
+
+
 def test_poke_fracs_resolve_against_the_nominal_weight():
     m_g = CF.values["mass"] * abs(CF.values["grav"])
     env = _env(poke_force_frac=0.5, poke_torque_frac=0.1, poke_prob=0.01)
