@@ -203,7 +203,9 @@ class Viewer:
         self.speed = 1.0
         self._seek = 0
         self._reset_requested = False
-        self.show_fleet = False
+        # scatter dots draw whenever a frame carries fleet positions (a pushing host
+        # ships them itself; the raw frame() path pulls them here) — G hides/shows
+        self.show_fleet = True
         self._proj_kind = "iso"
         self._projs: dict[str, Projection] = {}
         self._focus = 0
@@ -765,6 +767,7 @@ class Viewer:
             label=label,
             font=self._small,
             show_glyphs=self.show_glyphs,
+            show_fleet=self.show_fleet,
         )
 
         fx = wpx - _FPV_W - 8

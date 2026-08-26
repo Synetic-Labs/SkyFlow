@@ -141,6 +141,20 @@ class TestBuilders:
             renders.append(pygame.surfarray.array3d(surface))
         assert (renders[0] != renders[1]).any(), "the up-flag should move with roll"
 
+    def test_fleet_scatter_gated_by_show_fleet(self):
+        # a pushed frame carries positions; the G key must be able to hide them
+        scene = Scene(Grid(half=(6, 6)))
+        proj = Projection.fit("iso", *scene.aabb(), (0, 0, 400, 300))
+        painted = []
+        for show in (True, False):
+            vf = _frame()
+            vf.positions = np.tile(np.array([[5.0, 5.0, 0.5]]), (50, 1))
+            surface = pygame.Surface((400, 300))
+            draw_scene(surface, (0, 0, 400, 300), proj, scene, vf, show_fleet=show)
+            arr = pygame.surfarray.array3d(surface).reshape(-1, 3)
+            painted.append(int((arr != palette.BG).any(axis=1).sum()))
+        assert painted[0] > painted[1], "show_fleet=False should hide the scatter"
+
     def test_hud_compass_turns_with_yaw(self):
         # pure yaw changes no other instrument, so any pixel delta comes from the compass
         renders = []

@@ -225,13 +225,15 @@ def draw_scene(
     label: str | None = None,
     font=None,
     show_glyphs: bool = False,
+    show_fleet: bool = True,
 ) -> None:
     """
     Draw the whole scene pane into `rect`: primitives (bind-resolved from `frame`,
     dispatched through the public registry), optional whole-fleet scatter, trails, then
     one glyph per watched world. `omega_max` normalises the rotor arcs (falls back to
     the frame's own max). `show_glyphs` draws full glyphs for every watched world;
-    the default keeps unfocused worlds as fleet marks at every zoom. This function holds no task knowledge — accents and live
+    the default keeps unfocused worlds as fleet marks at every zoom. `show_fleet`
+    gates the whole-fleet scatter even when the frame carries positions (the G key). This function holds no task knowledge — accents and live
     geometry arrive already resolved on the primitives themselves.
     """
     surface.set_clip(pygame.Rect(rect))
@@ -241,7 +243,7 @@ def draw_scene(
             color = palette.STYLES.get(prim.style, palette.WIRE)
             draw_fn_for(prim)(surface, proj, prim, color)
 
-        if frame.positions is not None:  # whole-fleet scatter (subsampled, fleet marks)
+        if show_fleet and frame.positions is not None:  # whole-fleet scatter dots
             stride = max(1, frame.positions.shape[0] // 4000)
             for p in proj.points(frame.positions[::stride]):
                 pygame.draw.circle(surface, palette.WIRE, (float(p[0]), float(p[1])), 2)
