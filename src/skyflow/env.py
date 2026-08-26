@@ -659,17 +659,10 @@ class SkyFlowEnv:
                     "align_board_* = 0 (mount alignment belongs to the real "
                     "vehicle, not the sim)."
                 )
-        # yaw_motors_reversed flips the QUADX spin table; the plant's rotor spin
-        # directions are fixed by the airframe, and motor_perm only reorders
-        # outputs — it cannot compensate. Yaw authority would silently invert
-        # (TECH_DEBT C13/F9).
-        if re.search(r"^\s*set\s+yaw_motors_reversed\s*=\s*ON", text, re.M):
-            raise ValueError(
-                "cfg.eeprom: yaw_motors_reversed = ON reverses the QUADX spin "
-                "table, but the plant's rotor spin directions are fixed by the "
-                "airframe and motor_perm only reorders outputs. Use a dump with "
-                "yaw_motors_reversed = OFF."
-            )
+        # yaw_motors_reversed is NOT checked (decided 2026-08-25): props in/out is
+        # airframe information — the airframe's `spin` table and the vehicle's own
+        # CLI dump are both measured facts from the same real drone (the props-out
+        # whoop correctly sets ON). TECH_DEBT C13/F9.
 
         import cudaflight  # deferred like the fleet import: only this seam needs it
 

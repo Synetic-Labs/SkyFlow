@@ -104,7 +104,8 @@ Most findings are instances of six patterns. Fixing a pattern kills its class.
   env.py:928-939 (env wins) vs :975-976 (task wins). [C11] Fix S.
 - `motor_perm` default (3,1,0,2) is validated only as a permutation; a custom
   airframe or `yaw_motors_reversed` dump transposes the mixer with no check.
-  env.py:337-465, spin/rotor order live in 3 unlinked places. [C13,F9] Fix M.
+  env.py:337-465, spin/rotor order live in 3 unlinked places. [C13,F9] DECIDED
+  2026-08-25: no check — airframe `spin` + the vehicle's dump are the truth.
 - Firmware protocol text says fresh state is "disarmed"; both implementations
   return ARMED (types.py:146 vs firmware.py:170,322). External implementers
   ship dead fleets. [F5] Fix S. The real arming/re-arm rule exists only in an
@@ -280,9 +281,12 @@ Most findings are instances of six patterns. Fixing a pattern kills its class.
 6. **M-sized correctness: DONE 2026-08-24 (two deliberate partials)** —
    [F8] board-align: REJECTED, not implemented — _render_eeprom scans the dump
    (+overrides) and raises on nonzero align_board_*; DESIGN §10 updated.
-   [C13/F9] partial: yaw_motors_reversed=ON dumps now raise (motor_perm cannot
-   compensate a spin-table flip); full motor_perm derivation from the mixer
-   table stays OPEN (needs cudaflight introspection). [C8] obs_noise now skips
+   [C13/F9] DECIDED 2026-08-25 (James): NO check. Props in/out is airframe
+   information — the airframe's `spin` table and the vehicle's own CLI dump
+   (`yaw_motors_reversed`) are measured facts from the same real drone; the
+   whoop is props-out and its tune correctly sets ON. The interim ON-rejection
+   blocked the real vehicle's config and the trained policy's eval; removed.
+   No motor_perm derivation wanted. [C8] obs_noise now skips
    image-valued terms (units prefixed "[0,1]"/"{0,1}", env._is_image_units) via a per-dim scale; numeric terms bit-exact
    legacy. [T3] gates is a property whose setter re-derives ALL cached geometry —
    the reward/collision chimera is impossible. [T15] one crossing solve:

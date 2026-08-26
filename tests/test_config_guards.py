@@ -74,13 +74,6 @@ def test_zero_board_align_dump_passes_the_scan(tmp_path):
         pass  # ImportError / render failures are fine — the scan let it through
 
 
-def test_yaw_motors_reversed_dump_rejected(tmp_path):
-    dump = tmp_path / "dump.txt"
-    dump.write_text("set yaw_motors_reversed = ON\n")
-    with pytest.raises(ValueError, match="yaw_motors_reversed"):
-        SkyFlowEnv(_sticks_cfg(dump))
-
-
 def test_board_align_in_overrides_rejected(tmp_path):
     dump = tmp_path / "dump.txt"
     dump.write_text("set align_board_yaw = 0\n")
