@@ -12,7 +12,8 @@ z-up centres (z = altitude), yaw about world +z (0 = +x, 90° = +y), pitch up-po
 :func:`classify_crossings` takes z-up positions; the ``*_world`` properties read the
 geometry back in z-up. The DATACLASS FIELDS are the renderer's internal NED arrays
 (§3a) — construct through the builders, not the raw constructor, unless you are inside
-vision/. The z-up→NED conversion happens exactly once, in :func:`_gateset_from_world`.
+vision/. Gate GEOMETRY converts z-up→NED once, in :func:`_gateset_from_world`; positions
+convert per query via vision._ned.flip_xyz (the shared flip implementation).
 
 Geometry and crossing classification are validated against MuJoCo segmentation renders;
 :func:`figure_eight` is specific to SkyFlow (DESIGN.md §9).
@@ -184,16 +185,28 @@ def _gateset_from_world(
     depths: jax.Array,
 ) -> GateSet:
     """
-    The single z-up→NED conversion site (DESIGN.md §3a): centres get the (x, -y, -z)
+    The gate-geometry z-up→NED conversion site (DESIGN.md §3a): centres get the (x, -y, -z)
     flip; yaw flips sign (public yaw is about +z/up, the internal yaw about NED down);
     pitch passes through (up-positive in both frames — "up" survives the flip).
     """
+    inner = jnp.asarray(inner_half, jnp.float32)
+    outer = jnp.asarray(outer_half, jnp.float32)
+    d = jnp.asarray(depths, jnp.float32)
+    # Course geometry is static (built at task construction), so validate eagerly:
+    # outer < inner makes the frame solid (outer minus inner) EMPTY — an invisible,
+    # collision-free, still-passable phantom gate that trains a policy on nothing.
+    if bool(jnp.any(inner <= 0.0)) or bool(jnp.any(outer < inner)) or bool(jnp.any(d < 0.0)):
+        raise ValueError(
+            "bad gate geometry: need inner_half > 0, outer_half >= inner_half "
+            "(per axis; the frame solid is outer minus inner) and depths >= 0 — got "
+            f"inner_half={inner.tolist()}, outer_half={outer.tolist()}, depths={d.tolist()}"
+        )
     centers_ned = flip_xyz(jnp.asarray(centers_world, jnp.float32).reshape(-1, 3))
     yaws_ned = -jnp.asarray(yaws_world, jnp.float32).reshape(-1)
     pitches = (jnp.zeros_like(yaws_ned) if pitches_world is None
                else jnp.asarray(pitches_world, jnp.float32).reshape(-1))
-    return GateSet(centers=centers_ned, yaws=yaws_ned, inner_half=inner_half,
-                   outer_half=outer_half, pitches=pitches, depths=depths)
+    return GateSet(centers=centers_ned, yaws=yaws_ned, inner_half=inner,
+                   outer_half=outer, pitches=pitches, depths=d)
 
 
 _BIG = 1e30
@@ -273,17 +286,8 @@ def classify_crossings(
     Returns (pass_fwd, pass_bwd, hit_frame), each [F, G] bool. Pure geometry, shared by
     the gate task's pass/collision events; unit-testable without the env.
     """
-    prev_ned = flip_xyz(prev_pos)
-    pos_ned = flip_xyz(pos)
     r = float(body_radius)
-    d_prev = prev_ned[:, None, :] - gates.centers                      # [F, G, 3]
-    seg = (pos_ned - prev_ned)[:, None, :]                             # [F, 1, 3]
-    oo_n = jnp.sum(d_prev * gates.normals, axis=-1)                    # [F, G]
-    dd_n = jnp.sum(seg * gates.normals, axis=-1)
-    oo_l = jnp.sum(d_prev * gates.laterals, axis=-1)
-    dd_l = jnp.sum(seg * gates.laterals, axis=-1)
-    oo_v = jnp.sum(d_prev * gates.verticals, axis=-1)
-    dd_v = jnp.sum(seg * gates.verticals, axis=-1)
+    oo_n, dd_n, oo_l, dd_l, oo_v, dd_v = _segment_frames(prev_pos, pos, gates)
 
     a0, a1, b0, b1 = _frame_solid_interval(
         oo_n, dd_n, oo_l, dd_l, oo_v, dd_v,
@@ -294,17 +298,65 @@ def classify_crossings(
 
     # clean pass: centre-plane sign change, crossing point inside the opening,
     # and the segment never touched the solid
+    crossed, forward, cp_lat, cp_vert = _crossing_point(
+        oo_n, dd_n, oo_l, dd_l, oo_v, dd_v
+    )
+    in_inner = ((cp_lat < gates.inner_half[:, 0] - r)
+                & (cp_vert < gates.inner_half[:, 1] - r))
+    passed = crossed & in_inner & (~hit)
+    return passed & forward, passed & (~forward), hit
+
+
+def _segment_frames(
+    prev_pos: jax.Array, pos: jax.Array, gates: GateSet
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Per-gate frame decomposition of the prev→pos segment, [F, G] each: (offset,
+    delta) along the gate normal, lateral and vertical axes. World z-up in, converted
+    to the internal NED once here; the flip is a rotation, so every dot product below
+    equals its world-frame value bit for bit."""
+    prev_ned = flip_xyz(prev_pos)
+    pos_ned = flip_xyz(pos)
+    d_prev = prev_ned[:, None, :] - gates.centers                      # [F, G, 3]
+    seg = (pos_ned - prev_ned)[:, None, :]                             # [F, 1, 3]
+    oo_n = jnp.sum(d_prev * gates.normals, axis=-1)                    # [F, G]
+    dd_n = jnp.sum(seg * gates.normals, axis=-1)
+    oo_l = jnp.sum(d_prev * gates.laterals, axis=-1)
+    dd_l = jnp.sum(seg * gates.laterals, axis=-1)
+    oo_v = jnp.sum(d_prev * gates.verticals, axis=-1)
+    dd_v = jnp.sum(seg * gates.verticals, axis=-1)
+    return oo_n, dd_n, oo_l, dd_l, oo_v, dd_v
+
+
+def _crossing_point(
+    oo_n: jax.Array, dd_n: jax.Array, oo_l: jax.Array, dd_l: jax.Array,
+    oo_v: jax.Array, dd_v: jax.Array,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """THE centre-plane crossing solve — one implementation, one epsilon (TECH_DEBT
+    T15). Returns (crossed, forward, |lat|, |vert|), each [F, G]: sign-change mask,
+    travel direction, and the crossing point's absolute in-plane offsets."""
     prev_sd, sd = oo_n, oo_n + dd_n
     crossed = (prev_sd * sd) < 0.0
     denom = prev_sd - sd
     alpha = prev_sd / jnp.where(jnp.abs(denom) < 1e-9, 1e-9, denom)
     cp_lat = jnp.abs(oo_l + alpha * dd_l)
     cp_vert = jnp.abs(oo_v + alpha * dd_v)
-    in_inner = ((cp_lat < gates.inner_half[:, 0] - r)
-                & (cp_vert < gates.inner_half[:, 1] - r))
-    passed = crossed & in_inner & (~hit)
     forward = prev_sd < 0.0
-    return passed & forward, passed & (~forward), hit
+    return crossed, forward, cp_lat, cp_vert
+
+
+def crossing_offsets(
+    prev_pos: jax.Array, pos: jax.Array, gates: GateSet
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """
+    Centre-plane crossing data for the prev_pos→pos segment against every gate:
+    (crossed, forward, |lateral|, |vertical|), each [F, G] — sign-change mask, travel
+    direction, and the crossing point's absolute in-plane offsets in metres (no
+    body-radius inflation: that belongs to the collision test alone). Shares the
+    exact solve `classify_crossings` uses for its pass predicate, so reward
+    centering/miss math can never drift from the collision math by an epsilon
+    (TECH_DEBT T15). Positions are [F, 3] world z-up FLU metres.
+    """
+    return _crossing_point(*_segment_frames(prev_pos, pos, gates))
 
 
 # -- course builders ---------------------------------------------------------------------

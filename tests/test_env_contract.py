@@ -451,7 +451,8 @@ def test_sticks_pipeline_with_injected_fleet(key):
     )
     obs, state = env.reset(key)
     assert obs.shape == (fleet, 19)
-    assert state.task_state.task.goal.shape == (fleet, 3)  # firmware carry wraps the task
+    assert state.task_carry.task.goal.shape == (fleet, 3)  # firmware carry wraps the task
+    assert env.task_state(state).goal.shape == (fleet, 3)  # the consumer-facing read
 
     # Throttle stick high → fake fleet outputs duty 1.0 → rotors spin up immediately.
     sticks = jnp.tile(jnp.asarray([0.0, 0.0, 1.0, 0.0], jnp.float32), (fleet, 1))
@@ -459,5 +460,5 @@ def test_sticks_pipeline_with_injected_fleet(key):
     assert obs.shape == (fleet, 19) and reward.shape == (fleet,)
     assert bool(jnp.all(state.plant[:, 13:17] > 0.0))
     # the firmware ticked once per 1 kHz substep
-    np.testing.assert_array_equal(np.asarray(state.task_state.fwstate), env.decimation)
+    np.testing.assert_array_equal(np.asarray(state.task_carry.fwstate), env.decimation)
     assert env.metrics(state)["hover/dist"].shape == ()

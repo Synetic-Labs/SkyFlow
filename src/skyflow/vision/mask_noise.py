@@ -279,9 +279,12 @@ def corrupt_mask(
         h, w = m.shape
         k_hole, k_band, k_pil, k_blob, k_salt, k_blur = (ks[i] for i in range(NOISE_FAMILIES))
 
-        # 1. band holes — erase blobby chunks (only bites where the mask is lit)
+        # 1. band holes — erase blobby chunks (only bites where the mask is lit).
+        # The threshold saturates at 1.0: unclamped, scale >= 1/hole_thr pushes it
+        # past the blob field's [0,1] range and the WHOLE mask erases silently.
         holes = jnp.clip(
-            (hole_thr * scale - _blob_field1(k_hole, h, w, hole_cells)) / hole_soft,
+            (jnp.minimum(hole_thr * scale, 1.0) - _blob_field1(k_hole, h, w, hole_cells))
+            / hole_soft,
             0.0, 1.0)
         m = m * (1.0 - hole_strength * holes)
 
@@ -390,8 +393,9 @@ def erasure_at(
     def one(ks: jax.Array, pts: jax.Array) -> jax.Array:
         xs, ys = pts[..., 0], pts[..., 1]
         k_hole, k_band, k_pil = ks[0], ks[1], ks[2]
-        holes = jnp.clip(
-            (hole_thr * scale - _blob_field_at(k_hole, h, w, hole_cells, xs, ys)) / hole_soft,
+        holes = jnp.clip(  # threshold saturates at 1.0 — same clamp as corrupt_mask
+            (jnp.minimum(hole_thr * scale, 1.0) - _blob_field_at(k_hole, h, w, hole_cells, xs, ys))
+            / hole_soft,
             0.0, 1.0) * hole_strength
         occ = _stick_at(k_band, h, w, xs, ys, prob=p(band_prob),
                         width_lo=band_width[0], width_hi=band_width[1],

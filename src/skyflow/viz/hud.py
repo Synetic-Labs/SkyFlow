@@ -137,15 +137,17 @@ def draw_hud(
             _stick_box(surface, x, top, box, a[3], a[2])
             _stick_box(surface, x + box + 10, top, box, a[0], a[1])
             caption(x, "STICKS AETR" + ("  ARMED" if armed else ""))
+            x += 2 * box + 34
         else:
-            _bars(surface, x + 4, top, box, (a + 1.0) / 2.0, palette.MUTED)
+            # advance from _bars' own return — the one home of the bar geometry
+            end = _bars(surface, x + 4, top, box, (a + 1.0) / 2.0, palette.MUTED)
             caption(x, "ACTION")
-        x += 2 * box + 34
+            x = end + 30
 
     norm = omega_max if omega_max else max(float(np.abs(frame.rotor_speeds).max()), 1.0)
-    _bars(surface, x + 4, top, box, frame.rotor_speeds[f] / norm, palette.MUTED)
+    end = _bars(surface, x + 4, top, box, frame.rotor_speeds[f] / norm, palette.MUTED)
     caption(x, "MOTORS Ω")
-    x += 4 * 14 + 30
+    x = end + 30
 
     r = box // 2
     _horizon(surface, x + r, top + r, r, frame.quat[f])

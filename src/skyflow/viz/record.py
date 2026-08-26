@@ -164,6 +164,8 @@ class FlightLog:
         return len(self._plant)
 
     def _resolve_path(self, state: Any, path: str) -> Any:
+        from skyflow.viz.primitives import warn_missing_bind
+
         parts = path.split(".")
         # the first hop honors the env's task-state accessor (sticks-mode carry, §10)
         if parts[0] == "task_state" and self._task_state_of is not None:
@@ -172,7 +174,12 @@ class FlightLog:
         else:
             obj = state
         for part in parts:
-            obj = getattr(obj, part, None)
+            if not hasattr(obj, part):
+                # a path that never resolves would silently drop out of the npz and
+                # replay would then HIDE the bound primitive — warn once instead
+                warn_missing_bind(path, state)
+                return None
+            obj = getattr(obj, part)
             if obj is None:
                 return None
         return obj

@@ -14,6 +14,7 @@ from skyflow.tasks import build_task, register_task
 from skyflow.types import (
     Array,
     DRState,
+    FirmwareCarry,
     FirmwareFleet,
     ObsSpec,
     ObsTerm,
@@ -31,6 +32,7 @@ __all__ = [
     "Array",
     "DRState",
     "DomainRand",
+    "FirmwareCarry",
     "FirmwareFleet",
     "ObsSpec",
     "ObsTerm",

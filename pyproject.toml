@@ -63,7 +63,7 @@ packages = ["src/skyflow"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --strict-markers"
 markers = ["gpu: needs a CUDA device (and the cudaflight wheel); skipped otherwise"]
 
 [tool.pyright]

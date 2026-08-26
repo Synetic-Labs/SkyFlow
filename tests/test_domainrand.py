@@ -234,7 +234,7 @@ def test_obs_noise_is_applied_by_the_env(key):
 
 class _RowRecorderFleet:
     """types.FirmwareFleet stand-in whose fwstate holds the LAST sensor rows fw_step
-    saw — after a step, state.task_state.fwstate is exactly what the firmware would
+    saw — after a step, state.task_carry.fwstate is exactly what the firmware would
     have consumed on the final 1 kHz substep. Motors stay at zero (grounded fleet)."""
 
     act_dim = 4
@@ -274,7 +274,7 @@ def _rows_after_step(env, key, n_steps=1):
     out = []
     for _ in range(n_steps):
         _, state, _, _, _ = env.step(state, a)
-        out.append(np.asarray(state.task_state.fwstate))
+        out.append(np.asarray(state.task_carry.fwstate))
     return out
 
 
@@ -308,3 +308,19 @@ def test_baro_noise_reaches_the_firmware_rows(key):
         _sticks_env(DomainRand(body_scale=0.0, baro_noise_pa=5.0)), key, n_steps=2
     )
     assert not np.array_equal(n1[:, 6], n2[:, 6])
+
+
+def test_obs_noise_skips_mask_terms(key):
+    """dr.obs_noise is unit-blind (LEGACY knob): a half-width sane for metres used
+    to DESTROY the {0,1} mask pixels riding in the same vector (TECH_DEBT C8).
+    Mask-valued terms are excluded; numeric terms keep the blanket."""
+    kw: dict = {"num_envs": 2, "task": "figure_eight", "task_kwargs": {"vision": True}}
+    with SkyFlowEnv(SimConfig(dr=DomainRand(body_scale=0.0), **kw)) as clean, \
+         SkyFlowEnv(SimConfig(dr=DomainRand(body_scale=0.0, obs_noise=0.5), **kw)) as noisy:
+        assert clean.obs_spec[0].name == "mask"
+        d = clean.obs_spec[0].dim
+        obs_c, _ = clean.reset(key)
+        obs_n, _ = noisy.reset(key)
+        # the mask block is untouched by obs_noise; the numeric tail is corrupted
+        np.testing.assert_array_equal(np.asarray(obs_n[:, :d]), np.asarray(obs_c[:, :d]))
+        assert float(np.abs(np.asarray(obs_n[:, d:] - obs_c[:, d:])).max()) > 0.0

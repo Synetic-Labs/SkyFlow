@@ -39,10 +39,11 @@ import math
 import re
 import tempfile
 import warnings
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -55,7 +56,15 @@ from skyflow.params import (
     max_bracket,
     sample_params,
 )
-from skyflow.types import Array, DRState, FirmwareFleet, SimState, StepInfo, Task
+from skyflow.types import (
+    Array,
+    DRState,
+    FirmwareCarry,
+    FirmwareFleet,
+    SimState,
+    StepInfo,
+    Task,
+)
 
 __all__ = ["DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
 
@@ -269,27 +278,15 @@ def tree_where(done: Array, fresh: Any, current: Any) -> Any:
 
     `done` is [F] bool; every leaf of both trees leads with the fleet axis (DESIGN.md §4).
     This is the auto-reset blend of the step pipeline (§7 step 9): done worlds take the
-    freshly spawned leaves, live worlds keep theirs, with no host round-trip.
+    freshly spawned leaves, live worlds keep theirs, with no host round-trip. Two step-9
+    exclusions never pass through here: the fleet-global metrics EMAs (cross-episode)
+    and the sticks firmware pair (FirmwareFleet.reset masks internally).
     """
 
     def sel(a: Array, b: Array) -> Array:
         return jnp.where(done.reshape((-1,) + (1,) * (a.ndim - 1)), a, b)
 
     return jax.tree.map(sel, fresh, current)
-
-
-class _FirmwareCarry(NamedTuple):
-    """
-    Sticks-mode `SimState.task_state` wrapper: the task's own pytree plus the
-    value-threaded firmware pair of `types.FirmwareFleet`. The env wraps/unwraps it
-    around every task call, so tasks never see it; motors mode stores the task pytree
-    bare. (SimState §4 has no firmware slot, so the pair rides in the one opaque slot
-    the env owns end to end.)
-    """
-
-    task: Any
-    blob: Any
-    fwstate: Any
 
 
 def _uniform_ball(key: Array, n: int) -> Array:
@@ -451,9 +448,12 @@ class SkyFlowEnv:
         self.fleet = int(cfg.num_envs)
         self.airframe = AIRFRAMES[cfg.airframe]
         # Battery sag shrinks the very ceiling the thrust-to-weight guard prices, so
-        # the guard re-runs over the SAGGED per-world ceiling after the trait draw
-        # (factor stage only; sag=0 makes the re-run an idempotent no-op, skipped).
-        self._tw_reguard = dr.factors is not None and dr.battery_sag > 0.0
+        # the guard re-runs over the SAGGED per-world ceiling after the trait draw.
+        # Gated on sag ALONE: the legacy factors=None sampler never guards, so a
+        # sagged fleet without factors previously flew with NO lift guard at all —
+        # worlds that could not take off truncated as `stuck` with no diagnostic.
+        # sag=0 keeps every path bit-exact (the re-run is skipped).
+        self._tw_reguard = dr.battery_sag > 0.0
         self._nominal_row = jnp.asarray(
             dynamics.pack_params(self.airframe.values), jnp.float32
         )
@@ -461,13 +461,37 @@ class SkyFlowEnv:
         self.dt_physics = 1.0 / cfg.physics_hz
         self.dt_control = self.decimation / cfg.physics_hz
         self.act_dim = 4
+        # Delay-ring / last-action NEUTRAL. Motors mode: 0.0 (u = 0.5) per rotor.
+        # Sticks mode is AETR — channel 2 is THROTTLE, where 0.0 means 50% power;
+        # the firmware arms (and idles sanely) only on stick-low, so the neutral
+        # a fresh ring feeds while the real command rides the transport delay
+        # must be throttle -1.0, not mid-stick.
+        self._act_neutral = jnp.array(
+            [0.0, 0.0, -1.0 if cfg.control == "sticks" else 0.0, 0.0], jnp.float32
+        )
 
         self.task: Task = task if task is not None else self._build_task(cfg)
         self.obs_spec = self.task.obs_spec
         self.obs_dim = self.obs_spec.dim
         self.image_shape = self.task.image_shape
+        # dr.obs_noise is unit-blind (the LEGACY stress knob): one half-width sane
+        # for metres DESTROYS {0,1} mask pixels riding in the same vector. Zero the
+        # noise on mask-valued terms; numeric terms keep the blanket, so state-only
+        # tasks stay bit-exact against legacy draws (same key, same shape).
+        self._obs_noise_scale: Array | None = None
+        if any("{0,1}" in t.units for t in self.obs_spec):
+            self._obs_noise_scale = jnp.concatenate([
+                jnp.zeros(t.dim, jnp.float32)
+                if "{0,1}" in t.units
+                else jnp.ones(t.dim, jnp.float32)
+                for t in self.obs_spec
+            ])
 
         self._fw: FirmwareFleet | None = None
+        self._owns_fw = False  # close() destroys only fleets this env constructed
+        self._closed = False
+        # unlinks the rendered boot image at close(), GC, or interpreter exit
+        self._eeprom_finalizer: weakref.finalize | None = None
         # boot-image temp file path when cfg.eeprom rendered (logs/provenance), else None
         self.eeprom_image: str | None = None
         # per-base bundle revision when the dump selected one (logs/provenance)
@@ -490,16 +514,52 @@ class SkyFlowEnv:
                     "cfg.eeprom and firmware_fleet= are exclusive — an injected "
                     "fleet already booted its own config"
                 )
-            fw = firmware_fleet if firmware_fleet is not None else self._build_fleet(
-                cfg, _firmware
-            )
-            if fw.act_dim != self.act_dim:
-                raise ValueError(f"firmware fleet act_dim {fw.act_dim} != {self.act_dim}")
-            perm = tuple(int(i) for i in motor_perm)
-            if sorted(perm) != [0, 1, 2, 3]:
-                raise ValueError(f"motor_perm must permute (0,1,2,3), got {motor_perm!r}")
+            self._owns_fw = firmware_fleet is None
+            fw: FirmwareFleet | None = None
+            try:
+                fw = firmware_fleet if firmware_fleet is not None else self._build_fleet(
+                    cfg, _firmware
+                )
+                if fw.act_dim != self.act_dim:
+                    raise ValueError(f"firmware fleet act_dim {fw.act_dim} != {self.act_dim}")
+                perm = tuple(int(i) for i in motor_perm)
+                if sorted(perm) != [0, 1, 2, 3]:
+                    raise ValueError(f"motor_perm must permute (0,1,2,3), got {motor_perm!r}")
+            except BaseException:
+                # a failed construction must not leak: free the one-CPU-fleet slot
+                # and the rendered boot image before re-raising
+                if fw is not None and self._owns_fw:
+                    fw.close()
+                self._reap_eeprom_image()
+                raise
             self._fw = fw
             self._motor_perm = jnp.asarray(perm, jnp.int32)
+
+    def close(self) -> None:
+        """Release lifecycle resources: destroy the firmware fleet this env
+        constructed (an injected fleet belongs to its caller) and unlink the
+        rendered eeprom boot image. Idempotent. A closed env must not step or
+        reset — reset()/step() raise at trace time, and the fleet's own guard
+        raises on any use of already-compiled sticks programs (motors mode
+        holds no firmware, so there close() only reaps the image)."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._fw is not None and self._owns_fw:
+            self._fw.close()
+        self._reap_eeprom_image()
+
+    def __enter__(self) -> "SkyFlowEnv":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def _reap_eeprom_image(self) -> None:
+        """Unlink the rendered boot image — a derived artifact, never precious.
+        `eeprom_image` keeps the path string for provenance records."""
+        if self._eeprom_finalizer is not None:
+            self._eeprom_finalizer()  # idempotent: detaches after the first call
 
     def _build_fleet(self, cfg: SimConfig, _firmware: Any) -> FirmwareFleet:
         """cfg.firmware → a FirmwareFleet (DESIGN.md §10).
@@ -523,16 +583,27 @@ class SkyFlowEnv:
             gpu_visible = bool(jax.devices("gpu"))
         except RuntimeError:
             gpu_visible = False
-        if self.fleet >= 3 and gpu_visible:
+        if self.fleet >= _firmware.GPU_FLEET_MIN and gpu_visible:
             try:
                 return _firmware.GpuFirmwareFleet(self.fleet, eeprom=eeprom, cubin=fatbin)
-            except Exception as e:  # ImportError (wheel < 0.3.3), RuntimeError (create)
-                warnings.warn(
-                    f'firmware="auto": GPU fleet unavailable ({e}); '
-                    "using the CPU SITL fleet",
-                    RuntimeWarning,
-                    stacklevel=3,
-                )
+            except Exception as e:  # ImportError (wheel too old), RuntimeError (create)
+                reason = f"GPU fleet construction failed ({e!r})"
+        elif not gpu_visible:
+            reason = "no CUDA device is visible to jax"
+        else:
+            reason = (
+                f"fleet {self.fleet} < {_firmware.GPU_FLEET_MIN} "
+                "(the GPU backend's minimum)"
+            )
+        # The fallback changes the backend, the binary, and the throughput by orders
+        # of magnitude — never do it silently. firmware="gpu" is the fail-loudly pin.
+        warnings.warn(
+            f'firmware="auto": {reason}; using the sequential CPU SITL fleet '
+            "(one host round-trip per substep — expect a large slowdown). "
+            'Pin firmware="gpu" to make this an error instead.',
+            RuntimeWarning,
+            stacklevel=3,
+        )
         return _firmware.CpuFirmwareFleet(self.fleet, eeprom=eeprom, lib=lib)
 
     def _render_eeprom(self, cfg: SimConfig) -> tuple[str | None, str | None, str | None]:
@@ -561,6 +632,38 @@ class SkyFlowEnv:
                 raise FileNotFoundError(
                     f"cfg.eeprom_overrides: no such CLI file: {overrides}"
                 )
+
+        # Settings SkyFlow's sensor packaging cannot honor — refuse the dump before
+        # it boots. Both scans cover the overrides file too (it merges in).
+        text = dump.read_text(errors="replace")
+        if overrides is not None:
+            text += "\n" + overrides.read_text(errors="replace")
+        # DESIGN §10 once named an inverse board-align rotation; no such step exists,
+        # so a dump aligned for a rotated FC board would fly with sensors the
+        # firmware misreads — silently (TECH_DEBT F8: reject, not implement).
+        for m in re.finditer(
+            r"^\s*set\s+(align_board_(?:roll|pitch|yaw))\s*=\s*(-?\d+)", text, re.M
+        ):
+            if int(m.group(2)) != 0:
+                raise ValueError(
+                    f"cfg.eeprom: {m.group(1)} = {m.group(2)} — board-align "
+                    "rotations are not implemented in SkyFlow's sensor packaging, "
+                    "so the firmware would misread every sensor row. Re-dump with "
+                    "align_board_* = 0 (mount alignment belongs to the real "
+                    "vehicle, not the sim)."
+                )
+        # yaw_motors_reversed flips the QUADX spin table; the plant's rotor spin
+        # directions are fixed by the airframe, and motor_perm only reorders
+        # outputs — it cannot compensate. Yaw authority would silently invert
+        # (TECH_DEBT C13/F9).
+        if re.search(r"^\s*set\s+yaw_motors_reversed\s*=\s*ON", text, re.M):
+            raise ValueError(
+                "cfg.eeprom: yaw_motors_reversed = ON reverses the QUADX spin "
+                "table, but the plant's rotor spin directions are fixed by the "
+                "airframe and motor_perm only reorders outputs. Use a dump with "
+                "yaw_motors_reversed = OFF."
+            )
+
         import cudaflight  # deferred like the fleet import: only this seam needs it
 
         bundle = _resolve_firmware_base(dump)
@@ -575,6 +678,11 @@ class SkyFlowEnv:
         with f:
             f.write(image)
         self.eeprom_image = f.name
+        # reap at close(), GC, or interpreter exit — whichever comes first
+        # (weakref.finalize registers an atexit fallback for still-live envs)
+        self._eeprom_finalizer = weakref.finalize(
+            self, Path(f.name).unlink, missing_ok=True
+        )
         return f.name, lib, fatbin
 
     @staticmethod
@@ -656,12 +764,16 @@ class SkyFlowEnv:
 
     def _corrupt_obs(self, obs: Array, key: Array) -> Array:
         """DomainRand.obs_noise on the finalized task observation (uniform half-width);
-        applied by the env so tasks keep semantics and the env keeps corruption."""
+        applied by the env so tasks keep semantics and the env keeps corruption.
+        Mask-valued terms ({0,1} units) are excluded — see `_obs_noise_scale`."""
         if self.dr.obs_noise <= 0.0:
             return obs
-        return obs + jax.random.uniform(
+        noise = jax.random.uniform(
             key, obs.shape, obs.dtype, -self.dr.obs_noise, self.dr.obs_noise
         )
+        if self._obs_noise_scale is not None:
+            noise = noise * self._obs_noise_scale
+        return obs + noise
 
     # -- public API --------------------------------------------------------------------
 
@@ -671,6 +783,8 @@ class SkyFlowEnv:
         (params, traits, delay), task spawn; gust state, delay ring and episode
         accumulators cleared. Pure — same key, same fleet, bit for bit.
         """
+        if self._closed:
+            raise RuntimeError("SkyFlowEnv is closed — construct a new env")
         dr = self.dr
         f = self.fleet
         k_params, k_spawn, k_traits, k_delay, k_imu, k_obs, k_carry = jax.random.split(
@@ -689,8 +803,8 @@ class SkyFlowEnv:
             k_delay, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
         )
         wind_vel = jnp.zeros((f, 3), jnp.float32)  # gust deviation; total adds the mean
-        act_buf = jnp.zeros((f, self._delay_max + 1, 4), jnp.float32)
-        last_action = jnp.zeros((f, 4), jnp.float32)
+        act_buf = jnp.broadcast_to(self._act_neutral, (f, self._delay_max + 1, 4))
+        last_action = jnp.broadcast_to(self._act_neutral, (f, 4))
 
         # First observation: IMU with the rotors held at their spawn speeds (no command
         # has been issued yet, so hold is the only self-consistent input). The task
@@ -712,7 +826,7 @@ class SkyFlowEnv:
 
         if self._fw is not None:
             blob, fwstate = self._fw.fresh_firmware_state()
-            task_state = _FirmwareCarry(task=task_state, blob=blob, fwstate=fwstate)
+            task_state = FirmwareCarry(task=task_state, blob=blob, fwstate=fwstate)
 
         state = SimState(
             plant=plant,
@@ -736,7 +850,7 @@ class SkyFlowEnv:
             trunc_frac=jnp.zeros((), jnp.float32),
             ep_return_ema=jnp.zeros((), jnp.float32),
             ep_len_ema=jnp.zeros((), jnp.float32),
-            task_state=task_state,
+            task_carry=task_state,
         )
         return obs, state
 
@@ -749,6 +863,8 @@ class SkyFlowEnv:
         already respawned, with their pre-reset observation in info["final_obs"] and the
         pre-reset flags in info["terminated"] / info["truncated"].
         """
+        if self._closed:
+            raise RuntimeError("SkyFlowEnv is closed — construct a new env")
         cfg = self.cfg
         dr = self.dr
         f = self.fleet
@@ -761,9 +877,17 @@ class SkyFlowEnv:
         cos_tilt_min = math.cos(cfg.ground_tilt_limit_rad)
 
         if self._fw is not None:
-            ts_in, blob, fwstate = state.task_state
+            if not isinstance(state.task_carry, FirmwareCarry):
+                raise TypeError(
+                    "sticks-mode step() needs SimState.task_carry to be the firmware "
+                    f"carry, got {type(state.task_carry).__name__}. Read task fields "
+                    "through env.task_state(state); a state whose carry was replaced "
+                    "by the bare task pytree (e.g. rebuilt from a motors-mode state) "
+                    "would step the firmware on task data."
+                )
+            ts_in, blob, fwstate = state.task_carry
         else:
-            ts_in = state.task_state
+            ts_in = state.task_carry
             blob = fwstate = None  # never read in motors mode
 
         # 1. Keys; delay ring (newest first) and the per-world delayed command.
@@ -823,6 +947,7 @@ class SkyFlowEnv:
                 substep_motors, (state.plant, jnp.zeros(f, bool)), None, length=self.decimation
             )
             omega_last = omega_cmd
+            armed = None  # no firmware, no arm state
         else:
             # Sticks (§10, normative substep order): synth FRD sensors from the generated
             # IMU + isothermal baro, corrupted per DomainRand (bias + per-sample noise —
@@ -834,7 +959,7 @@ class SkyFlowEnv:
             sub_keys = jax.random.split(k_sub, self.decimation)
 
             def substep_sticks(carry, k_t):
-                plant, blob, fwstate, omega_prev, impact = carry
+                plant, blob, fwstate, omega_prev, impact, _ = carry
                 k_imu_t, k_baro_t = jax.random.split(k_t)
                 accel, gyro = self._measure(
                     plant, omega_prev, wind_total, state.params, state.dr_state, k_imu_t
@@ -847,7 +972,7 @@ class SkyFlowEnv:
                 rows = jnp.concatenate(
                     [self._flu_to_frd(gyro), self._flu_to_frd(accel), baro], axis=-1
                 )
-                blob, fwstate, motors, _armed = fw.fw_step(blob, fwstate, delayed, rows)
+                blob, fwstate, motors, armed = fw.fw_step(blob, fwstate, delayed, rows)
                 u = motors[:, self._motor_perm]
                 omega_cmd = dynamics.throttle_to_omega(u, w_min, w_max, k_thr).astype(
                     jnp.float32
@@ -857,10 +982,11 @@ class SkyFlowEnv:
                     self.dt_physics, w_min, w_max,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
-                return (_ground_contact(raw), blob, fwstate, omega_cmd, impact), None
+                return (_ground_contact(raw), blob, fwstate, omega_cmd, impact, armed), None
 
-            init = (state.plant, blob, fwstate, state.plant[:, 13:17], jnp.zeros(f, bool))
-            (plant, blob, fwstate, omega_last, impact), _ = jax.lax.scan(
+            init = (state.plant, blob, fwstate, state.plant[:, 13:17], jnp.zeros(f, bool),
+                    jnp.ones(f, jnp.uint8))
+            (plant, blob, fwstate, omega_last, impact, armed), _ = jax.lax.scan(
                 substep_sticks, init, sub_keys
             )
 
@@ -951,7 +1077,7 @@ class SkyFlowEnv:
             params_new = apply_tw_guard(params_new, self._nominal_row, dr_new.w_max)
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
-        la_new = jnp.zeros((f, 4), jnp.float32)
+        la_new = jnp.broadcast_to(self._act_neutral, (f, 4))
         wind_new = jnp.zeros((f, 3), jnp.float32)
         k_ro_task, k_ro_dr = jax.random.split(k_ro)
         imu_new = self._measure(
@@ -973,7 +1099,7 @@ class SkyFlowEnv:
             params=params_new,
             wind_vel=wind_new,
             dr_state=dr_new,
-            act_buf=jnp.zeros((f, self._delay_max + 1, 4), jnp.float32),
+            act_buf=jnp.broadcast_to(self._act_neutral, (f, self._delay_max + 1, 4)),
             delay_idx=jax.random.randint(
                 k_rd, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
             ),
@@ -986,7 +1112,7 @@ class SkyFlowEnv:
             airborne=jnp.zeros(f, bool),
             ep_return=jnp.zeros(f, jnp.float32),
             ep_len=jnp.zeros(f, jnp.int32),
-            task_state=ts_fresh,
+            task_carry=ts_fresh,
         )
         current = dict(
             plant=plant,
@@ -1004,21 +1130,21 @@ class SkyFlowEnv:
             airborne=airborne,
             ep_return=ep_return,
             ep_len=ep_len,
-            task_state=ts_out,
+            task_carry=ts_out,
         )
         merged = tree_where(done, fresh, current)
         obs_out = jnp.where(done[:, None], obs_new, obs)
 
-        ts_state = merged.pop("task_state")
+        ts_state = merged.pop("task_carry")
         if self._fw is not None:
             # The fleet masks internally (types.FirmwareFleet.reset), so the pair is
             # taken whole rather than tree_where-blended (CPU placeholders are [0]).
             blob, fwstate = self._fw.reset(blob, fwstate, done.astype(jnp.uint8))
-            ts_state = _FirmwareCarry(task=ts_state, blob=blob, fwstate=fwstate)
+            ts_state = FirmwareCarry(task=ts_state, blob=blob, fwstate=fwstate)
 
         state_out = SimState(
             key=k_carry,
-            task_state=ts_state,
+            task_carry=ts_state,
             crash_frac=crash_frac,
             success_frac=success_frac,
             trunc_frac=trunc_frac,
@@ -1027,28 +1153,32 @@ class SkyFlowEnv:
             **merged,
         )
         # cast: the task's ev.info keys ride along beyond the typed StepInfo contract.
-        info = cast(
-            "StepInfo",
-            {
-                **ev.info,
-                "terminated": terminated,
-                "truncated": truncated,
-                "final_obs": obs,
-                "poke_active": poke,
-                "ep_return": ep_return,
-                "ep_len": ep_len,
-            },
-        )
+        info_dict = {
+            **ev.info,
+            "terminated": terminated,
+            "truncated": truncated,
+            "final_obs": obs,
+            "poke_active": poke,
+            "ep_return": ep_return,
+            "ep_len": ep_len,
+        }
+        if armed is not None:
+            # sticks mode: the firmware's arm flag after the last substep. A world
+            # that disarms mid-episode (failsafe, runaway-takeoff) free-falls with
+            # motors at zero — without this flag that reads as a policy failure.
+            info_dict["armed"] = armed.astype(bool)
+        info = cast("StepInfo", info_dict)
         return obs_out, state_out, reward, done, info
 
     def task_state(self, state: SimState) -> Any:
         """
-        The task's OWN pytree for this state. In sticks mode `SimState.task_state` is
+        The task's OWN pytree for this state. In sticks mode `SimState.task_carry` is
         the firmware carry (§10) with the task's pytree inside it; every consumer that
         wants task fields (metrics, viewers, recorders) must read through this accessor
         instead of unwrapping the carry itself.
         """
-        return state.task_state.task if self._fw is not None else state.task_state
+        ts = state.task_carry
+        return ts.task if isinstance(ts, FirmwareCarry) else ts
 
     def metrics(self, state: SimState) -> dict[str, Array]:
         """

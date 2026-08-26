@@ -218,7 +218,7 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         trunc_frac=jnp.zeros((), jnp.float32),
         ep_return_ema=jnp.zeros((), jnp.float32),
         ep_len_ema=jnp.zeros((), jnp.float32),
-        task_state={"goal": jnp.zeros((f, 3), jnp.float32)},
+        task_carry={"goal": jnp.zeros((f, 3), jnp.float32)},
     )
 
     def body(s, _):
@@ -228,4 +228,4 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
     assert isinstance(out, SimState)
     assert np.all(np.asarray(out.steps) == 4)
     assert stacked.shape == (4, f)
-    assert out.task_state["goal"].shape == (f, 3)
+    assert out.task_state["goal"].shape == (f, 3)  # property passthrough (motors)

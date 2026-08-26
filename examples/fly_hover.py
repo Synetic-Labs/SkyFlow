@@ -102,7 +102,7 @@ def main() -> None:
     u_hover, g = hover_throttle(AIRFRAMES["crazyflie"])
 
     obs, state = env.reset(jax.random.PRNGKey(args.seed))
-    goal = np.asarray(state.task_state.goal)
+    goal = np.asarray(env.task_state(state).goal)
     print(f"fleet of {args.fleet}: pad → goal, {args.seconds:.1f} s at {cfg.control_hz:.0f} Hz")
     print(f"  goal[0] = {goal[0].round(2)}, initial error {np.linalg.norm(np.asarray(obs)[:, 0:3], axis=-1).mean():.2f} m")
 

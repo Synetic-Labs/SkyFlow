@@ -145,7 +145,15 @@ class FirmwareFleet(Protocol):
     act_dim: int
 
     def fresh_firmware_state(self) -> tuple[Any, Any]:
-        """New (blob, fwstate) for the whole fleet, disarmed."""
+        """New (blob, fwstate) for the whole fleet, from the ARMED-ON-GROUND snapshot.
+
+        Arming lifecycle (THE normative statement — implementations and docs defer
+        here): instances arm during construction (settle → arm → snapshot), so
+        `armed` is truthy from the first tick after any fresh state or `reset`.
+        A mid-episode disarm (failsafe, runaway-takeoff) persists until the next
+        reset restores the snapshot; Betaflight re-arms only on LOW throttle, so
+        an open-loop feeder that never lowers throttle cannot re-arm a world.
+        """
         ...
 
     def fw_step(
@@ -161,6 +169,21 @@ class FirmwareFleet(Protocol):
     def close(self) -> None:
         """Release host/device resources; the fleet is unusable afterwards."""
         ...
+
+
+class FirmwareCarry(NamedTuple):
+    """
+    Sticks-mode `SimState.task_carry` wrapper: the task's own pytree plus the
+    value-threaded firmware pair of `FirmwareFleet`. The env wraps/unwraps it around
+    every task call, so tasks never see it; motors mode stores the task pytree bare.
+    (SimState has no firmware slot, so the pair rides in the one opaque slot the env
+    owns end to end.) Read task fields through ``env.task_state(state)`` — it unwraps
+    this carry in sticks mode and is the identity in motors mode.
+    """
+
+    task: Any
+    blob: Any
+    fwstate: Any
 
 
 @jax.tree_util.register_dataclass
@@ -196,7 +219,27 @@ class SimState:
     trunc_frac: Array  # 0-d f32 — EMA fraction ending by pure truncation (no termination)
     ep_return_ema: Array  # 0-d f32 — EMA of completed-episode return
     ep_len_ema: Array  # 0-d f32 — EMA of completed-episode length, control steps
-    task_state: Any  # opaque task pytree
+    # opaque task pytree (motors) or FirmwareCarry (sticks) — read task fields
+    # through env.task_state(state), never off this field directly
+    task_carry: Any
+
+    @property
+    def task_state(self) -> Any:
+        """The task's own pytree — motors mode only.
+
+        In sticks mode `task_carry` holds the firmware carry, and a raw read of a
+        task field off it compiles fine but binds to the wrong pytree — the shipped
+        vanishing-gates bug. This property therefore RAISES on a carry instead of
+        returning it: read through ``env.task_state(state)`` (unwraps in both
+        modes), or take the carry itself from ``state.task_carry``.
+        """
+        if isinstance(self.task_carry, FirmwareCarry):
+            raise TypeError(
+                "SimState.task_state is the firmware carry in sticks mode — read "
+                "the task pytree through env.task_state(state), or the raw carry "
+                "through state.task_carry"
+            )
+        return self.task_carry
 
     def replace(self, **updates: Any) -> Self:
         """New SimState with the given leaves swapped (dataclasses.replace)."""

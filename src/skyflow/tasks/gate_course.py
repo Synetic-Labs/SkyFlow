@@ -35,7 +35,12 @@ import jax.numpy as jnp
 
 from skyflow.tasks.base import finalize_obs, quat_to_rot
 from skyflow.types import Array, ObsSpec, ObsTerm, TaskEval
-from skyflow.vision.gates import GateSet, classify_crossings, figure_eight
+from skyflow.vision.gates import (
+    GateSet,
+    classify_crossings,
+    crossing_offsets,
+    figure_eight,
+)
 
 if TYPE_CHECKING:
     from skyflow.vision.camera import CameraModel
@@ -122,7 +127,6 @@ class GateCourseTask:
         if spawn_mode not in ("podium", "spread"):
             raise ValueError(f"spawn_mode must be 'podium' or 'spread', got {spawn_mode!r}")
         self.gates = gates if gates is not None else figure_eight(3)
-        self.num_gates = len(self.gates)
         self.body_radius_m = float(body_radius_m)
         min_inner = float(jnp.min(self.gates.inner_half))
         if self.body_radius_m >= min_inner:
@@ -140,17 +144,6 @@ class GateCourseTask:
         self.spawn_lateral_m = float(spawn_lateral_m)
         self.spawn_alt_jitter_m = float(spawn_alt_jitter_m)
         self.spawn_yaw_jitter_rad = float(spawn_yaw_jitter_rad)
-
-        # Course geometry as fixed world-frame constants, read through the GateSet's
-        # public z-up properties (the raw fields are the renderer's internal NED —
-        # DESIGN.md §3a). They ride inside jitted programs as baked-in values, indexed
-        # per world by the active gate. Lateral/vertical signs are internal-convention;
-        # the centering measure only takes magnitudes along them.
-        self._centers = self.gates.centers_world  # [G, 3]
-        self._normals = self.gates.normals_world  # [G, 3] unit, facing flight direction
-        self._laterals = self.gates.laterals_world  # [G, 3] unit, in-plane horizontal
-        self._verticals = self.gates.verticals_world  # [G, 3] unit, in-plane vertical
-        self._inner = self.gates.inner_half  # [G, 2] (lateral, vertical) half-extents
 
         # Podium pad: an explicit (x, y), or — on the shipped default course only — the
         # centre of the gate cluster opposite gate 0 (the second course half: the other
@@ -190,6 +183,29 @@ class GateCourseTask:
                     *tail,
                 )
             )
+
+    @property
+    def gates(self):
+        """The course. Reassigning it re-derives ALL cached geometry below, so the
+        reward geometry and the collision geometry can never come from two different
+        courses (a subclass that swapped `gates` used to get a chimera: cached
+        reward constants from the old course, live crossings from the new)."""
+        return self._gates
+
+    @gates.setter
+    def gates(self, gates) -> None:
+        # Course geometry as fixed world-frame constants, read through the GateSet's
+        # public z-up properties (the raw fields are the renderer's internal NED —
+        # DESIGN.md §3a). They ride inside jitted programs as baked-in values, indexed
+        # per world by the active gate. Lateral/vertical signs are internal-convention;
+        # the centering measure only takes magnitudes along them.
+        self._gates = gates
+        self.num_gates = len(gates)
+        self._centers = gates.centers_world  # [G, 3]
+        self._normals = gates.normals_world  # [G, 3] unit, facing flight direction
+        self._laterals = gates.laterals_world  # [G, 3] unit, in-plane horizontal
+        self._verticals = gates.verticals_world  # [G, 3] unit, in-plane vertical
+        self._inner = gates.inner_half  # [G, 2] (lateral, vertical) half-extents
 
     # -- Task protocol -------------------------------------------------------------
 
@@ -277,7 +293,9 @@ class GateCourseTask:
             mask = self._render_masks(camera, self.gates, pos, quat)
             head = [mask.reshape(pos.shape[0], -1)]
         else:
-            active = task_state.active_gate
+            # clip, don't trust: JAX gathers clamp OOB indices silently, and a bad
+            # index (mismatched checkpoint, subclass with fewer gates) would stick.
+            active = jnp.clip(task_state.active_gate, 0, self.num_gates - 1)
             nxt = jnp.minimum(active + 1, self.num_gates - 1)
             head = [
                 _world_to_body(rot, self._centers[active] - pos),
@@ -305,7 +323,10 @@ class GateCourseTask:
         pos_prev = prev_plant[:, 0:3]
         pos = plant[:, 0:3]
         omega = plant[:, 10:13]
-        active = task_state.active_gate
+        # Clip once so a bad stored index (mismatched checkpoint, subclass with a
+        # shorter course) self-heals through new_active below, instead of riding
+        # JAX's silent gather-clamp forever with `success` permanently unreachable.
+        active = jnp.clip(task_state.active_gate, 0, self.num_gates - 1)
         fleet = pos.shape[0]
 
         center = self._centers[active]
@@ -322,16 +343,13 @@ class GateCourseTask:
         # Centering at the centre-plane crossing point: SkyDreamer's Chebyshev miss,
         # normalized per axis (rectangular openings score like square ones). On a pass
         # the crossing point is strictly inside the opening (classify_crossings), so
-        # centering ∈ (0, 1]; elsewhere it is zeroed and pays nothing.
-        oo = pos_prev - center
-        seg = pos - pos_prev
-        prev_sd = jnp.sum(oo * normal, axis=-1)
-        sd = prev_sd + jnp.sum(seg * normal, axis=-1)
-        denom = prev_sd - sd
-        alpha = prev_sd / jnp.where(jnp.abs(denom) < 1e-9, 1e-9, denom)
-        cp = oo + alpha[:, None] * seg
-        lat = jnp.abs(jnp.sum(cp * self._laterals[active], axis=-1)) / self._inner[active, 0]
-        vert = jnp.abs(jnp.sum(cp * self._verticals[active], axis=-1)) / self._inner[active, 1]
+        # centering ∈ (0, 1]; elsewhere it is zeroed and pays nothing. The solve is
+        # crossing_offsets — the SAME one classify_crossings uses for its pass
+        # predicate, so reward math cannot drift from collision math (TECH_DEBT T15).
+        crossed_g, forward_g, lat_g, vert_g = crossing_offsets(pos_prev, pos, self.gates)
+        rows = jnp.arange(fleet)
+        lat = lat_g[rows, active] / self._inner[active, 0]
+        vert = vert_g[rows, active] / self._inner[active, 1]
         centering = jnp.where(passed, 1.0 - jnp.maximum(lat, vert), 0.0)
         reward = reward + self.w_gate * centering
 
@@ -339,7 +357,7 @@ class GateCourseTask:
         # the same crossing predicate classify_crossings applies, so pass and miss
         # partition every forward transit. Catches wide fly-arounds beyond the outer
         # edge, which touch no solid but end the attempt.
-        missed = (prev_sd * sd < 0.0) & (prev_sd < 0.0) & ~passed
+        missed = crossed_g[rows, active] & forward_g[rows, active] & ~passed
         crash = jnp.any(hit, axis=-1) | missed
 
         reward = reward - self.w_rate * jnp.linalg.norm(omega, axis=-1)

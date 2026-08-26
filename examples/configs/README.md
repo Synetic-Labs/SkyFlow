@@ -10,7 +10,7 @@ artifact: render it at use time and never commit it. Rendering is strict
 — any line the firmware rejects fails the render and is named.
 
 The env renders for you — point `SimConfig.eeprom` at the dump
-(`control="sticks"`, needs cudaflight >= 0.5.0):
+(`control="sticks"`, needs cudaflight >= 0.6.0, the pyproject floor):
 
 ```python
 from skyflow import SimConfig, SkyFlowEnv

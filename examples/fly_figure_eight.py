@@ -8,7 +8,7 @@ version-gated render, then flies open loop — climb, hold, report altitude and 
 task tally. No policy lives in the examples, so no gates get passed; this shows the
 benchmark env exactly as a trainer constructs it, drone-config seam included. Point
 --dump at a real drone's dump (plus its sim_overrides.txt) to fly that config.
-Needs the firmware extra (skyflow[firmware], cudaflight >= 0.5.0).
+Needs the firmware extra (skyflow[firmware]; the pyproject pins the floor).
 
 --trace runs the kinematic course tracer instead — no dynamics, no firmware: a
 constant-speed tour through pre/post-gate waypoints fed to `GateCourseTask.evaluate`,

@@ -271,4 +271,4 @@ def test_env_firmware_auto_picks_gpu_fleet(gpu_fleet):
         obs, state, reward, _done, _info = step(state, aetr)
         assert bool(jnp.isfinite(obs).all()) and reward.shape == (GPU_FLEET,)
     finally:
-        env._fw.close()
+        env.close()
