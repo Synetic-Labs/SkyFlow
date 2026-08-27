@@ -53,6 +53,17 @@ sensor model, the policy eats the estimator model.
 - **event** — Bernoulli occurrences with consequences (pokes, command drops,
   estimator dropouts). Event RATES are never scaled by the master dial.
 
+## Floors: the dial never cuts below reality (2026-08-26)
+
+A MEASURED value is not a stress width — it is the minimum truth. `DomainRand.
+floors` maps knob names to measured minimums (bench/sysid provenance required):
+for any scale > 0 the knob resolves to floor + scale·(value − floor). The dial's
+meaning becomes: 0 = corruption off (bit-exact, the charter), 0+ = measured
+reality, 1 = the full stress envelope. The "obs_error_fracs" floor (1.0) pins
+the estimator profile at reality and retires the fracs-compensation workaround.
+Un-floored knobs keep the legacy scale·value fold. Floors follow the SENSOR
+BOARD, not the airframe: one sit-still bench per FC board class sets them.
+
 ## Rules for every error model
 
 1. **Name, units, equations.** Every knob is a physical quantity in SI units,

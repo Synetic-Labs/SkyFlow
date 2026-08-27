@@ -200,6 +200,17 @@ class DomainRand:
     # (bit-exact); {"profile": "mocap"} etc.; fracs scale the profile widths and
     # the master `scale` folds into them. p_drop is an event rate — never scaled.
     obs_error: dict | None = None
+    # -- measured floors (ERRORS.md): the dial never cuts below reality ---------------
+    # {knob_name: floor}. A floor is a MEASURED minimum (bench/sysid provenance): for
+    # any scale > 0 the knob resolves to floor + scale·(value − floor) instead of
+    # scale·value, so no setting of the dial produces a sim cleaner than the physical
+    # hardware. Scale exactly 0 stays bit-exact OFF (the clean-baseline charter), and
+    # a knob explicitly set to 0 stays 0 (off is off). The special key
+    # "obs_error_fracs" floors the estimator width fractions at its value (1.0 = the
+    # profile is measured reality; stress arms set fracs > 1 and scale interpolates).
+    # The dial's meaning with floors on: 0 = corruption off, 0+ = reality, 1 = the
+    # full stress envelope.
+    floors: dict | None = None
 
     # -- initial state: task variety, forwarded to builders as spawn_dr_scale ---------
     spawn_scale: float = 1.0
@@ -211,40 +222,94 @@ class DomainRand:
             gyro_sat_rps=0.0,
         )
 
+    #: Knob names `floors` may carry (the scaled continuous magnitudes), plus the
+    #: special "obs_error_fracs" key for the estimator width fractions.
+    _FLOORABLE = (
+        "wind_mean_mps", "wind_gust_mps", "poke_force_n", "poke_torque_nm",
+        "poke_force_frac", "poke_torque_frac", "gyro_noise_rps", "accel_noise_mps2",
+        "gyro_bias_rps", "accel_bias_mps2", "baro_noise_pa", "obs_noise",
+        "battery_sag", "battery_sag_rate_ps", "gyro_scale_frac", "imu_offset_m",
+        "imu_mount_deg", "cog_offset_m", "cog_offset_frac",
+    )
+
     def effective(self) -> "DomainRand":
-        """This setting with `scale` folded into every continuous magnitude (scale=1)."""
+        """This setting with `scale` folded into every continuous magnitude (scale=1).
+
+        With `floors` set, a floored knob resolves to floor + scale·(value − floor)
+        for any scale > 0 — the dial moves only the margin above measured reality.
+        Scale exactly 0 and knobs at exactly 0 keep the legacy bit-exact zeros."""
         s = self.scale
+        fl = dict(self.floors or {})
+        bad = sorted(set(fl) - set(self._FLOORABLE) - {"obs_error_fracs"})
+        if bad:
+            raise ValueError(
+                f"unknown dr.floors keys {bad}; floorable: "
+                f"{self._FLOORABLE + ('obs_error_fracs',)}"
+            )
+        for name, f in fl.items():
+            if float(f) < 0.0:
+                raise ValueError(f"dr.floors[{name!r}] must be >= 0, got {f}")
+            if name == "obs_error_fracs":
+                continue
+            v = getattr(self, name)
+            if v > 0.0 and v < float(f):
+                raise ValueError(
+                    f"dr.{name} = {v} is below its floor {f}: the stress ceiling "
+                    "(the knob value at scale 1) cannot sit under measured reality"
+                )
+
+        def mag(name: str) -> float:
+            v = getattr(self, name)
+            f = float(fl.get(name, 0.0))
+            if s == 0.0 or v <= 0.0 or f == 0.0:
+                return s * v  # legacy path: bit-exact zeros, un-floored knobs
+            return f + s * (v - f)
+
         obs_error = self.obs_error
         if obs_error is not None:
             # Fold the master scale into the width fractions; the event knobs
             # (p_drop, drop_mean_steps) pass through unscaled per the charter.
+            # With the "obs_error_fracs" floor, fractions resolve to
+            # floor + s·(frac − floor): at floor 1.0 the profile is always at
+            # measured reality and stress arms set fracs > 1.
             obs_error = dict(obs_error)
+            ff = float(fl.get("obs_error_fracs", 0.0))
             for key in ("bias_frac", "ou_frac", "white_frac"):
-                obs_error[key] = s * float(obs_error.get(key, 1.0))
+                frac = float(obs_error.get(key, 1.0))
+                if s == 0.0 or ff == 0.0:
+                    obs_error[key] = s * frac
+                else:
+                    if frac < ff:
+                        raise ValueError(
+                            f"dr.obs_error.{key} = {frac} is below the "
+                            f"obs_error_fracs floor {ff}"
+                        )
+                    obs_error[key] = ff + s * (frac - ff)
         return replace(
             self,
             scale=1.0,
+            floors=None,
             obs_error=obs_error,
             body_scale=s * self.body_scale,
-            wind_mean_mps=s * self.wind_mean_mps,
-            wind_gust_mps=s * self.wind_gust_mps,
-            poke_force_n=s * self.poke_force_n,
-            poke_torque_nm=s * self.poke_torque_nm,
-            gyro_noise_rps=s * self.gyro_noise_rps,
-            accel_noise_mps2=s * self.accel_noise_mps2,
-            gyro_bias_rps=s * self.gyro_bias_rps,
-            accel_bias_mps2=s * self.accel_bias_mps2,
-            baro_noise_pa=s * self.baro_noise_pa,
-            obs_noise=s * self.obs_noise,
-            battery_sag=s * self.battery_sag,
-            battery_sag_rate_ps=s * self.battery_sag_rate_ps,
-            poke_force_frac=s * self.poke_force_frac,
-            poke_torque_frac=s * self.poke_torque_frac,
-            gyro_scale_frac=s * self.gyro_scale_frac,
-            imu_offset_m=s * self.imu_offset_m,
-            imu_mount_deg=s * self.imu_mount_deg,
-            cog_offset_m=s * self.cog_offset_m,
-            cog_offset_frac=s * self.cog_offset_frac,
+            wind_mean_mps=mag("wind_mean_mps"),
+            wind_gust_mps=mag("wind_gust_mps"),
+            poke_force_n=mag("poke_force_n"),
+            poke_torque_nm=mag("poke_torque_nm"),
+            gyro_noise_rps=mag("gyro_noise_rps"),
+            accel_noise_mps2=mag("accel_noise_mps2"),
+            gyro_bias_rps=mag("gyro_bias_rps"),
+            accel_bias_mps2=mag("accel_bias_mps2"),
+            baro_noise_pa=mag("baro_noise_pa"),
+            obs_noise=mag("obs_noise"),
+            battery_sag=mag("battery_sag"),
+            battery_sag_rate_ps=mag("battery_sag_rate_ps"),
+            poke_force_frac=mag("poke_force_frac"),
+            poke_torque_frac=mag("poke_torque_frac"),
+            gyro_scale_frac=mag("gyro_scale_frac"),
+            imu_offset_m=mag("imu_offset_m"),
+            imu_mount_deg=mag("imu_mount_deg"),
+            cog_offset_m=mag("cog_offset_m"),
+            cog_offset_frac=mag("cog_offset_frac"),
         )
 
 
