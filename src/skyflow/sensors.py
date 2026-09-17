@@ -17,6 +17,7 @@ def measure(
     wind_vel,
     params,
     *,
+    motor_model: str = "first_order",
     key=None,
     accel_noise_std: float = 0.0,
     gyro_noise_std: float = 0.0,
@@ -42,7 +43,8 @@ def measure(
     # noise, then the ADC full-scale clip (saturation) — the range limit cuts LAST,
     # exactly as the real front end does.
     accel, gyro = dynamics.imu(
-        plant, omega_cmd, wind_vel, params, offset=imu_offset, mount=imu_mount
+        plant, omega_cmd, wind_vel, params,
+        motor_model=motor_model, offset=imu_offset, mount=imu_mount,
     )
     if gyro_scale is not None:
         gyro = gyro * gyro_scale.astype(gyro.dtype)

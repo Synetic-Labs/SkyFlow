@@ -40,7 +40,7 @@ import re
 import tempfile
 import warnings
 import weakref
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
@@ -67,7 +67,7 @@ from skyflow.types import (
     Task,
 )
 
-__all__ = ["DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
+__all__ = ["MOTOR_MODELS", "DomainRand", "SimConfig", "SkyFlowEnv", "tree_where"]
 
 #: Near-ground band, metres: below it a descending/tilted airborne vehicle is a ground
 #: crash; above it the airborne latch sets (DESIGN.md §7 step 6 uses 0.05 for both).
@@ -354,6 +354,20 @@ class SimConfig:
     max_speed_mps: float = 30.0
     max_rate_rps: float = 50.0
     ground_tilt_limit_rad: float = math.pi / 3
+    # Per-world dynamics identity across episodes. False (default): auto-reset redraws
+    # the parameter rows and the transport delay for every done world. True: both stay
+    # fixed for the life of the env (one quadrotor per world, RAPTOR-style teachers);
+    # auto-reset still respawns the plant/task and redraws the per-episode traits. The
+    # reset-time guards (thrust-to-weight, CoG offset) are baked into the pinned rows once.
+    pin_dynamics: bool = False
+    # Rotor model of the generated dynamics: "first_order" (tau_m) or "asymmetric"
+    # (ka1/ka2 spin-up, kd1/kd2 spin-down; ka1 = kd1 = 1/tau_m, ka2 = kd2 = 0 reproduces
+    # first_order). The airframe row must carry the matching coefficients.
+    motor_model: str = "first_order"
+
+
+#: Rotor models the generated backend provides (skyflow_dynamics.spec.dynamics.MOTOR_MODELS).
+MOTOR_MODELS = ("first_order", "asymmetric")
 
 
 def _installed_base_rev() -> "str | None":
@@ -479,10 +493,17 @@ class SkyFlowEnv:
         task: Task | None = None,
         firmware_fleet: FirmwareFleet | None = None,
         motor_perm: Sequence[int] = (3, 1, 0, 2),
+        params_sampler: Callable[[Array, int], Array] | None = None,
     ) -> None:
         """
         Args:
           cfg: frozen platform configuration.
+          params_sampler: optional ``(key, fleet) -> rows [fleet, P]`` replacing the §6
+            multiplicative sampler at reset (and at auto-reset respawn unless
+            ``cfg.pin_dynamics``). Rows are float32 in ``pack_params`` order; the
+            reset-time guards (thrust-to-weight under battery sag, CoG offset) still apply.
+            Use it for distributions the bracket sampler cannot express, e.g. a wide
+            physically coupled family of vehicles.
           task: pre-built Task instance; None builds `cfg.task` through the
             `skyflow.tasks` registry with `cfg.task_kwargs` (forwarding the env-owned
             `spawn_dr_scale` and `control_hz` to builders that name them).
@@ -498,6 +519,10 @@ class SkyFlowEnv:
         """
         if cfg.differentiable:
             raise NotImplementedError("planned")
+        if cfg.motor_model not in MOTOR_MODELS:
+            raise ValueError(
+                f"cfg.motor_model must be one of {MOTOR_MODELS}, got {cfg.motor_model!r}"
+            )
         if cfg.control not in ("motors", "sticks"):
             raise ValueError(f'cfg.control must be "motors" or "sticks", got {cfg.control!r}')
         if cfg.eeprom is None and cfg.eeprom_overrides is not None:
@@ -595,6 +620,8 @@ class SkyFlowEnv:
         self.cfg = cfg
         self.dr = dr  # effective DomainRand: master scale already folded in
         self._delay_min, self._delay_max = d_min, d_max
+        self._params_sampler = params_sampler
+        self._motor_model = cfg.motor_model
         self._imu_noise_on = dr.gyro_noise_rps > 0.0 or dr.accel_noise_mps2 > 0.0
         self._imu_bias_on = dr.gyro_bias_rps > 0.0 or dr.accel_bias_mps2 > 0.0
         self.fleet = int(cfg.num_envs)
@@ -891,6 +918,22 @@ class SkyFlowEnv:
 
     # -- DomainRand draws (all read self.dr — the effective, master-scaled setting) ------
 
+    def _sample_params(self, key: Array, f: int) -> Array:
+        """Fresh parameter rows [f,P]: the injected sampler, else the §6 sampler."""
+        if self._params_sampler is None:
+            dr = self.dr
+            return sample_params(
+                key, self.airframe, f, dr.body_scale, dr.brackets, dr.factors
+            )
+        rows = jnp.asarray(self._params_sampler(key, f), jnp.float32)
+        expected = (f, int(self._nominal_row.shape[0]))
+        if rows.shape != expected:
+            raise ValueError(
+                f"params_sampler returned shape {tuple(rows.shape)}, expected {expected} "
+                "(fleet rows in pack_params order)"
+            )
+        return rows
+
     def _draw_traits(self, key: Array, f: int) -> DRState:
         """Fresh per-episode trait rows (types.DRState) — used at reset and respawn.
 
@@ -964,6 +1007,7 @@ class SkyFlowEnv:
         dr = self.dr
         return sensors.measure(
             plant, omega, wind, params,
+            motor_model=self._motor_model,
             key=key if self._imu_noise_on else None,
             accel_noise_std=dr.accel_noise_mps2,
             gyro_noise_std=dr.gyro_noise_rps,
@@ -1021,9 +1065,7 @@ class SkyFlowEnv:
             key, 7
         )
 
-        params = sample_params(
-            k_params, self.airframe, f, dr.body_scale, dr.brackets, dr.factors
-        )
+        params = self._sample_params(k_params, f)
         dr_state = self._draw_traits(k_traits, f)
         if self._tw_reguard:
             params = apply_tw_guard(params, self._nominal_row, dr_state.w_max)
@@ -1215,7 +1257,7 @@ class SkyFlowEnv:
                 plant, impact = carry
                 raw = dynamics.substep(
                     plant, omega_cmd, wind_total, f_ext, tau_ext, state.params,
-                    self.dt_physics, w_min, w_max,
+                    self.dt_physics, w_min, w_max, motor_model=self._motor_model,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
                 return (_ground_contact(raw), impact), None
@@ -1256,7 +1298,7 @@ class SkyFlowEnv:
                 )
                 raw = dynamics.substep(
                     plant, omega_cmd, wind_total, f_ext, tau_ext, state.params,
-                    self.dt_physics, w_min, w_max,
+                    self.dt_physics, w_min, w_max, motor_model=self._motor_model,
                 )
                 impact = impact | _ground_impact(raw, cos_tilt_min)
                 return (_ground_contact(raw), blob, fwstate, omega_cmd, impact, armed), None
@@ -1348,12 +1390,22 @@ class SkyFlowEnv:
         # cleared buffers/gust for done worlds, blended leaf-wise; live worlds pass
         # through untouched (bit-identical).
         k_rp, k_rs, k_rt, k_rd, k_ri, k_ro = jax.random.split(k_reset, 6)
-        params_new = sample_params(k_rp, af, f, dr.body_scale, dr.brackets, dr.factors)
         dr_new = self._draw_traits(k_rt, f)
-        if self._tw_reguard:
-            params_new = apply_tw_guard(params_new, self._nominal_row, dr_new.w_max)
-        if self._cog_on:
-            params_new = apply_cog_offset(params_new, dr_new.cog_offset)
+        if cfg.pin_dynamics:
+            # One quadrotor per world for the life of the env: the rows (guards already
+            # baked in at reset) and the delay draw carry over; only the spawn and the
+            # per-episode traits are fresh.
+            params_new = state.params
+            delay_new = state.delay_idx
+        else:
+            params_new = self._sample_params(k_rp, f)
+            if self._tw_reguard:
+                params_new = apply_tw_guard(params_new, self._nominal_row, dr_new.w_max)
+            if self._cog_on:
+                params_new = apply_cog_offset(params_new, dr_new.cog_offset)
+            delay_new = jax.random.randint(
+                k_rd, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
+            )
         plant_new, ts_fresh = self.task.spawn(k_rs, f, params_new)
         plant_new = plant_new.astype(jnp.float32)
         la_new = jnp.broadcast_to(self._act_neutral, (f, 4))
@@ -1379,9 +1431,7 @@ class SkyFlowEnv:
             wind_vel=wind_new,
             dr_state=dr_new,
             act_buf=jnp.broadcast_to(self._act_neutral, (f, self._delay_max + 1, 4)),
-            delay_idx=jax.random.randint(
-                k_rd, (f,), self._delay_min, self._delay_max + 1, dtype=jnp.int32
-            ),
+            delay_idx=delay_new,
             cmd_prev=la_new,
             last_action=la_new,
             est_ou=jnp.zeros((f, 12), jnp.float32),

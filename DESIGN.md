@@ -177,6 +177,16 @@ validates `body_scale·max_bracket < 1` so factors stay positive). Keys NEVER ji
 (multiplicative). Same routine used at reset and auto-reset respawn, driven by the §7
 DomainRand block: `scale = dr.scale·dr.body_scale`.
 
+Injected samplers: `SkyFlowEnv(cfg, params_sampler=fn)` with `fn(key, fleet) -> [F,P]`
+float32 rows in `pack_params` order replaces this routine (reset and respawn). It is the
+seam for distributions the bracket table cannot express — a wide, physically coupled
+family of vehicles (thrust-to-weight, size, torque-to-inertia drawn jointly). The
+reset-time guards still apply to injected rows. `SimConfig.pin_dynamics=True` then keeps
+each world's rows and its delay draw for the life of the env (auto-reset respawns the
+plant/task and redraws traits only): one quadrotor per world, as a per-world teacher
+population needs. `SimConfig.motor_model` selects the generated rotor model
+("first_order" on `tau_m`, or "asymmetric" on `ka1/ka2/kd1/kd2`).
+
 ## 7. env.py — the platform
 
 ```python
