@@ -525,9 +525,12 @@ Boundary: viz SHOWS what the vehicle did and sensed — it never decides it. Nor
 Four layers, strict about what each may know:
 
 1. **Vehicle truth — always drawn.** Pose, attitude, rotor speeds, trails, glyphs, the
-   fixed HUD instruments (sticks/action + arm lamp, motors, attitude, heading, speed and
-   climb dials, episode-length bars). All from
-   `plant` and the step outputs. No task knowledge.
+   fixed HUD instruments (sticks/action + arm lamp, motors, attitude with pitch/roll
+   level markers, heading, speed and climb dials, episode-length bars). All from
+   `plant` and the step outputs. No task knowledge. Host telemetry rides along: the
+   fleet size in the top bar and a steps/s trace (per sim and all sims) — measured from
+   the drawn frames' step counter live, reported by the host
+   (`viewer.report_throughput`) elsewhere; replay never measures playback speed.
 2. **World geometry — always data.** Scene primitives. Tasks and users contribute them;
    the pane only draws. Extension is public: `register_primitive(cls, draw_fn)` — the
    same registry idiom as `register_task`/`register_airframe`.
@@ -536,7 +539,11 @@ Four layers, strict about what each may know:
    block, default "mask"). Viz never invents a sensor.
 4. **Channels — named scalars, caller-selected.** Anything from step returns, `info` or
    `metrics` can be traced (`viewer.frame(..., channels={...})`); the HUD draws one graph
-   per name. Reward is a channel, not a viz concept.
+   per name. Reward is a channel, not a viz concept — the one convention is that a
+   channel named `reward` also gets per-episode totals (EP REWARD bars): exact from
+   `info["ep_return"]` when the frame carries it, else summed from the channel. Only
+   episodes seen from their first step are charted; a host that jumps (a new log, a
+   seek) calls `viewer.discontinuity()` so the jump is not read as an episode end.
 
 Conventions degrade to nothing: `viz_scene()`, `camera`, `gates` are optional duck-typed
 hooks; a task without them still gets layers 1, 3 and 4.

@@ -397,8 +397,8 @@ class SkyFlowEnv:
     observation and flags are returned through `info` (final_obs / terminated /
     truncated), so training code never sees a dead state.
 
-    Exposes `fleet`, `obs_spec`, `obs_dim`, `act_dim` (=4), `image_shape`, `decimation`,
-    `dt_control` and `dt_physics`. Actions are [F,4] in [-1,1] (clipped defensively):
+    Exposes `fleet`, `task_name`, `obs_spec`, `obs_dim`, `act_dim` (=4), `image_shape`,
+    `decimation`, `dt_control` and `dt_physics`. Actions are [F,4] in [-1,1] (clipped defensively):
     motor throttles in motors mode, AETR sticks in sticks mode (§10).
 
     info keys beyond the pre-reset flags and observation, all [F]: `poke_active` (this
@@ -588,6 +588,12 @@ class SkyFlowEnv:
         )
 
         self.task: Task = task if task is not None else self._build_task(cfg)
+        # display name (viewer title, FlightLog header): an injected task instance
+        # leaves cfg.task at its "hover" default, so name the instance instead
+        name = getattr(task, "name", None)
+        self.task_name: str = (
+            cfg.task if task is None else name if isinstance(name, str) else type(task).__name__
+        )
         self.obs_spec = self.task.obs_spec
         self.obs_dim = self.obs_spec.dim
         self.image_shape = self.task.image_shape
