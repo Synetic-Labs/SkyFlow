@@ -21,6 +21,7 @@ class ViewFrame:
 
     plant: np.ndarray  # [W,17] spec layout: x(3) v(3) q_wxyz(4) ω(3) Ω(4)
     step: int = 0  # focused world's control-step count
+    steps: np.ndarray | None = None  # [W] every watched world's step count (None: all `step`)
     t: float = 0.0  # step * dt, seconds
     focus: int = 0  # index into the watch list, not the fleet
     action: np.ndarray | None = None  # [W,4] in [-1,1]
@@ -138,16 +139,17 @@ def snapshot(
         rows(obs),
         task_rows,
         info_rows,
-        state.steps[idx[focus]],
+        state.steps[idx],
         state.plant[:: max(1, int(fleet_stride)), 0:3] if fleet_positions else None,
     )
     plant, action_w, chans_w, done_w, obs_w, ts, info_w, steps, positions = jax.device_get(
         bundle
     )
-    step = int(steps)
+    step = int(steps[int(focus)])
     return ViewFrame(
         plant=np.asarray(plant),
         step=step,
+        steps=np.asarray(steps),
         t=step * float(dt),
         focus=int(focus),
         action=None if action_w is None else np.asarray(action_w),
