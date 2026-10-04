@@ -638,12 +638,14 @@ class Viewer:
                 trace.clear()
         step = int(vf.step)
         prev = self._prev_step
-        if (
-            prev == step and self._prev_rows is not None
-            and np.array_equal(vf.plant, self._prev_rows[0])
-            and np.array_equal(vf.done, self._prev_rows[1])
-        ):
-            return  # the same row again (paused or held replay): nothing new happened
+        if prev == step and self._prev_rows is not None:
+            plant, done = self._prev_rows
+            same_done = (
+                done is None if vf.done is None
+                else done is not None and np.array_equal(vf.done, done)
+            )
+            if same_done and np.array_equal(vf.plant, plant):
+                return  # the same row again (paused or held replay): nothing new happened
         self._prev_step, self._prev_rows = step, (vf.plant, vf.done)
         # steps advanced since the last tracked frame; a counter drop means a fresh
         # per-episode counter, which has advanced `step` steps since its reset

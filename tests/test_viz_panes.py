@@ -190,14 +190,15 @@ class TestBuilders:
         font = pygame.font.Font(None, 14)
         rect = (0, 0, 1600, 150)
         renders = []
-        for extra in (
-            {},
-            {"ep_rewards": [-3.0, 1.0, 5.0]},  # negative totals hang below a zero line
-            {"throughput": [900.0, 1000.0, 1100.0], "fleet": 4096},
+        for ep_rewards, throughput in (
+            (None, None),
+            ([-3.0, 1.0, 5.0], None),  # negative totals hang below a zero line
+            (None, [900.0, 1000.0, 1100.0]),
         ):
             surface = pygame.Surface(rect[2:])
             draw_hud(surface, rect, _frame(), histories={"reward": [0.1, 0.3]},
-                     font=font, small=font, **extra)
+                     ep_rewards=ep_rewards, throughput=throughput, fleet=4096,
+                     font=font, small=font)
             renders.append(pygame.surfarray.array3d(surface))
         assert (renders[0] != renders[1]).any(), "the episode-reward panel should draw"
         assert (renders[0] != renders[2]).any(), "the throughput panel should draw"
@@ -472,10 +473,11 @@ class TestViewer:
             late_done.done = np.array([True, False])
             viewer._stash_done(late_done, seq=5)
             viewer._merge_lost_dones(early, seq=4)  # fed before the done: untouched
-            assert not early.done.any() and len(viewer._lost_dones) == 1
+            assert early.done is not None and not early.done.any()
+            assert len(viewer._lost_dones) == 1
             after = _frame()
             viewer._merge_lost_dones(after, seq=6)
-            assert after.done[0] and not viewer._lost_dones
+            assert after.done is not None and after.done[0] and not viewer._lost_dones
         finally:
             viewer.close()
 

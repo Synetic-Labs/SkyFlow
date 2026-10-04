@@ -301,11 +301,13 @@ class TestFlightLog:
         class RaceLike(GateCourseTask):
             pass
 
+        class Named(GateCourseTask):
+            name = "race"  # a string `name` attribute wins over the class name
+
         env = SkyFlowEnv(SimConfig(num_envs=2), task=RaceLike())
         assert env.task_name == "RaceLike"
         assert FlightLog.for_env(env).header["task"] == "RaceLike"
-        RaceLike.name = "race"  # a string `name` attribute wins over the class name
-        assert SkyFlowEnv(SimConfig(num_envs=2), task=RaceLike()).task_name == "race"
+        assert SkyFlowEnv(SimConfig(num_envs=2), task=Named()).task_name == "race"
         assert SkyFlowEnv(SimConfig(num_envs=2)).task_name == "hover"
 
     def test_capture_unwraps_wrapped_task_state(self):
