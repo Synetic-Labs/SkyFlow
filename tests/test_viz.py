@@ -279,6 +279,7 @@ class TestFlightLog:
         env = SkyFlowEnv(SimConfig(num_envs=2, task="figure_eight"))
         log = FlightLog.for_env(env, watch=(0,))
         assert log.header["task"] == "figure_eight" and log.header["dt"] == pytest.approx(0.01)
+        assert log.header["fleet"] == 2
         assert log.header["scene"], "the task hook should populate the scene"
         from skyflow.tasks.gate_course import GateCourseTask
 
@@ -290,6 +291,22 @@ class TestFlightLog:
             np.asarray(task.gates.centers_world),
             atol=1e-6,
         )
+
+    def test_injected_task_is_named_by_the_instance(self):
+        """cfg.task stays at its "hover" default when a Task instance is injected —
+        the title and header must name the instance, not that default."""
+        from skyflow import SimConfig, SkyFlowEnv
+        from skyflow.tasks.gate_course import GateCourseTask
+
+        class RaceLike(GateCourseTask):
+            pass
+
+        env = SkyFlowEnv(SimConfig(num_envs=2), task=RaceLike())
+        assert env.task_name == "RaceLike"
+        assert FlightLog.for_env(env).header["task"] == "RaceLike"
+        RaceLike.name = "race"  # a string `name` attribute wins over the class name
+        assert SkyFlowEnv(SimConfig(num_envs=2), task=RaceLike()).task_name == "race"
+        assert SkyFlowEnv(SimConfig(num_envs=2)).task_name == "hover"
 
     def test_capture_unwraps_wrapped_task_state(self):
         """Sticks mode wraps the task pytree in the firmware carry; the env accessor

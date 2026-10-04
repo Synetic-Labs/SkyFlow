@@ -32,6 +32,7 @@ class ViewFrame:
     task_state: Any = None  # watch-row task pytree (binds walk it)
     info: dict[str, np.ndarray] | None = None  # [W] rows of the step info
     positions: np.ndarray | None = None  # [F,3] whole-fleet scatter, only when asked
+    fleet: int | None = None  # worlds simulated in parallel (F), not just the watched ones
 
     @property
     def reward(self) -> np.ndarray | None:
@@ -156,4 +157,5 @@ def snapshot(
         task_state=ts,
         info=info_w,
         positions=None if positions is None else np.asarray(positions),
+        fleet=int(fleet),
     )

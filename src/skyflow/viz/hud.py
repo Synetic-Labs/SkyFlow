@@ -3,11 +3,13 @@ Instrument-strip builder (DESIGN.md §13) — vehicle truth plus user-selected c
 
 Left to right: stick crosses (AETR in sticks mode, four action bars in motors mode) with
 an arm lamp under them (when the caller passes `armed`), rotor speed bars from
-plant[13:17], an attitude horizon (roll/pitch printed under it) and a heading compass
-(heading printed under it), a speed dial and a cockpit-style climb dial (zero at the
-left, needle up = climb), an episode-length bar chart (when the caller tracks one),
-then one graph per named channel — reward drawn last. The fixed instruments are vehicle truth —
-valid for any quadrotor use case. Channels are whatever the caller traces (reward, goal
+plant[13:17], an attitude horizon with pitch/roll level markers (roll/pitch printed
+under it) and a heading compass (heading printed under it), a speed dial and a
+cockpit-style climb dial (zero at the left, needle up = climb), an episode-length bar
+chart (when the caller tracks one), then one graph per named channel — reward drawn
+last — then the episode-reward bars and the steps/s throughput trace (each when the
+caller passes it). The fixed instruments are vehicle truth — valid for any quadrotor
+use case. Channels are whatever the caller traces (reward, goal
 distance, estimator error, ...); this module knows no channel names and no task fields.
 A builder, not a host: draws onto the given surface, owns no window.
 """
@@ -53,12 +55,23 @@ def _bars(surface, x: int, y: int, h: int, values: np.ndarray, color) -> int:
     return x + len(values) * (bw + gap)
 
 
-def _horizon(surface, cx: int, cy: int, r: int, quat: np.ndarray) -> None:
-    """Attitude ball: line rolled with the body, shifted by pitch."""
-    rot = quat_to_rot(quat)
-    # ZYX euler read-back from body→world R: roll about body x, pitch about body y
+_LEVEL_TOL = math.radians(2.0)  # a level marker lights GOOD inside this band
+
+
+def _pitch_roll(rot: np.ndarray) -> tuple[float, float]:
+    """(pitch, roll) radians — ZYX euler read-back from body→world R: roll about body
+    x, pitch about body y. The one home of the angles the ball draws and prints."""
     pitch = -math.asin(float(np.clip(rot[2, 0], -1.0, 1.0)))
     roll = math.atan2(float(rot[2, 1]), float(rot[2, 2]))
+    return pitch, roll
+
+
+def _horizon(surface, cx: int, cy: int, r: int, quat: np.ndarray) -> None:
+    """Attitude ball: line rolled with the body, shifted by pitch. Two fixed level
+    markers: wing stubs at the centre (the horizon sits on them at zero pitch) and an
+    index above the rim (the bank pointer meets it at zero roll). Each marker lights
+    GOOD while its own axis is level."""
+    pitch, roll = _pitch_roll(quat_to_rot(quat))
     pygame.draw.circle(surface, palette.DIM, (cx, cy), r, 1)
     dy = float(np.clip(pitch / (math.pi / 2.0), -1.0, 1.0)) * r * 0.8
     dxr, dyr = math.cos(-roll), math.sin(-roll)
@@ -66,7 +79,19 @@ def _horizon(surface, cx: int, cy: int, r: int, quat: np.ndarray) -> None:
     p0 = (cx - dxr * span, cy + dy - dyr * span)
     p1 = (cx + dxr * span, cy + dy + dyr * span)
     pygame.draw.aaline(surface, palette.BRIGHT, p0, p1)
-    pygame.draw.aaline(surface, palette.MUTED, (cx, cy - r), (cx, cy - r + 5))
+    # bank pointer: the horizon's sky-side normal, drawn just inside the rim
+    nx, ny = dyr, -dxr
+    pygame.draw.aaline(surface, palette.ACCENT, (cx + nx * (r - 7), cy + ny * (r - 7)),
+                       (cx + nx * (r - 1), cy + ny * (r - 1)))
+    # roll-level index: a small triangle above the rim at 12 o'clock
+    color = palette.GOOD if abs(roll) < _LEVEL_TOL else palette.MUTED
+    pygame.draw.polygon(surface, color, [(cx, cy - r - 1), (cx - 4, cy - r - 6),
+                                         (cx + 4, cy - r - 6)])
+    # pitch-level marker: aircraft wing stubs either side of the centre
+    color = palette.GOOD if abs(pitch) < _LEVEL_TOL else palette.MUTED
+    gap, wing = r * 0.15, r * 0.3
+    for s in (-1.0, 1.0):
+        pygame.draw.line(surface, color, (cx + s * gap, cy), (cx + s * (gap + wing), cy), 2)
 
 
 def _compass(surface, cx: int, cy: int, r: int, quat: np.ndarray, font=None) -> None:
@@ -149,26 +174,62 @@ def _dial(surface, cx: float, cy: float, r: int, value: float, full: float,
         surface.blit(img, (cx - img.get_width() / 2, cy + r + 3))
 
 
-def _ep_chart(surface, x: int, top: int, w: int, h: int, lengths, font=None) -> None:
-    """Episode-length bars: one bar per finished episode (or per bin once the caller
-    compresses), scaled so the WHOLE run always fits the panel width. The latest
-    length prints in the corner."""
+def _ep_chart(surface, x: int, top: int, w: int, h: int, values, font=None,
+              fmt: str = "{:.0f}") -> None:
+    """Per-episode bars: one bar per finished episode (or per bin once the caller
+    compresses), scaled so the WHOLE run always fits the panel width. Bars grow from
+    zero, so negative values (episode reward) hang below a zero line. The latest value
+    prints in the corner through `fmt`."""
     pygame.draw.rect(surface, palette.DIM, pygame.Rect(x, top, w, h), 1, border_radius=4)
-    arr = np.asarray(lengths, np.float64)
+    arr = np.asarray(values, np.float64)
     if arr.shape[0] == 0:
         return
-    peak = max(float(arr.max()), 1.0)
+    lo, hi = min(float(arr.min()), 0.0), max(float(arr.max()), 0.0)
+    scale = (h - 8) / max(hi - lo, 1e-6)
+    zero = top + 4 + hi * scale  # y of the zero line
+    if lo < 0.0:
+        pygame.draw.aaline(surface, palette.DIM, (x + 4, zero), (x + w - 4, zero))
     bw = (w - 8) / arr.shape[0]
     for i, v in enumerate(arr):
-        bh = max(1, round(float(v) / peak * (h - 8)))
+        bh = max(1, round(abs(float(v)) * scale))
+        by = zero - bh if v >= 0.0 else zero
         bx = round(x + 4 + i * bw)
         pygame.draw.rect(
             surface, palette.dim(palette.ACCENT, 0.8),
-            pygame.Rect(bx, top + h - 4 - bh, max(1, math.floor(bw * 0.8)), bh),
+            pygame.Rect(bx, round(by), max(1, math.floor(bw * 0.8)), bh),
         )
     if font:
-        img = font.render(f"{int(arr[-1])}", True, palette.MUTED)
+        img = font.render(fmt.format(float(arr[-1])), True, palette.MUTED)
         surface.blit(img, (x + w - img.get_width() - 5, top + 3))
+
+
+def _si(v: float) -> str:
+    """Compact count: 950, 12.3k, 4.56M."""
+    for div, suffix in ((1e9, "G"), (1e6, "M"), (1e3, "k")):
+        if abs(v) >= div:
+            return f"{v / div:.3g}{suffix}"
+    return f"{v:.0f}"
+
+
+def _rate_chart(surface, x: int, top: int, w: int, h: int, per_sim, fleet: int | None,
+                font=None) -> None:
+    """Throughput trace in steps/s, scaled from zero. Plots the all-sims total (per-sim
+    x fleet) when the fleet size is known, else the per-sim rate. Prints the latest
+    per-sim rate on the left and the total on the right."""
+    pygame.draw.rect(surface, palette.DIM, pygame.Rect(x, top, w, h), 1, border_radius=4)
+    arr = np.asarray(per_sim, np.float64) * (fleet or 1)
+    if arr.shape[0] >= 2:
+        span = max(float(arr.max()), 1e-6)
+        xs = x + 4 + np.linspace(0, w - 8, arr.shape[0])
+        ys = top + h - 4 - arr / span * (h - 8)
+        pts = [(float(a), float(b)) for a, b in zip(xs, ys, strict=True)]
+        pygame.draw.aalines(surface, palette.ACCENT, False, pts)
+    if font and arr.shape[0]:
+        sim = font.render(f"sim {_si(float(per_sim[-1]))}", True, palette.MUTED)
+        surface.blit(sim, (x + 5, top + 3))
+        if fleet:
+            img = font.render(f"all {_si(float(arr[-1]))}", True, palette.MUTED)
+            surface.blit(img, (x + w - img.get_width() - 5, top + 3))
 
 
 def _lamp(surface, x: float, y: float, w: float, on: bool, text: str, small=None) -> None:
@@ -191,6 +252,9 @@ def draw_hud(
     armed: bool | None = None,
     ranges: dict[str, float] | None = None,
     episodes: Sequence[float] | None = None,
+    ep_rewards: Sequence[float] | None = None,
+    throughput: Sequence[float] | None = None,
+    fleet: int | None = None,
     font=None,
     small=None,
 ) -> None:
@@ -201,7 +265,11 @@ def draw_hud(
     caller-OWNED dict of gauge full-scales: this function grows its entries in place
     (1/2/5 steps, never shrinking), so a persistent caller gets dials with a steady
     range instead of a per-frame autoscale. `episodes` is a sequence of finished
-    episode lengths (steps) for the bar chart; None hides the panel.
+    episode lengths (steps) for the bar chart; None hides the panel. `ep_rewards` is
+    the matching sequence of episode total rewards, drawn as bars after the reward
+    graph; None hides it. `throughput` is a per-sim steps/s history; `fleet` (the
+    number of sims stepping in parallel) turns it into the all-sims total. None hides
+    the throughput panel.
     """
     surface.set_clip(pygame.Rect(rect))
     surface.fill(palette.BG, pygame.Rect(rect))
@@ -245,8 +313,7 @@ def draw_hud(
     rot = quat_to_rot(frame.quat[f])
     _horizon(surface, x + r, top + r, r, frame.quat[f])
     if small:  # numeric read-back under the ball, same angles the ball draws
-        pitch = -math.degrees(math.asin(float(np.clip(rot[2, 0], -1.0, 1.0))))
-        roll = math.degrees(math.atan2(float(rot[2, 1]), float(rot[2, 2])))
+        pitch, roll = (math.degrees(a) for a in _pitch_roll(rot))
         img = small.render(f"R{roll:+.0f} P{pitch:+.0f}", True, palette.MUTED)
         surface.blit(img, (x + r - img.get_width() / 2, top + 2 * r + 3))
     caption(x, "ATTITUDE")
@@ -286,10 +353,24 @@ def draw_hud(
     if "reward" in named:
         named["reward"] = named.pop("reward")  # reorder only: reward draws last
     graph_w = 150
+
+    def fits() -> bool:  # no silent squeeze: extra panels wait for a wider window
+        return x + graph_w <= rect[0] + rect[2] - 10
+
     for name, values in named.items():
-        if x + graph_w > rect[0] + rect[2] - 10:
-            break  # no silent squeeze: extra channels wait for a wider window
+        if not fits():
+            break
         _graph(surface, x, top, graph_w, box, name, values, font=small)
         caption(x, name.upper())
+        x += graph_w + 20
+
+    if ep_rewards is not None and fits():
+        _ep_chart(surface, x, top, graph_w, box, ep_rewards, font=small, fmt="{:+.3g}")
+        caption(x, "EP REWARD")
+        x += graph_w + 20
+
+    if throughput is not None and fits():
+        _rate_chart(surface, x, top, graph_w, box, throughput, fleet, font=small)
+        caption(x, f"STEPS/S · {fleet:,} SIMS" if fleet else "STEPS/S")
         x += graph_w + 20
     surface.set_clip(None)

@@ -39,6 +39,7 @@ def viewer_for_log(log: ReplayLog, *, pilot: tuple[int, int] | None = None, **kw
         camera = CameraModel(**header["camera"])
     gates = gateset_from_dict(header["gateset"]) if header.get("gateset") else None
     n_watch = log.plant.shape[1]
+    kw.setdefault("measure_sps", False)  # playback speed is not sim throughput
     viewer = Viewer(
         scene,
         camera=camera,
@@ -86,6 +87,7 @@ def _frame_at(log: ReplayLog, i: int) -> ViewFrame:
         channels={name: arr[i] for name, arr in log.channels.items()},
         done=None if log.done is None else log.done[i],
         task_state=getattr(ns, "task_state", None),
+        fleet=log.header.get("fleet"),
     )
 
 
@@ -152,7 +154,10 @@ def replay(
     while viewer.open:
         t0 = time.perf_counter()
         viewer.push(_frame_at(log, i), force=True)
-        i += viewer.take_seek()
+        seek = viewer.take_seek()
+        if seek:
+            i += seek
+            viewer.discontinuity()  # a scrub is no episode end and no episode step
         if not viewer.paused:
             i += 1
         if i >= total:  # hold on the last frame rather than exiting: it's a DVR

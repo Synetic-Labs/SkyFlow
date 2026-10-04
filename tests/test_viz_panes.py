@@ -167,6 +167,41 @@ class TestBuilders:
             renders.append(pygame.surfarray.array3d(surface))
         assert (renders[0] != renders[1]).any()
 
+    def test_hud_level_markers_light_when_level(self):
+        # each level marker turns GOOD only while its own axis is level
+        def good_pixels(half_roll: float, half_pitch: float) -> int:
+            f = _frame()
+            f.plant[:, 6] = np.cos(half_roll) * np.cos(half_pitch)
+            f.plant[:, 7] = np.sin(half_roll) * np.cos(half_pitch)
+            f.plant[:, 8] = np.cos(half_roll) * np.sin(half_pitch)
+            f.plant[:, 9] = -np.sin(half_roll) * np.sin(half_pitch)
+            surface = pygame.Surface((900, 150))
+            draw_hud(surface, (0, 0, 900, 150), f, omega_max=2500.0)
+            arr = pygame.surfarray.array3d(surface).reshape(-1, 3)
+            return int((arr == palette.GOOD).all(axis=1).sum())
+
+        level, rolled, pitched = good_pixels(0, 0), good_pixels(0.2, 0), good_pixels(0, 0.2)
+        both_off = good_pixels(0.2, 0.2)
+        assert level > rolled > both_off == 0 and level > pitched > both_off
+        assert rolled != pitched, "the roll and pitch markers are separate marks"
+
+    def test_hud_episode_reward_and_throughput_panels(self):
+        pygame.font.init()
+        font = pygame.font.Font(None, 14)
+        rect = (0, 0, 1600, 150)
+        renders = []
+        for extra in (
+            {},
+            {"ep_rewards": [-3.0, 1.0, 5.0]},  # negative totals hang below a zero line
+            {"throughput": [900.0, 1000.0, 1100.0], "fleet": 4096},
+        ):
+            surface = pygame.Surface(rect[2:])
+            draw_hud(surface, rect, _frame(), histories={"reward": [0.1, 0.3]},
+                     font=font, small=font, **extra)
+            renders.append(pygame.surfarray.array3d(surface))
+        assert (renders[0] != renders[1]).any(), "the episode-reward panel should draw"
+        assert (renders[0] != renders[2]).any(), "the throughput panel should draw"
+
     def test_hud_dials_and_armed_lamp(self):
         pygame.font.init()
         font = pygame.font.Font(None, 14)
@@ -287,19 +322,160 @@ class TestViewer:
                 f.done = np.array([done, False])
                 return f
 
-            # GLOBAL step counter (training viz): lengths are diffs across dones
+            # GLOBAL step counter (training viz): the first episode was joined midway,
+            # so only the second (steps 111..118) is charted
             for f in (vf_at(100), vf_at(105), vf_at(110, done=True),
                       vf_at(111), vf_at(118, done=True)):
                 viewer._track(f)
-            assert viewer._eps.vals == [10.0, 7.0]
+            assert viewer._eps.vals == [8.0]
 
             # PER-EPISODE counter (eval): the drop 9 -> 1 reveals a missed done
             viewer._eps.clear()
-            viewer._ep_base = None
-            viewer._ep_last_step = None
+            viewer.discontinuity()
             for f in (vf_at(3), vf_at(9), vf_at(1), vf_at(5), vf_at(8, done=True)):
                 viewer._track(f)
-            assert viewer._eps.vals == [6.0, 8.0]
+            assert viewer._eps.vals == [8.0]
+
+            # a host-declared discontinuity (new log, seek): the step jump back is no
+            # episode end, and the episode in progress leaves the chart
+            viewer._eps.clear()
+            for f in (vf_at(1), vf_at(2), vf_at(3, done=True), vf_at(4), vf_at(5)):
+                viewer._track(f)
+            viewer.discontinuity()
+            for f in (vf_at(0), vf_at(1), vf_at(2, done=True), vf_at(3), vf_at(4, done=True)):
+                viewer._track(f)
+            assert viewer._eps.vals == [3.0, 2.0]  # the cut-short episode is not charted
+
+            # a repeated row (paused or held replay) counts once
+            viewer._eps.clear()
+            viewer.discontinuity()
+            frames = [vf_at(10), vf_at(11), vf_at(12, done=True)]
+            for f in (frames[0], frames[1], frames[1], frames[1], frames[2], frames[2]):
+                viewer._track(f)
+            for f in (vf_at(13), vf_at(14), vf_at(14), vf_at(15, done=True)):
+                viewer._track(f)
+            assert viewer._eps.vals == [3.0]
+        finally:
+            viewer.close()
+
+    def test_viewer_tracks_episode_rewards(self):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            def vf_at(step: int, r: float, done: bool = False, info=None) -> ViewFrame:
+                f = _frame()
+                f.step = step
+                f.done = np.array([done, False])
+                f.channels = {"reward": np.array([r, 0.0], np.float32)}
+                f.info = info
+                return f
+
+            # replay: every step drawn, no step info — the reward channel sums exactly
+            for f in (vf_at(1, 1.0), vf_at(2, 2.0), vf_at(3, 3.0, done=True),
+                      vf_at(4, -1.0), vf_at(5, -1.0, done=True)):
+                viewer._track(f)
+            assert viewer._ep_rets.vals == [-2.0]  # the joined-midway first is not charted
+            assert viewer._eps.vals == [2.0]
+
+            # live: the env's exact accumulators win over the sampled reward, even for
+            # an episode joined midway; the done row carries the finished totals while
+            # its step counter already reset
+            viewer._ep_rets.clear()
+            viewer._eps.clear()
+            viewer.discontinuity()
+
+            def info(n: int, ret: float, done: bool) -> dict:
+                return {"ep_len": np.array([n, 0]), "ep_return": np.array([ret, 0.0]),
+                        "terminated": np.array([done, False]),
+                        "truncated": np.array([False, False])}
+
+            for f in (vf_at(10, 0.5, info=info(10, 4.0, False)),
+                      vf_at(30, 0.5, info=info(30, 9.0, False)),
+                      vf_at(0, 0.5, done=True, info=info(31, 9.5, True)),
+                      vf_at(7, 0.1, info=info(7, 0.7, False)),
+                      # a done merged from a dropped frame whose totals were lost: this
+                      # row is the next episode, the cut-short one is not charted
+                      vf_at(2, 0.1, done=True, info=info(2, 0.2, False)),
+                      vf_at(5, 0.1, info=info(5, 0.5, False)),
+                      vf_at(0, 0.1, done=True, info=info(6, 0.6, True))):
+                viewer._track(f)
+            assert viewer._ep_rets.vals == [9.5, 0.6]
+            assert viewer._eps.vals == [31.0, 6.0]
+        finally:
+            viewer.close()
+
+    def test_viewer_throughput_and_fleet(self):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            t = [0.0]
+            import skyflow.viz.viewer as vmod
+
+            real = vmod.time.perf_counter
+            vmod.time.perf_counter = lambda: t[0]
+            try:
+                for i in range(7):  # 100 steps every 0.25 s = 400 steps/s per sim
+                    f = _frame()
+                    f.step, f.fleet = 100 * i, 64
+                    t[0] = 0.25 * i
+                    viewer._track(f)
+            finally:
+                vmod.time.perf_counter = real
+            # the first window (first-draw compiles) is dropped
+            assert viewer._sps.vals == [pytest.approx(400.0), pytest.approx(400.0)]
+            assert viewer._fleet == 64
+
+            viewer.report_throughput(1234.0, fleet=128)  # the host knows better
+            assert not viewer.measure_sps and viewer._sps.vals[-1] == 1234.0
+            assert viewer._fleet == 128
+        finally:
+            viewer.close()
+
+    def test_dropped_frame_keeps_exact_episode_totals(self):
+        """Live viewers drop most frames, so most done rows are never drawn: their
+        exact ep_len/ep_return must still reach the episode charts."""
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            def vf_at(step: int, n: int, ret: float, done: bool) -> ViewFrame:
+                f = _frame()
+                f.step = step
+                f.done = np.array([done, False])
+                f.info = {"ep_len": np.array([n, 0]), "ep_return": np.array([ret, 0.0]),
+                          "terminated": np.array([done, False]),
+                          "truncated": np.array([False, False])}
+                return f
+
+            viewer._track(vf_at(40, 40, 3.0, False))
+            viewer._stash_done(vf_at(0, 57, 4.5, True))  # the done row, never drawn
+            drawn = vf_at(5, 5, 0.4, False)
+            viewer._merge_lost_dones(drawn)
+            viewer._track(drawn)
+            assert viewer._eps.vals == [57.0] and viewer._ep_rets.vals == [4.5]
+            assert viewer._ep_len == 5 and viewer._ep_ret == pytest.approx(0.4)
+        finally:
+            viewer.close()
+
+    def test_later_dropped_done_waits_for_a_later_frame(self):
+        """A done stashed AFTER a frame was fed belongs to a later frame: folding it
+        into the earlier one charted the episode early, then a second time."""
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            early = _frame()
+            early.step = 10
+            late_done = _frame()
+            late_done.done = np.array([True, False])
+            viewer._stash_done(late_done, seq=5)
+            viewer._merge_lost_dones(early, seq=4)  # fed before the done: untouched
+            assert not early.done.any() and len(viewer._lost_dones) == 1
+            after = _frame()
+            viewer._merge_lost_dones(after, seq=6)
+            assert after.done[0] and not viewer._lost_dones
         finally:
             viewer.close()
 
