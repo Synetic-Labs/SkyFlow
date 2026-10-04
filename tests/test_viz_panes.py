@@ -190,18 +190,21 @@ class TestBuilders:
         font = pygame.font.Font(None, 14)
         rect = (0, 0, 1600, 150)
         renders = []
-        for ep_rewards, throughput in (
-            (None, None),
-            ([-3.0, 1.0, 5.0], None),  # negative totals hang below a zero line
-            (None, [900.0, 1000.0, 1100.0]),
+        for ep_rewards, throughput, total in (
+            (None, None, None),
+            ([-3.0, 1.0, 5.0], None, None),  # negative totals hang below a zero line
+            (None, [900.0, 1000.0, 1100.0], None),
+            (None, None, [1000.0, 2000.0, 3000.0]),
         ):
             surface = pygame.Surface(rect[2:])
             draw_hud(surface, rect, _frame(), histories={"reward": [0.1, 0.3]},
-                     ep_rewards=ep_rewards, throughput=throughput, fleet=4096,
+                     ep_rewards=ep_rewards, throughput=throughput, total_steps=total,
+                     total_now=None if total is None else 3500.0, fleet=4096,
                      font=font, small=font)
             renders.append(pygame.surfarray.array3d(surface))
         assert (renders[0] != renders[1]).any(), "the episode-reward panel should draw"
         assert (renders[0] != renders[2]).any(), "the throughput panel should draw"
+        assert (renders[0] != renders[3]).any(), "the total-steps panel should draw"
 
     def test_hud_dials_and_armed_lamp(self):
         pygame.font.init()
@@ -428,9 +431,13 @@ class TestViewer:
             assert viewer._sps.vals == [pytest.approx(400.0), pytest.approx(400.0)]
             assert viewer._fleet == 64
 
-            viewer.report_throughput(1234.0, fleet=128)  # the host knows better
+            # measured mode totals the steps seen since the viewer opened
+            assert viewer._steps.vals == [400.0, 600.0] and viewer._steps_now == 600.0
+
+            viewer.report_throughput(1234.0, fleet=128, steps=9000.0)  # the host knows better
             assert not viewer.measure_sps and viewer._sps.vals[-1] == 1234.0
             assert viewer._fleet == 128
+            assert viewer._steps.vals[-1] == 9000.0 and viewer._steps_now == 9000.0
         finally:
             viewer.close()
 
@@ -478,6 +485,30 @@ class TestViewer:
             after = _frame()
             viewer._merge_lost_dones(after, seq=6)
             assert after.done is not None and after.done[0] and not viewer._lost_dones
+        finally:
+            viewer.close()
+
+    def test_status_pill_and_watch_labels(self, tmp_path):
+        from skyflow.viz.primitives import Grid, Scene
+
+        with pytest.raises(ValueError, match="labels"):
+            Viewer(Scene(Grid()), watch=(0, 4), labels=("seed 0",), headless=True,
+                   threaded=False)
+        viewer = Viewer(Scene(Grid()), watch=(0, 4), labels=("seed 0", "seed 1"),
+                        headless=True, threaded=False)
+        try:
+            with pytest.raises(ValueError, match="level"):
+                viewer.set_status("x", level="loud")
+            shots = []
+            for status in (None, ("TRAINING STOPPED", "bad")):
+                viewer.set_status(*status) if status else viewer.set_status(None)
+                viewer.push(_frame(), force=True)
+                path = tmp_path / f"s{len(shots)}.png"
+                assert viewer.screenshot(str(path))
+                shots.append(pygame.surfarray.array3d(pygame.image.load(str(path))))
+            arr = shots[1].reshape(-1, 3)
+            assert (arr == palette.BAD).all(axis=1).any(), "the status pill should draw"
+            assert not (shots[0].reshape(-1, 3) == palette.BAD).all(axis=1).any()
         finally:
             viewer.close()
 

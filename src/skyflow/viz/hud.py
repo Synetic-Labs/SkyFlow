@@ -7,8 +7,8 @@ plant[13:17], an attitude horizon with pitch/roll level markers (roll/pitch prin
 under it) and a heading compass (heading printed under it), a speed dial and a
 cockpit-style climb dial (zero at the left, needle up = climb), an episode-length bar
 chart (when the caller tracks one), then one graph per named channel — reward drawn
-last — then the episode-reward bars and the steps/s throughput trace (each when the
-caller passes it). The fixed instruments are vehicle truth — valid for any quadrotor
+last — then the episode-reward bars, the steps/s throughput trace and the total-steps
+trace (each when the caller passes it). The fixed instruments are vehicle truth — valid for any quadrotor
 use case. Channels are whatever the caller traces (reward, goal
 distance, estimator error, ...); this module knows no channel names and no task fields.
 A builder, not a host: draws onto the given surface, owns no window.
@@ -211,11 +211,12 @@ def _si(v: float) -> str:
     return f"{v:.0f}"
 
 
-def _rate_chart(surface, x: int, top: int, w: int, h: int, per_sim, fleet: int | None,
-                font=None) -> None:
-    """Throughput trace in steps/s, scaled from zero. Plots the all-sims total (per-sim
-    x fleet) when the fleet size is known, else the per-sim rate. Prints the latest
-    per-sim rate on the left and the total on the right."""
+def _fleet_chart(surface, x: int, top: int, w: int, h: int, per_sim, fleet: int | None,
+                 latest: float | None = None, font=None) -> None:
+    """A per-sim trace (steps/s, total steps), scaled from zero. Plots the all-sims
+    total (per-sim x fleet) when the fleet size is known, else the per-sim value.
+    Prints the latest per-sim value on the left and the all-sims one on the right;
+    `latest` overrides the last trace point (a compressed trace holds bin means)."""
     pygame.draw.rect(surface, palette.DIM, pygame.Rect(x, top, w, h), 1, border_radius=4)
     arr = np.asarray(per_sim, np.float64) * (fleet or 1)
     if arr.shape[0] >= 2:
@@ -225,10 +226,11 @@ def _rate_chart(surface, x: int, top: int, w: int, h: int, per_sim, fleet: int |
         pts = [(float(a), float(b)) for a, b in zip(xs, ys, strict=True)]
         pygame.draw.aalines(surface, palette.ACCENT, False, pts)
     if font and arr.shape[0]:
-        sim = font.render(f"sim {_si(float(per_sim[-1]))}", True, palette.MUTED)
+        now = float(per_sim[-1]) if latest is None else float(latest)
+        sim = font.render(f"sim {_si(now)}", True, palette.MUTED)
         surface.blit(sim, (x + 5, top + 3))
         if fleet:
-            img = font.render(f"all {_si(float(arr[-1]))}", True, palette.MUTED)
+            img = font.render(f"all {_si(now * fleet)}", True, palette.MUTED)
             surface.blit(img, (x + w - img.get_width() - 5, top + 3))
 
 
@@ -254,6 +256,8 @@ def draw_hud(
     episodes: Sequence[float] | None = None,
     ep_rewards: Sequence[float] | None = None,
     throughput: Sequence[float] | None = None,
+    total_steps: Sequence[float] | None = None,
+    total_now: float | None = None,
     fleet: int | None = None,
     font=None,
     small=None,
@@ -269,7 +273,8 @@ def draw_hud(
     the matching sequence of episode total rewards, drawn as bars after the reward
     graph; None hides it. `throughput` is a per-sim steps/s history; `fleet` (the
     number of sims stepping in parallel) turns it into the all-sims total. None hides
-    the throughput panel.
+    the throughput panel. `total_steps` is a per-sim cumulative step-count history
+    (`total_now` its exact latest value) for the TOTAL STEPS panel; None hides it.
     """
     surface.set_clip(pygame.Rect(rect))
     surface.fill(palette.BG, pygame.Rect(rect))
@@ -370,7 +375,13 @@ def draw_hud(
         x += graph_w + 20
 
     if throughput is not None and fits():
-        _rate_chart(surface, x, top, graph_w, box, throughput, fleet, font=small)
+        _fleet_chart(surface, x, top, graph_w, box, throughput, fleet, font=small)
         caption(x, f"STEPS/S · {fleet:,} SIMS" if fleet else "STEPS/S")
+        x += graph_w + 20
+
+    if total_steps is not None and fits():
+        _fleet_chart(surface, x, top, graph_w, box, total_steps, fleet, latest=total_now,
+                     font=small)
+        caption(x, "TOTAL STEPS")
         x += graph_w + 20
     surface.set_clip(None)

@@ -52,6 +52,9 @@ __all__ = ["Viewer"]
 _PILOT_RES = (192, 256)  # (H, W) of the default pilot cam pane
 _TOP_H, _HUD_H, _FPV_W, _KEYBAR_H = 30, 150, 336, 20
 _TRAIL_LEN = 300
+_STATUS_COLORS = {
+    "info": palette.MUTED, "good": palette.GOOD, "warn": palette.ACCENT, "bad": palette.BAD,
+}
 
 
 class _EpTrace:
@@ -142,6 +145,7 @@ class Viewer:
         pilot: Any = None,
         policy_floor: Any = None,
         measure_sps: bool = True,
+        labels: tuple[str, ...] | None = None,
     ) -> None:
         """
         Args:
@@ -172,9 +176,15 @@ class Viewer:
           measure_sps: estimate sim throughput (steps/s) from the step counter of
             the drawn frames over wall time. Replay passes False: playback speed is
             not sim throughput. `report_throughput` also turns it off.
+          labels: one display name per watch row (e.g. "seed 2"), shown in the top
+            bar next to the world index; None shows the index only.
         """
         self.scene = scene
         self.watch = tuple(int(w) for w in watch)
+        if labels is not None and len(labels) != len(self.watch):
+            raise ValueError(f"{len(labels)} labels for {len(self.watch)} watched worlds")
+        self.labels = None if labels is None else tuple(str(x) for x in labels)
+        self._status: tuple[str, str] | None = None  # host status line: (text, level)
         self.title = title
         self.dt = float(dt)
         self.control = control
@@ -240,6 +250,9 @@ class Viewer:
         self._cut = False  # discontinuity() asked: the next frame does not follow on
         self.measure_sps = bool(measure_sps)
         self._sps = _EpTrace(cap=512)  # per-sim steps/s samples, the whole run
+        self._steps = _EpTrace(cap=512)  # cumulative per-sim steps, sampled with _sps
+        self._steps_now: float | None = None  # latest cumulative (traces bin-average)
+        self._steps_seen = 0  # measured mode: steps advanced since the viewer opened
         self._sps_t0: float | None = None  # start of the current sample window
         self._sps_acc = 0  # steps advanced inside that window
         self._sps_warm = False  # the first window holds first-draw compiles: dropped
@@ -379,15 +392,29 @@ class Viewer:
         s, self._seek = self._seek, 0
         return s
 
-    def report_throughput(self, steps_per_s: float, fleet: int | None = None) -> None:
+    def report_throughput(
+        self, steps_per_s: float, fleet: int | None = None, steps: float | None = None
+    ) -> None:
         """Add one host-measured sample of per-sim steps/s (`fleet` sets the sim count
-        when the frames do not carry it). The host knows its real step rate (a
-        trainer's chunk timing, a replayed log's header), so this turns off the
-        viewer's own estimate for the rest of the session."""
+        when the frames do not carry it; `steps` is the per-sim step count so far, for
+        the TOTAL STEPS chart). The host knows its real step rate (a trainer's chunk
+        timing, a replayed log's header), so this turns off the viewer's own estimate
+        for the rest of the session."""
         self.measure_sps = False
         self._sps.add(float(steps_per_s))
         if fleet is not None:
             self._fleet = int(fleet)
+        if steps is not None:
+            self._steps_now = float(steps)
+            self._steps.add(self._steps_now)
+
+    def set_status(self, text: str | None, level: str = "info") -> None:
+        """A host-owned status line, drawn as a pill at the top of the scene pane (for
+        example "TRAINING STOPPED"); None clears it. `level` picks the color:
+        "info", "good", "warn" or "bad"."""
+        if level not in _STATUS_COLORS:
+            raise ValueError(f"status level must be one of {sorted(_STATUS_COLORS)}")
+        self._status = None if text is None else (str(text), level)
 
     def discontinuity(self) -> None:
         """The next frame does not follow on from the last one: a newly loaded log, a
@@ -733,9 +760,12 @@ class Viewer:
             self._sps_t0, self._sps_acc = now, 0
             return
         self._sps_acc += adv
+        self._steps_seen += adv
         if now - self._sps_t0 >= 0.5:
             if self._sps_warm:
                 self._sps.add(self._sps_acc / (now - self._sps_t0))
+                self._steps_now = float(self._steps_seen)
+                self._steps.add(self._steps_now)
             self._sps_warm = True
             self._sps_t0, self._sps_acc = now, 0
 
@@ -875,13 +905,26 @@ class Viewer:
         pygame.draw.rect(self._screen, palette.DIM, pygame.Rect(x, y, width, h), 1)
         return h
 
+    def _draw_status(self, rect: tuple[int, int, int, int], text: str, level: str) -> None:
+        """The host status pill, centred at the top of the scene pane."""
+        color = _STATUS_COLORS[level]
+        img = self._font.render(text, True, color)
+        w, h = img.get_width() + 24, img.get_height() + 10
+        box = pygame.Rect(rect[0] + (rect[2] - w) // 2, rect[1] + 8, w, h)
+        pygame.draw.rect(self._screen, palette.BG, box, border_radius=h // 2)
+        pygame.draw.rect(self._screen, color, box, 1, border_radius=h // 2)
+        self._screen.blit(img, (box.x + 12, box.y + 5))
+
     def _draw(self, vf: ViewFrame) -> None:
         screen = self._screen
         wpx, hpx = self._size
         screen.fill(palette.BG)
 
         # top bar
-        left = f"{self.title} · world {self.watch[vf.focus]} ({vf.focus + 1}/{len(self.watch)})"
+        where = f"world {self.watch[vf.focus]} ({vf.focus + 1}/{len(self.watch)})"
+        if self.labels is not None:
+            where = f"{self.labels[vf.focus]} · {where}"
+        left = f"{self.title} · {where}"
         if self._fleet is not None:
             left += f" · fleet {self._fleet:,}"
         health = f" · {self._fps(self._drawn_t):.0f}/{self._fps(self._fed_t):.0f} fps"
@@ -919,6 +962,8 @@ class Viewer:
             show_glyphs=self.show_glyphs,
             show_fleet=self.show_fleet,
         )
+        if self._status is not None:
+            self._draw_status(scene_rect, *self._status)
 
         fx = wpx - _FPV_W - 8
         y = _TOP_H + 8
@@ -969,6 +1014,8 @@ class Viewer:
             episodes=self._eps.vals or None,
             ep_rewards=self._ep_rets.vals or None,
             throughput=self._sps.vals or None,
+            total_steps=self._steps.vals or None,
+            total_now=self._steps_now,
             fleet=self._fleet,
             font=self._font,
             small=self._small,

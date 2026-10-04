@@ -49,6 +49,8 @@ def viewer_for_log(log: ReplayLog, *, pilot: tuple[int, int] | None = None, **kw
         control=header.get("control", "motors"),
         dt=log.dt,
         title=f"SkyFlow Viz — replay · {header.get('task', '?')}",
+        labels=(tuple(header["watch_labels"])[:n_watch] if header.get("watch_labels")
+                else None),
         **kw,
     )
     if pilot is not None:
@@ -164,6 +166,7 @@ def replay(
             i = total - 1
             viewer.paused = True
         i = max(0, i)
+        viewer.set_status("END OF LOG · ←/→ to scrub" if i == total - 1 else None)
         time.sleep(max(0.0, log.dt / viewer.speed - (time.perf_counter() - t0)))
 
 
