@@ -33,7 +33,8 @@ command transport delay, ground contact, crash detection, and in-jit auto-reset.
 Two built-in airframes. The default, `racer5in`, is a 5-inch racer whose every value
 traces to one real platform (the UZH-RPG NeuroBEM / Agilicious quad): thrust, rotor drag
 and frame drag fitted to its public flight data, rotor inflow damping from a BEM model
-of its prop, the rest from its simulator config (provenance in `params.RACER_5IN`).
+of its prop, the rest from its simulator config (values and provenance in SkyFlow-Dynamics,
+`skyflow_dynamics.spec.parameters.RACER_5IN`).
 `crazyflie` is the spec's Crazyflie reference row. `register_airframe` adds vehicles
 from spec parameter rows.
 

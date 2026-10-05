@@ -51,3 +51,11 @@ def test_saturated_motors_level_off_instead_of_spinning_up():
     r4, r6 = (_rate_after(t, [lo, hi, hi, hi], w_hover) for t in (4.0, 6.0))
     assert np.isfinite(r6) and r6 < 500.0
     assert abs(r6 - r4) < 0.03 * r4  # levelled off
+
+
+def test_values_come_from_skyflow_dynamics():
+    """One source for the racer's values: SkyFlow-Dynamics' traced reference vehicle."""
+    from skyflow_dynamics.spec.parameters import RACER_5IN as SFD_RACER_5IN
+
+    assert RACER_5IN is SFD_RACER_5IN
+    assert AIRFRAMES["racer5in"].values == SFD_RACER_5IN

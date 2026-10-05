@@ -31,13 +31,18 @@ from skyflow_dynamics.backends.jax import pack_params, param_slices
 N_ROTORS = 4
 STATE_DIM = 13 + N_ROTORS  # 17
 
-#: Crazyflie 2.0 reference parameter dict (spec SCHEMA row + its harness-side `limits`
-#: entry), re-exported through the backend so params.py never imports skyflow_dynamics.
+#: Reference parameter dicts (spec SCHEMA rows + their harness-side `limits` entries),
+#: re-exported through the backend so params.py never imports skyflow_dynamics. Values and
+#: provenance live in skyflow_dynamics.spec.parameters: CRAZYFLIE via RotorPy; RACER_5IN the
+#: NeuroBEM / Agilicious 5-inch racer, identified from its public flight data
+#: (tools/identify_neurobem.py there).
 CRAZYFLIE = sfd.parameters.CRAZYFLIE
+RACER_5IN = sfd.parameters.RACER_5IN
 
 __all__ = [
     "CRAZYFLIE",
     "N_ROTORS",
+    "RACER_5IN",
     "STATE_DIM",
     "imu",
     "pack_params",
