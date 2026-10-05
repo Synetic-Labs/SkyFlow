@@ -17,6 +17,7 @@ FLEET = 4
 
 
 def make_env(**cfg_kwargs) -> SkyFlowEnv:
+    cfg_kwargs.setdefault("airframe", "crazyflie")  # thresholds below are Crazyflie numbers
     cfg_kwargs.setdefault("dr", DomainRand(body_scale=0.0))
     cfg_kwargs.setdefault("stuck_steps", 10**6)
     cfg_kwargs.setdefault("max_episode_steps", 10**6)

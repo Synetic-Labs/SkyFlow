@@ -45,10 +45,57 @@ def _from_spec(name: str, values: dict, throttle_k: float) -> Airframe:
     )
 
 
-#: Built-in vehicles. Crazyflie throttle_k = 1.0 keeps the command map linear in u
-#: (√(u²) = u): no measured throttle-curve blend exists for the brushed Crazyflie, so the
-#: neutral setting of the verified curve is the honest default.
+_RACER_ARM = 0.13 / 2**0.5  # x and y projection of a 0.13 m arm at 45 deg
+_RACER_CT = 1.5837612920467833e-06  # N/(rad/s)^2
+
+#: A 5-inch racing quadrotor: the UZH-RPG NeuroBEM / Agilicious platform (Armattan
+#: Chameleon 6" frame, Hobbywing XRotor 2306 motors, 5.1" three-blade props, Jetson TX2
+#: on board; Bauersfeld et al., NeuroBEM, RSS 2021; Foehn et al., Agilicious, Science
+#: Robotics 2022). One platform, every value traced to it:
+#: - from its public flight data (NeuroBEM dataset, 1h15 at 400 Hz; force fit with 95 %
+#:   bootstrap intervals over 234 training segments, checked on the authors' 13 held-out
+#:   segments: force RMSE 0.56 N horizontal, 1.13 N vertical, below the paper's own BEM
+#:   model): mass 0.772 kg (the dataset's labels), thrust c_T 1.584e-6 [1.570, 1.597],
+#:   rotor H-force k_d 4.49e-5 [4.24, 4.75], vertical frame drag c_Dz 0.0213 [0.0185,
+#:   0.0235]. Horizontal frame drag fits to zero: rotor drag explains it.
+#: - from BEM (agilib's executed blade-element model of this prop, as replicated and
+#:   verified in SkyFlow-Dynamics' golden/generate/gen_agilicious.py, with the F-24
+#:   lever-arm frame fix): inflow k_z 3.84e-5, the per-rotor value whose roll damping
+#:   equals BEM's at 13 rad/s, the largest body rate in the flight data. BEM damping
+#:   stiffens with rate (0.00145 N m s/rad at 13 rad/s, 0.0040 at 200 rad/s); this
+#:   linear term matches it inside the flown envelope and under-damps violent tumbles.
+#: - from its simulator config (agilib kingfisher.yaml / sim_kingfisher.yaml): inertia
+#:   diag(2.5, 2.1, 4.3) g m^2, drag torque c_Q 1.909e-8 (BEM agrees to 3 %), motor time
+#:   constant 33 ms, rotor + motor spin inertia 9.3575e-6 kg m^2, prop radius 6.477 cm,
+#:   and the 8.5 N per-motor thrust cap, which sets the rotor-speed ceiling through c_T
+#:   (2317 rad/s; thrust-to-weight 4.5).
+#: - geometry: a symmetric X with a 0.13 m arm (the NeuroBEM code's setupKingfisher.m).
+#: Torque coefficients are not fitted to the flight data: its moments do not close (the
+#: motor-speed differentials imply ~5x the measured torque). Rotor order FL, FR, RR, RL.
+RACER_5IN: dict = {
+    "mass": 0.772, "grav": 9.81,
+    "inertia": [[0.0025, 0.0, 0.0], [0.0, 0.0021, 0.0], [0.0, 0.0, 0.0043]],
+    "rotor_pos": [[_RACER_ARM, _RACER_ARM, 0.0], [_RACER_ARM, -_RACER_ARM, 0.0],
+                  [-_RACER_ARM, -_RACER_ARM, 0.0], [-_RACER_ARM, _RACER_ARM, 0.0]],
+    "spin": [-1, 1, -1, 1],
+    "axis": [[0.0, 0.0, 1.0]] * 4,
+    "ct0": [0.0] * 4, "ct1": [0.0] * 4, "ct2": [_RACER_CT] * 4,
+    "cq0": [0.0] * 4, "cq1": [0.0] * 4, "cq2": [1.908873e-08] * 4,
+    "tau_m": 0.033,
+    "ka1": 0.0, "ka2": 0.0, "kd1": 0.0, "kd2": 0.0,
+    "I_rot": 9.3575e-06,
+    "c_D": [0.0, 0.0, 0.021279309271892116], "c_L": [0.0, 0.0, 0.0],
+    "k_d": 4.488865677888165e-05, "k_z": 3.835023444869122e-05,
+    "k_flap": 0.0, "k_h": 0.0, "k_angle": 0.0, "k_hor": 0.0, "k_v2": 0.0,
+    "r_prop": 0.06477,
+    "limits": {"rotor_speed_min": 150.0, "rotor_speed_max": (8.5 / _RACER_CT) ** 0.5},
+}
+
+#: Built-in vehicles. throttle_k = 1.0 keeps the command map linear in u (√(u²) = u):
+#: no measured throttle-curve blend exists for either vehicle, so the neutral setting of
+#: the verified curve is the honest default.
 AIRFRAMES: dict[str, Airframe] = {
+    "racer5in": _from_spec("racer5in", RACER_5IN, throttle_k=1.0),
     "crazyflie": _from_spec("crazyflie", CRAZYFLIE, throttle_k=1.0),
 }
 

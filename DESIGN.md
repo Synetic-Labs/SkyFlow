@@ -160,7 +160,8 @@ class Airframe:
     values: dict            # spec SCHEMA row (validated by skyflow_dynamics pack_params)
     rotor_speed_min: float; rotor_speed_max: float
     throttle_k: float       # throttle-curve blend for the command map
-AIRFRAMES = {"crazyflie": ...}   # from skyflow_dynamics.spec.parameters.CRAZYFLIE (+limits)
+AIRFRAMES = {"racer5in": ...,    # params.RACER_5IN: 5-inch racer, the default
+             "crazyflie": ...}   # from skyflow_dynamics.spec.parameters.CRAZYFLIE (+limits)
 register_airframe(name, airframe)
 ```
 
@@ -218,7 +219,7 @@ class DomainRand:                        # ALL training-robustness randomization
 class SimConfig:
     num_envs: int = 1024
     task: str = "hover"; task_kwargs: dict = field(default_factory=dict)
-    airframe: str = "crazyflie"
+    airframe: str = "racer5in"
     control: str = "motors"            # "motors" | "sticks" (§10)
     firmware: str = "auto"             # sticks backend: "auto" | "cpu" | "gpu" (§10)
     control_hz: float = 100.0          # physics fixed at physics_hz

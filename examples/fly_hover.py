@@ -92,6 +92,7 @@ def main() -> None:
 
     cfg = SimConfig(
         num_envs=args.fleet,
+        airframe="crazyflie",  # the gains below are tuned for the Crazyflie
         task="hover",
         # Goal held longer than the flight so the setpoint never moves mid-demo. (The
         # env also accepts a pre-built instance: SkyFlowEnv(cfg, task=HoverTask(...)).)

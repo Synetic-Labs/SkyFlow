@@ -41,6 +41,7 @@ if "crazyflie_cd_dr" not in AIRFRAMES:
 
 
 def make_env(dr: DomainRand, fleet: int = FLEET, **cfg_kwargs) -> SkyFlowEnv:
+    cfg_kwargs.setdefault("airframe", "crazyflie")  # nominals below are the Crazyflie's
     cfg_kwargs.setdefault("stuck_steps", 10**6)
     cfg_kwargs.setdefault("max_episode_steps", 10**6)
     cfg = SimConfig(num_envs=fleet, dr=dr, **cfg_kwargs)

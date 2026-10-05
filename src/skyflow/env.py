@@ -260,7 +260,7 @@ class SimConfig:
     num_envs: int = 1024
     task: str = "hover"
     task_kwargs: dict = field(default_factory=dict)
-    airframe: str = "crazyflie"
+    airframe: str = "racer5in"  # params.AIRFRAMES: "racer5in" (5-inch racer) | "crazyflie"
     control: str = "motors"  # "motors" | "sticks" (DESIGN.md §10)
     firmware: str = "auto"  # sticks backend: "auto" | "cpu" | "gpu" (DESIGN.md §10)
     # sticks firmware config: path to a drone's Betaflight CLI `dump all` file. The env
