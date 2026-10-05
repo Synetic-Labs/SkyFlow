@@ -19,7 +19,7 @@ W_MAX = AIRFRAMES["crazyflie"].rotor_speed_max
 
 def _env(sag: float, scale: float = 1.0):
     dr = DomainRand(scale=scale, body_scale=0.0, battery_sag=sag)
-    cfg = SimConfig(num_envs=FLEET, task="hover", control="motors",
+    cfg = SimConfig(num_envs=FLEET, airframe="crazyflie", task="hover", control="motors",
                     physics_hz=1000, control_hz=100.0, dr=dr)
     return SkyFlowEnv(cfg)
 

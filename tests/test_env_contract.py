@@ -32,6 +32,7 @@ def make_env(
     fleet: int = FLEET, task_kwargs: dict | None = None,
     dr: DomainRand | None = None, **cfg_kwargs,
 ) -> SkyFlowEnv:
+    cfg_kwargs.setdefault("airframe", "crazyflie")  # the contract tests use its zero idle floor
     cfg = SimConfig(num_envs=fleet, dr=dr if dr is not None else dr0(), **cfg_kwargs)
     return SkyFlowEnv(cfg, task=HoverTask(**(task_kwargs or {})))
 
