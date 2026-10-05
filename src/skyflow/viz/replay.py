@@ -40,6 +40,9 @@ def viewer_for_log(log: ReplayLog, *, pilot: tuple[int, int] | None = None, **kw
     gates = gateset_from_dict(header["gateset"]) if header.get("gateset") else None
     n_watch = log.plant.shape[1]
     kw.setdefault("measure_sps", False)  # playback speed is not sim throughput
+    kw.setdefault("title", f"SkyFlow · replay · {header.get('task', '?')}")
+    if header.get("watch_labels"):
+        kw.setdefault("labels", tuple(header["watch_labels"])[:n_watch])
     viewer = Viewer(
         scene,
         camera=camera,
@@ -48,9 +51,6 @@ def viewer_for_log(log: ReplayLog, *, pilot: tuple[int, int] | None = None, **kw
         omega_max=header.get("omega_max"),
         control=header.get("control", "motors"),
         dt=log.dt,
-        title=f"SkyFlow Viz — replay · {header.get('task', '?')}",
-        labels=(tuple(header["watch_labels"])[:n_watch] if header.get("watch_labels")
-                else None),
         **kw,
     )
     if pilot is not None:
@@ -166,7 +166,7 @@ def replay(
             i = total - 1
             viewer.paused = True
         i = max(0, i)
-        viewer.set_status("END OF LOG · ←/→ to scrub" if i == total - 1 else None)
+        viewer.set_status("END OF LOG" if i == total - 1 else None)
         time.sleep(max(0.0, log.dt / viewer.speed - (time.perf_counter() - t0)))
 
 

@@ -13,7 +13,7 @@ never pays draw time. Replay and export run synchronous (`threaded=False`) — s
 video need frame-exact draws in the caller's thread.
 
 Keys (always listed in a bar along the window's bottom edge): Space pause · ←/→
-step/scrub (replay) · [ ] speed · Tab focus world · V iso/top/profile (a switch lands on
+step/scrub (replay) · [ ] speed · Tab focus drone · V iso/top/profile (a switch lands on
 a fresh fit) · C follow the focused world · X full glyphs for all watched worlds ·
 G fleet scatter · left-drag orbit (the scene's near side follows the cursor) ·
 right-drag pan · wheel zoom · P print a screenshot · R reset request (only hosts that
@@ -85,6 +85,80 @@ class _EpTrace:
         self.bin = 1
 
 
+class _Episodes:
+    """One watched drone's episode bookkeeping: the per-episode length and reward bars
+    (whole episodes only) and the per-step channel traces of the current episode.
+    Every watched drone keeps its own, so Tab shows that drone's whole history."""
+
+    def __init__(self) -> None:
+        self.lens = _EpTrace(cap=2048)
+        self.rets = _EpTrace(cap=2048)
+        self.hists: dict[str, _EpTrace] = {}
+        self.n = 0  # the current episode so far, steps
+        self.ret: float | None = None  # None: no reward channel / ep_return seen
+        self.whole = False  # seen from its first step (a partial one is not charted)
+        self.exact = False  # totals come from the env's step info, not an estimate
+        # exact (ep_len, ep_return) of episodes that ended in DROPPED frames
+        self.lost: list[tuple[float, float | None]] = []
+
+    def chart(self, length: float, ret: float | None) -> None:
+        if length > 0:
+            self.lens.add(length)
+            if ret is not None:
+                self.rets.add(ret)
+
+    def end(self) -> None:
+        """Close the episode: chart it when seen whole. The next one starts whole."""
+        if self.whole:
+            self.chart(self.n, self.ret)
+        self.n, self.ret, self.whole = 0, None, True
+        for trace in self.hists.values():
+            trace.clear()  # channel graphs span ONE episode, compressed to fit
+
+    def cut(self) -> None:
+        """The frames jumped: the episode in progress can no longer be charted."""
+        self.n, self.ret, self.whole = 0, None, False
+        for trace in self.hists.values():
+            trace.clear()
+
+    def step(self, adv: int, dropped: bool, done: bool, own_done: bool,
+             reward: float | None, exact: tuple[float | None, float | None],
+             channels: dict[str, float]) -> None:
+        """Advance by one tracked frame. `adv`: steps since the last tracked frame;
+        `dropped`: the step counter fell without a done (a missed episode end);
+        `done`: this row's done flag, which may be merged from a dropped frame;
+        `own_done`: this row itself ended an episode; `exact`: the env's
+        (ep_len, ep_return) for this row, when the frame carries step info. Live
+        frames carry it: on the row that ENDED an episode it holds that episode's
+        totals, on any other row the running totals. Without it, each frame's `adv`
+        steps (and reward x adv) go to the current episode — exact when every step
+        is drawn (replay), an estimate when frames drop."""
+        if self.lost:  # episodes that ended in dropped frames, with exact totals
+            for length, ret in self.lost:
+                self.chart(length, ret)
+            self.lost.clear()
+            self.whole = False  # end() below charts nothing: those were the charted ones
+            self.end()
+        elif dropped or (done and not own_done):
+            # the boundary fell between drawn frames: this frame is already inside
+            # the next episode. Exact-tracked totals stop at the last drawn frame, so
+            # that episode is not charted; estimated ones are charted as before
+            if self.exact:
+                self.whole = False
+            self.end()
+        self.n += adv
+        if reward is not None:
+            self.ret = (self.ret or 0.0) + reward * adv
+        if exact[0] is not None:  # counted by the env from the episode's first step
+            self.n, self.whole, self.exact = int(exact[0]), True, True
+            if exact[1] is not None:
+                self.ret = exact[1]
+        for name, value in channels.items():
+            self.hists.setdefault(name, _EpTrace()).add(value)
+        if done and own_done:
+            self.end()
+
+
 class _Mailbox:
     """
     Latest-wins single-slot handoff to the render thread; old frames drop by design.
@@ -135,7 +209,7 @@ class Viewer:
         control: str = "motors",
         dt: float = 0.01,
         task_state_of: Any = None,
-        title: str = "SkyFlow Viz",
+        title: str = "SkyFlow",
         size: tuple[int, int] = (1280, 800),
         display_hz: float = 60.0,
         headless: bool = False,
@@ -235,24 +309,15 @@ class Viewer:
         # feed order of every frame()/push(): a drawn frame folds in only the dropped
         # frames fed BEFORE it — a later episode end must wait for a later frame
         self._feed_seq = 0
-        # episode charts, focused world: steps and total reward per WHOLE episode
-        self._eps = _EpTrace(cap=2048)
-        self._ep_rets = _EpTrace(cap=2048)
-        self._ep_len = 0  # the current episode so far
-        self._ep_ret: float | None = None  # None: no reward channel / ep_return seen
-        self._ep_whole = False  # seen from its first step (a partial one is not charted)
-        self._ep_exact = False  # totals come from the env's step info, not an estimate
-        # exact (ep_len, ep_return) of focused-world episodes that ended in DROPPED
-        # frames, recovered from their step info by _merge_lost_dones
-        self._lost_ends: list[tuple[float, float | None]] = []
-        self._prev_step: int | None = None  # focused world's step at the last tracked frame
-        self._prev_rows: tuple[np.ndarray, Any] | None = None  # its (plant, done) rows
+        # per watched drone: episode bars and channel traces (Tab just switches view)
+        self._eps: dict[int, _Episodes] = {}
+        # step counts, plant and done rows at the last tracked frame [W]
+        self._prev_rows: tuple[np.ndarray, np.ndarray, Any] | None = None
         self._cut = False  # discontinuity() asked: the next frame does not follow on
+        self._rt: deque[tuple[float, int]] = deque(maxlen=240)  # (wall, steps) → realtime
         self.measure_sps = bool(measure_sps)
-        self._sps = _EpTrace(cap=512)  # per-sim steps/s samples, the whole run
-        self._steps = _EpTrace(cap=512)  # cumulative per-sim steps, sampled with _sps
-        self._steps_now: float | None = None  # latest cumulative (traces bin-average)
-        self._steps_seen = 0  # measured mode: steps advanced since the viewer opened
+        self._sps = _EpTrace(cap=512)  # per-drone steps/s samples, the whole run
+        self._train_step: int | None = None  # host-reported training step (top bar)
         self._sps_t0: float | None = None  # start of the current sample window
         self._sps_acc = 0  # steps advanced inside that window
         self._sps_warm = False  # the first window holds first-draw compiles: dropped
@@ -265,7 +330,6 @@ class Viewer:
         self._last_fleet: tuple[float, np.ndarray | None] = (0.0, None)
         self._last_vf: ViewFrame | None = None
         self._trails: dict[int, deque] = {i: deque(maxlen=_TRAIL_LEN) for i in range(len(self.watch))}
-        self._hists: dict[str, _EpTrace] = {}  # one per-episode trace per channel, focused world
 
         # render thread: owns the window and every pygame call after this point
         self._running = True
@@ -373,7 +437,7 @@ class Viewer:
         kw.setdefault("control", env.cfg.control)
         kw.setdefault("dt", env.dt_control)
         kw.setdefault("task_state_of", getattr(env, "task_state", None))
-        kw.setdefault("title", f"SkyFlow Viz — {env.task_name} · {env.cfg.control}")
+        kw.setdefault("title", f"SkyFlow · {env.task_name} · {env.cfg.control}")
         return cls(scene, watch=watch, **kw)
 
     # -- host state ------------------------------------------------------------------
@@ -393,24 +457,23 @@ class Viewer:
         return s
 
     def report_throughput(
-        self, steps_per_s: float, fleet: int | None = None, steps: float | None = None
+        self, steps_per_s: float, fleet: int | None = None, train_step: int | None = None
     ) -> None:
-        """Add one host-measured sample of per-sim steps/s (`fleet` sets the sim count
-        when the frames do not carry it; `steps` is the per-sim step count so far, for
-        the TOTAL STEPS chart). The host knows its real step rate (a trainer's chunk
-        timing, a replayed log's header), so this turns off the viewer's own estimate
-        for the rest of the session."""
+        """Add one host-measured sample of per-drone steps/s (`fleet` sets the drone
+        count when the frames do not carry it; `train_step` is the host's training
+        step, shown in the top bar). The host knows its real step rate (a trainer's
+        chunk timing), so this turns off the viewer's own estimate for the rest of
+        the session."""
         self.measure_sps = False
         self._sps.add(float(steps_per_s))
         if fleet is not None:
             self._fleet = int(fleet)
-        if steps is not None:
-            self._steps_now = float(steps)
-            self._steps.add(self._steps_now)
+        if train_step is not None:
+            self._train_step = int(train_step)
 
     def set_status(self, text: str | None, level: str = "info") -> None:
-        """A host-owned status line, drawn as a pill at the top of the scene pane (for
-        example "TRAINING STOPPED"); None clears it. `level` picks the color:
+        """A host-owned status chip, drawn at the right end of the top bar (for
+        example "LIVE" or "STOPPED"); None clears it. Keep it short. `level` picks the color:
         "info", "good", "warn" or "bad"."""
         if level not in _STATUS_COLORS:
             raise ValueError(f"status level must be one of {sorted(_STATUS_COLORS)}")
@@ -418,8 +481,8 @@ class Viewer:
 
     def discontinuity(self) -> None:
         """The next frame does not follow on from the last one: a newly loaded log, a
-        seek, an episode restarted outside the frames. The in-progress episode leaves
-        the episode charts (its totals would be wrong), the step jump counts as
+        seek, an episode restarted outside the frames. The episodes in progress leave
+        the episode charts (their totals would be wrong), the step jump counts as
         neither an episode end nor throughput, and trails and channel graphs restart."""
         self._cut = True
 
@@ -632,17 +695,18 @@ class Viewer:
             if vf.done is not None and rows.shape != vf.done.shape:
                 continue
             vf.done = rows if vf.done is None else np.logical_or(vf.done, rows)
-            focus = min(self._focus, rows.shape[0] - 1)
-            if ends is not None and rows[focus]:
-                # the focused world's episode ended in this dropped frame: keep its
-                # exact totals (one scalar pull each), or the charts lose that episode
-                row = focus if is_vf else self.watch[focus]
+            if ends is None:
+                continue
+            for w in np.flatnonzero(rows):
+                # this drone's episode ended in the dropped frame: keep its exact
+                # totals (one scalar pull each), or the charts lose that episode
+                row = int(w) if is_vf else self.watch[int(w)]
                 try:
                     length = float(ends[0][row])
                     ret = None if ends[1] is None else float(ends[1][row])
                 except Exception:
                     continue
-                self._lost_ends.append((length, ret))
+                self._eps.setdefault(int(w), _Episodes()).lost.append((length, ret))
         self._lost_dones.extendleft(reversed(later))
 
     @staticmethod
@@ -654,120 +718,91 @@ class Viewer:
         """Per-frame bookkeeping: episode charts, throughput, trails, channel traces."""
         if vf.fleet is not None:
             self._fleet = int(vf.fleet)
+        n = vf.plant.shape[0]
+        steps = (np.asarray(vf.steps, np.int64) if vf.steps is not None
+                 else np.full(n, int(vf.step), np.int64))
         if self._cut:
             self._cut = False
-            self._prev_step = self._prev_rows = None
-            self._ep_len, self._ep_ret, self._ep_whole = 0, None, False
+            self._prev_rows = None
             self._sps_t0 = None
+            self._rt.clear()
+            for ep in self._eps.values():
+                ep.cut()
             for trail in self._trails.values():
                 trail.clear()  # a trail across the jump would lie
-            for trace in self._hists.values():
-                trace.clear()
-        step = int(vf.step)
-        prev = self._prev_step
-        if prev == step and self._prev_rows is not None:
-            plant, done = self._prev_rows
+        prev = self._prev_rows
+        if prev is not None and np.array_equal(steps, prev[0]):
+            done = prev[2]
             same_done = (
                 done is None if vf.done is None
                 else done is not None and np.array_equal(vf.done, done)
             )
-            if same_done and np.array_equal(vf.plant, plant):
+            if same_done and np.array_equal(vf.plant, prev[1]):
                 return  # the same row again (paused or held replay): nothing new happened
-        self._prev_step, self._prev_rows = step, (vf.plant, vf.done)
-        # steps advanced since the last tracked frame; a counter drop means a fresh
-        # per-episode counter, which has advanced `step` steps since its reset
-        adv = 0 if prev is None else step - prev if step >= prev else step
-        self._measure_sps(adv)
+        self._prev_rows = (steps, vf.plant, vf.done)
+        # steps advanced since the last tracked frame, per drone; a counter drop means
+        # a fresh per-episode counter, which has advanced `step` steps since its reset
+        if prev is None or prev[0].shape != steps.shape:
+            adv, dropped = np.zeros(n, np.int64), np.zeros(n, bool)
+        else:
+            dropped = steps < prev[0]
+            adv = np.where(dropped, steps, steps - prev[0])
+        now = time.perf_counter()
+        self._rt.append((now, int(adv[vf.focus])))
+        self._measure_sps(int(adv[vf.focus]), now)
 
-        # EPISODES, focused world. Each frame's `adv` steps (and reward x adv) go to
-        # the current episode — exact when every step is drawn (replay), an estimate
-        # when frames drop. Live frames carry the env's own accumulators
-        # (info ep_len / ep_return), which override the estimate: on the row that
-        # ENDED an episode they hold its totals, on any other row the running totals.
-        focus_done = vf.done is not None and bool(vf.done[vf.focus])
-        ended = self._info_at(vf, "terminated"), self._info_at(vf, "truncated")
-        own_done = bool(ended[0] or ended[1]) if None not in ended else focus_done
-        boundary = bool(self._lost_ends)
-        for length, ret in self._lost_ends:  # episodes that ended in dropped frames
-            self._chart_episode(length, ret)
-        if self._lost_ends:
-            self._lost_ends.clear()
-            self._ep_len, self._ep_ret, self._ep_whole = 0, None, True
-        elif (prev is not None and step < prev and not focus_done) or (
-            focus_done and not own_done
-        ):
-            # the boundary fell between drawn frames (a counter reset with no done
-            # seen, or a done merged from a dropped frame): this frame is already
-            # inside the next episode. Exact-tracked totals stop at the last drawn
-            # frame, so that episode is not charted; estimated ones carry on as before
-            if self._ep_exact:
-                self._ep_whole = False
-            self._end_episode()
-            boundary = True
-        self._ep_len += adv
+        done = vf.done if vf.done is not None else np.zeros(n, bool)
+        term, trunc = self._info_rows(vf, "terminated"), self._info_rows(vf, "truncated")
+        own_done = (term.astype(bool) | trunc.astype(bool)) if term is not None and \
+            trunc is not None else done
         reward = vf.channels.get("reward")
-        if reward is not None:
-            self._ep_ret = (self._ep_ret or 0.0) + float(reward[vf.focus]) * adv
-        exact_len, exact_ret = self._info_at(vf, "ep_len"), self._info_at(vf, "ep_return")
-        if exact_len is not None:  # counted by the env from the episode's first step
-            self._ep_len, self._ep_whole, self._ep_exact = int(exact_len), True, True
-            if exact_ret is not None:
-                self._ep_ret = exact_ret
-        if focus_done and own_done:
-            self._end_episode()
-            boundary = True
-        if boundary:
-            for trace in self._hists.values():
-                trace.clear()  # channel graphs span ONE episode, compressed to fit
-
-        for w in range(vf.plant.shape[0]):
+        ep_len, ep_ret = self._info_rows(vf, "ep_len"), self._info_rows(vf, "ep_return")
+        for w in range(n):
+            self._eps.setdefault(w, _Episodes()).step(
+                int(adv[w]), bool(dropped[w]) and not bool(done[w]), bool(done[w]),
+                bool(own_done[w]),
+                None if reward is None else float(reward[w]),
+                (None if ep_len is None else float(ep_len[w]),
+                 None if ep_ret is None else float(ep_ret[w])),
+                {name: float(values[w]) for name, values in vf.channels.items()},
+            )
             trail = self._trails.setdefault(w, deque(maxlen=_TRAIL_LEN))
-            if vf.done is not None and bool(vf.done[w]):
-                trail.clear()  # respawned world: a trail across the jump would lie
+            if bool(done[w]):
+                trail.clear()  # respawned drone: a trail across the jump would lie
             else:
                 trail.append(np.asarray(vf.pos[w], np.float64))
-        for name, values in vf.channels.items():
-            self._hists.setdefault(name, _EpTrace()).add(float(values[vf.focus]))
 
     @staticmethod
-    def _info_at(vf: ViewFrame, key: str) -> float | None:
-        """The focused world's value of one step-info key, None when not carried."""
+    def _info_rows(vf: ViewFrame, key: str) -> np.ndarray | None:
+        """Every watched drone's value of one step-info key [W], None when not carried."""
         if not vf.info or key not in vf.info:
             return None
-        return float(np.asarray(vf.info[key]).reshape(-1)[vf.focus])
+        return np.asarray(vf.info[key]).reshape(-1)
 
-    def _chart_episode(self, length: float, ret: float | None) -> None:
-        if length > 0:
-            self._eps.add(length)
-            if ret is not None:
-                self._ep_rets.add(ret)
-
-    def _end_episode(self) -> None:
-        """Close the focused world's episode: chart its length and total reward when
-        it was seen whole. The next episode starts whole — from its first step."""
-        if self._ep_whole:
-            self._chart_episode(self._ep_len, self._ep_ret)
-        self._ep_len, self._ep_ret, self._ep_whole = 0, None, True
-
-    def _measure_sps(self, adv: int) -> None:
-        """Per-sim steps/s from the focused world's step counter: one sample per
-        half-second window of wall time. All sims step together, so the total is
-        this times the fleet size."""
+    def _measure_sps(self, adv: int, now: float) -> None:
+        """Per-drone steps/s from the focused drone's step counter: one sample per
+        half-second window of wall time. All drones step together, so the total is
+        this times the drone count."""
         if not self.measure_sps:
             return
-        now = time.perf_counter()
         if self._sps_t0 is None:
             self._sps_t0, self._sps_acc = now, 0
             return
         self._sps_acc += adv
-        self._steps_seen += adv
         if now - self._sps_t0 >= 0.5:
             if self._sps_warm:
                 self._sps.add(self._sps_acc / (now - self._sps_t0))
-                self._steps_now = float(self._steps_seen)
-                self._steps.add(self._steps_now)
             self._sps_warm = True
             self._sps_t0, self._sps_acc = now, 0
+
+    def _realtime(self) -> float | None:
+        """Sim seconds shown per wall second over the last ~2 s of tracked frames
+        (None until there is a span to measure, or when frames stopped coming)."""
+        now = time.perf_counter()
+        pts = [(t, a) for t, a in self._rt if now - t <= 2.0]
+        if len(pts) < 2 or now - pts[-1][0] > 0.5:
+            return None
+        return sum(a for _, a in pts[1:]) * self.dt / max(pts[-1][0] - pts[0][0], 1e-6)
 
     def _events(self) -> None:
         for ev in pygame.event.get():
@@ -800,9 +835,6 @@ class Viewer:
             self.paused = not self.paused
         elif key == pygame.K_TAB:
             self._focus = (self._focus + 1) % len(self.watch)
-            self._hists.clear()
-            self._lost_ends.clear()
-            self.discontinuity()  # the charts persist; the other world's episode is partial
         elif key == pygame.K_v:
             self._proj_kind = KINDS[(KINDS.index(self._proj_kind) + 1) % len(KINDS)]
             self._projs.pop(self._proj_kind, None)  # a view switch lands on a fresh fit
@@ -905,39 +937,65 @@ class Viewer:
         pygame.draw.rect(self._screen, palette.DIM, pygame.Rect(x, y, width, h), 1)
         return h
 
-    def _draw_status(self, rect: tuple[int, int, int, int], text: str, level: str) -> None:
-        """The host status pill, centred at the top of the scene pane."""
+    def _draw_status(self, right: int) -> int:
+        """The host status chip, right-aligned at `right` in the top bar; returns its
+        left edge (or `right` when there is no status)."""
+        if self._status is None:
+            return right
+        text, level = self._status
         color = _STATUS_COLORS[level]
-        img = self._font.render(text, True, color)
-        w, h = img.get_width() + 24, img.get_height() + 10
-        box = pygame.Rect(rect[0] + (rect[2] - w) // 2, rect[1] + 8, w, h)
-        pygame.draw.rect(self._screen, palette.BG, box, border_radius=h // 2)
+        img = self._small.render(text, True, color)
+        w, h = img.get_width() + 16, 20
+        box = pygame.Rect(right - w, (_TOP_H - h) // 2, w, h)
         pygame.draw.rect(self._screen, color, box, 1, border_radius=h // 2)
-        self._screen.blit(img, (box.x + 12, box.y + 5))
+        self._screen.blit(img, (box.x + 8, box.y + (h - img.get_height()) // 2))
+        return box.x
+
+    def _top_bar(self, vf: ViewFrame) -> None:
+        """Left: what is shown (title, focused drone, drone count). Right: training
+        step, the focused drone's episode clock, playback rate, draw rate, status."""
+        screen, wpx = self._screen, self._size[0]
+        n = len(self.watch)
+        who = self.labels[vf.focus] if self.labels is not None else f"drone {self.watch[vf.focus]}"
+        left = f"{self.title} · {who} ({vf.focus + 1}/{n})"
+        if self._fleet is None:
+            left += f" · {n} drones shown"
+        elif self._fleet == n:
+            left += f" · {n:,} drones"
+        else:
+            left += f" · showing {n} of {self._fleet:,} drones"
+        right = []
+        if self._train_step is not None:
+            right.append(f"train step {self._train_step:,}")
+        ep = self._eps.get(vf.focus)
+        if ep is not None:
+            right.append(f"episode {'' if ep.whole else '≥'}{ep.n * self.dt:.1f} s")
+        if self.paused:
+            right.append("PAUSED")
+        else:
+            rt = self._realtime()
+            rate = "—" if rt is None else f"{rt:.2g}x realtime" if rt < 10 else f"{rt:.0f}x realtime"
+            if self.speed != 1.0:
+                rate += f" (speed x{self.speed:g})"
+            right.append(rate)
+        right.append(f"{self._fps(self._drawn_t):.0f} fps")
+        if self.snap_drops:
+            right.append(f"drops {self.snap_drops}")
+        edge = self._draw_status(wpx - 12) - 12
+        r_img = self._font.render(" · ".join(right), True, palette.MUTED)
+        screen.blit(r_img, (edge - r_img.get_width(), 8))
+        room = edge - r_img.get_width() - 24 - 12
+        while left and self._font.size(left)[0] > room:  # never under the right side
+            left = left[:-2] + "…"
+        screen.blit(self._font.render(left, True, palette.MUTED), (12, 8))
+        pygame.draw.aaline(screen, palette.DIM, (0, _TOP_H), (wpx, _TOP_H))
 
     def _draw(self, vf: ViewFrame) -> None:
         screen = self._screen
         wpx, hpx = self._size
         screen.fill(palette.BG)
 
-        # top bar
-        where = f"world {self.watch[vf.focus]} ({vf.focus + 1}/{len(self.watch)})"
-        if self.labels is not None:
-            where = f"{self.labels[vf.focus]} · {where}"
-        left = f"{self.title} · {where}"
-        if self._fleet is not None:
-            left += f" · fleet {self._fleet:,}"
-        health = f" · {self._fps(self._drawn_t):.0f}/{self._fps(self._fed_t):.0f} fps"
-        if self.snap_drops:
-            health += f" · drops {self.snap_drops}"
-        right = (
-            f"{'PAUSED' if self.paused else f'{self.speed:g}x'} · t {vf.t:7.2f} s"
-            f" · step {vf.step}{health}"
-        )
-        screen.blit(self._font.render(left, True, palette.MUTED), (12, 8))
-        r_img = self._font.render(right, True, palette.MUTED)
-        screen.blit(r_img, (wpx - r_img.get_width() - 12, 8))
-        pygame.draw.aaline(screen, palette.DIM, (0, _TOP_H), (wpx, _TOP_H))
+        self._top_bar(vf)
 
         # panes
         scene_rect = self._scene_rect
@@ -962,8 +1020,6 @@ class Viewer:
             show_glyphs=self.show_glyphs,
             show_fleet=self.show_fleet,
         )
-        if self._status is not None:
-            self._draw_status(scene_rect, *self._status)
 
         fx = wpx - _FPV_W - 8
         y = _TOP_H + 8
@@ -999,6 +1055,7 @@ class Viewer:
         self._draw_keybar()
 
         hud_rect = (0, hpx - _HUD_H - _KEYBAR_H, wpx, _HUD_H)
+        ep = self._eps.get(vf.focus)
         armed = None
         if vf.info and "armed" in vf.info:
             armed = bool(np.asarray(vf.info["armed"]).reshape(-1)[vf.focus])
@@ -1008,14 +1065,12 @@ class Viewer:
             vf,
             control=self.control,
             omega_max=self.omega_max,
-            histories={k: list(v.vals) for k, v in self._hists.items()},
+            histories={k: list(v.vals) for k, v in ep.hists.items()} if ep else None,
             armed=armed,
             ranges=self._gauges,
-            episodes=self._eps.vals or None,
-            ep_rewards=self._ep_rets.vals or None,
+            episodes=(ep.lens.vals or None) if ep else None,
+            ep_rewards=(ep.rets.vals or None) if ep else None,
             throughput=self._sps.vals or None,
-            total_steps=self._steps.vals or None,
-            total_now=self._steps_now,
             fleet=self._fleet,
             font=self._font,
             small=self._small,

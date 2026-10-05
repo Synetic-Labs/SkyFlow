@@ -190,21 +190,18 @@ class TestBuilders:
         font = pygame.font.Font(None, 14)
         rect = (0, 0, 1600, 150)
         renders = []
-        for ep_rewards, throughput, total in (
-            (None, None, None),
-            ([-3.0, 1.0, 5.0], None, None),  # negative totals hang below a zero line
-            (None, [900.0, 1000.0, 1100.0], None),
-            (None, None, [1000.0, 2000.0, 3000.0]),
+        for ep_rewards, throughput in (
+            (None, None),
+            ([-3.0, 1.0, 5.0], None),  # negative totals hang below a zero line
+            (None, [900.0, 1000.0, 1100.0]),
         ):
             surface = pygame.Surface(rect[2:])
             draw_hud(surface, rect, _frame(), histories={"reward": [0.1, 0.3]},
-                     ep_rewards=ep_rewards, throughput=throughput, total_steps=total,
-                     total_now=None if total is None else 3500.0, fleet=4096,
+                     ep_rewards=ep_rewards, throughput=throughput, fleet=4096,
                      font=font, small=font)
             renders.append(pygame.surfarray.array3d(surface))
         assert (renders[0] != renders[1]).any(), "the episode-reward panel should draw"
         assert (renders[0] != renders[2]).any(), "the throughput panel should draw"
-        assert (renders[0] != renders[3]).any(), "the total-steps panel should draw"
 
     def test_hud_dials_and_armed_lamp(self):
         pygame.font.init()
@@ -251,7 +248,7 @@ class TestBuilders:
             f.plant[:, 3] = speed
             surface = pygame.Surface((900, 150))
             draw_hud(surface, (0, 0, 900, 150), f, ranges=ranges)
-            seen.append(ranges["SPD m/s"])
+            seen.append(ranges["SPEED m/s"])
         assert seen == [2.0, 10.0, 10.0]  # grows on 9, never shrinks back
 
     def test_hud_draws_both_control_modes(self):
@@ -331,34 +328,34 @@ class TestViewer:
             for f in (vf_at(100), vf_at(105), vf_at(110, done=True),
                       vf_at(111), vf_at(118, done=True)):
                 viewer._track(f)
-            assert viewer._eps.vals == [8.0]
+            assert viewer._eps[0].lens.vals == [8.0]
 
             # PER-EPISODE counter (eval): the drop 9 -> 1 reveals a missed done
-            viewer._eps.clear()
+            viewer._eps[0].lens.clear()
             viewer.discontinuity()
             for f in (vf_at(3), vf_at(9), vf_at(1), vf_at(5), vf_at(8, done=True)):
                 viewer._track(f)
-            assert viewer._eps.vals == [8.0]
+            assert viewer._eps[0].lens.vals == [8.0]
 
             # a host-declared discontinuity (new log, seek): the step jump back is no
             # episode end, and the episode in progress leaves the chart
-            viewer._eps.clear()
+            viewer._eps[0].lens.clear()
             for f in (vf_at(1), vf_at(2), vf_at(3, done=True), vf_at(4), vf_at(5)):
                 viewer._track(f)
             viewer.discontinuity()
             for f in (vf_at(0), vf_at(1), vf_at(2, done=True), vf_at(3), vf_at(4, done=True)):
                 viewer._track(f)
-            assert viewer._eps.vals == [3.0, 2.0]  # the cut-short episode is not charted
+            assert viewer._eps[0].lens.vals == [3.0, 2.0]  # the cut-short episode is not charted
 
             # a repeated row (paused or held replay) counts once
-            viewer._eps.clear()
+            viewer._eps[0].lens.clear()
             viewer.discontinuity()
             frames = [vf_at(10), vf_at(11), vf_at(12, done=True)]
             for f in (frames[0], frames[1], frames[1], frames[1], frames[2], frames[2]):
                 viewer._track(f)
             for f in (vf_at(13), vf_at(14), vf_at(14), vf_at(15, done=True)):
                 viewer._track(f)
-            assert viewer._eps.vals == [3.0]
+            assert viewer._eps[0].lens.vals == [3.0]
         finally:
             viewer.close()
 
@@ -379,14 +376,14 @@ class TestViewer:
             for f in (vf_at(1, 1.0), vf_at(2, 2.0), vf_at(3, 3.0, done=True),
                       vf_at(4, -1.0), vf_at(5, -1.0, done=True)):
                 viewer._track(f)
-            assert viewer._ep_rets.vals == [-2.0]  # the joined-midway first is not charted
-            assert viewer._eps.vals == [2.0]
+            assert viewer._eps[0].rets.vals == [-2.0]  # the joined-midway first is not charted
+            assert viewer._eps[0].lens.vals == [2.0]
 
             # live: the env's exact accumulators win over the sampled reward, even for
             # an episode joined midway; the done row carries the finished totals while
             # its step counter already reset
-            viewer._ep_rets.clear()
-            viewer._eps.clear()
+            viewer._eps[0].rets.clear()
+            viewer._eps[0].lens.clear()
             viewer.discontinuity()
 
             def info(n: int, ret: float, done: bool) -> dict:
@@ -404,8 +401,8 @@ class TestViewer:
                       vf_at(5, 0.1, info=info(5, 0.5, False)),
                       vf_at(0, 0.1, done=True, info=info(6, 0.6, True))):
                 viewer._track(f)
-            assert viewer._ep_rets.vals == [9.5, 0.6]
-            assert viewer._eps.vals == [31.0, 6.0]
+            assert viewer._eps[0].rets.vals == [9.5, 0.6]
+            assert viewer._eps[0].lens.vals == [31.0, 6.0]
         finally:
             viewer.close()
 
@@ -431,13 +428,9 @@ class TestViewer:
             assert viewer._sps.vals == [pytest.approx(400.0), pytest.approx(400.0)]
             assert viewer._fleet == 64
 
-            # measured mode totals the steps seen since the viewer opened
-            assert viewer._steps.vals == [400.0, 600.0] and viewer._steps_now == 600.0
-
-            viewer.report_throughput(1234.0, fleet=128, steps=9000.0)  # the host knows better
+            viewer.report_throughput(1234.0, fleet=128, train_step=9000)  # the host knows better
             assert not viewer.measure_sps and viewer._sps.vals[-1] == 1234.0
-            assert viewer._fleet == 128
-            assert viewer._steps.vals[-1] == 9000.0 and viewer._steps_now == 9000.0
+            assert viewer._fleet == 128 and viewer._train_step == 9000
         finally:
             viewer.close()
 
@@ -462,8 +455,8 @@ class TestViewer:
             drawn = vf_at(5, 5, 0.4, False)
             viewer._merge_lost_dones(drawn)
             viewer._track(drawn)
-            assert viewer._eps.vals == [57.0] and viewer._ep_rets.vals == [4.5]
-            assert viewer._ep_len == 5 and viewer._ep_ret == pytest.approx(0.4)
+            assert viewer._eps[0].lens.vals == [57.0] and viewer._eps[0].rets.vals == [4.5]
+            assert viewer._eps[0].n == 5 and viewer._eps[0].ret == pytest.approx(0.4)
         finally:
             viewer.close()
 
@@ -510,6 +503,48 @@ class TestViewer:
             assert (arr == palette.BAD).all(axis=1).any(), "the status pill should draw"
             assert not (shots[0].reshape(-1, 3) == palette.BAD).all(axis=1).any()
         finally:
+            viewer.close()
+
+    def test_each_drone_keeps_its_own_episodes(self):
+        """Tab switches which drone the HUD shows; every drone's bars and traces are
+        tracked all along, so a switch shows that drone's whole history."""
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), watch=(0, 4), headless=True, threaded=False)
+        try:
+            for step, d0, d1 in ((1, False, False), (2, False, True), (3, True, False),
+                                 (4, False, False), (5, False, True), (6, True, False)):
+                f = _frame()
+                f.step = step
+                f.done = np.array([d0, d1])
+                f.channels = {"reward": np.array([1.0, 2.0], np.float32)}
+                viewer._track(f)
+            assert viewer._eps[0].lens.vals == [3.0]  # steps 4..6; 1..3 joined midway
+            assert viewer._eps[1].lens.vals == [3.0]  # steps 3..5
+            assert viewer._eps[1].rets.vals == [6.0]
+            assert viewer._eps[1].hists["reward"].vals == [2.0]  # step 6, the new episode
+        finally:
+            viewer.close()
+
+    def test_realtime_factor_is_measured(self):
+        import skyflow.viz.viewer as vmod
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False, dt=0.01)
+        t = [100.0]
+        real = vmod.time.perf_counter
+        vmod.time.perf_counter = lambda: t[0]
+        try:
+            for i in range(21):  # 5 steps of 10 ms every 0.1 s wall: 0.5x realtime
+                f = _frame()
+                f.step = 5 * i
+                t[0] = 100.0 + 0.1 * i
+                viewer._track(f)
+            assert viewer._realtime() == pytest.approx(0.5)
+            t[0] += 1.0  # frames stopped coming: no rate to claim
+            assert viewer._realtime() is None
+        finally:
+            vmod.time.perf_counter = real
             viewer.close()
 
     def test_ep_trace_compresses_pairwise(self):

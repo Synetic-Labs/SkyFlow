@@ -7,8 +7,8 @@ plant[13:17], an attitude horizon with pitch/roll level markers (roll/pitch prin
 under it) and a heading compass (heading printed under it), a speed dial and a
 cockpit-style climb dial (zero at the left, needle up = climb), an episode-length bar
 chart (when the caller tracks one), then one graph per named channel — reward drawn
-last — then the episode-reward bars, the steps/s throughput trace and the total-steps
-trace (each when the caller passes it). The fixed instruments are vehicle truth — valid for any quadrotor
+last — then the episode-reward bars and the steps/s throughput trace (each when the
+caller passes it). Every chart prints its one number under it, as the dials do. The fixed instruments are vehicle truth — valid for any quadrotor
 use case. Channels are whatever the caller traces (reward, goal
 distance, estimator error, ...); this module knows no channel names and no task fields.
 A builder, not a host: draws onto the given surface, owns no window.
@@ -116,21 +116,28 @@ def _compass(surface, cx: int, cy: int, r: int, quat: np.ndarray, font=None) -> 
         surface.blit(img, (cx - img.get_width() / 2, cy - r + 6))
 
 
-def _graph(surface, x: int, top: int, w: int, h: int, name: str, values: Sequence[float],
-           font=None) -> None:
-    """One channel graph: auto-scaled trace, latest value printed in the corner."""
+def _value_under(surface, x: float, top: int, w: float, h: int, text: str, font) -> None:
+    """A panel's ONE printed number, centred under it — the dials' convention."""
+    if font:
+        img = font.render(text, True, palette.MUTED)
+        surface.blit(img, (x + (w - img.get_width()) / 2, top + h + 3))
+
+
+def _graph(surface, x: int, top: int, w: int, h: int, values: Sequence[float] | np.ndarray,
+           font=None, *, from_zero: bool = False, fmt=lambda v: f"{v:+.3g}") -> None:
+    """One trace: auto-scaled (from zero when `from_zero`), latest value printed under
+    the panel through `fmt`."""
     pygame.draw.rect(surface, palette.DIM, pygame.Rect(x, top, w, h), 1, border_radius=4)
     arr = np.asarray(values, np.float64)
     if arr.shape[0] >= 2:
-        lo, hi = float(arr.min()), float(arr.max())
+        lo, hi = (0.0 if from_zero else float(arr.min())), float(arr.max())
         span = max(hi - lo, 1e-6)
         xs = x + 4 + np.linspace(0, w - 8, arr.shape[0])
         ys = top + h - 4 - (arr - lo) / span * (h - 8)
         pts = [(float(a), float(b)) for a, b in zip(xs, ys, strict=True)]
         pygame.draw.aalines(surface, palette.ACCENT, False, pts)
-    if font and arr.shape[0]:
-        img = font.render(f"{float(arr[-1]):+.3g}", True, palette.MUTED)
-        surface.blit(img, (x + w - img.get_width() - 5, top + 3))
+    if arr.shape[0]:
+        _value_under(surface, x, top, w, h, fmt(float(arr[-1])), font)
 
 
 def _nice_ceil(v: float) -> float:
@@ -179,7 +186,7 @@ def _ep_chart(surface, x: int, top: int, w: int, h: int, values, font=None,
     """Per-episode bars: one bar per finished episode (or per bin once the caller
     compresses), scaled so the WHOLE run always fits the panel width. Bars grow from
     zero, so negative values (episode reward) hang below a zero line. The latest value
-    prints in the corner through `fmt`."""
+    prints under the panel through `fmt`."""
     pygame.draw.rect(surface, palette.DIM, pygame.Rect(x, top, w, h), 1, border_radius=4)
     arr = np.asarray(values, np.float64)
     if arr.shape[0] == 0:
@@ -198,9 +205,7 @@ def _ep_chart(surface, x: int, top: int, w: int, h: int, values, font=None,
             surface, palette.dim(palette.ACCENT, 0.8),
             pygame.Rect(bx, round(by), max(1, math.floor(bw * 0.8)), bh),
         )
-    if font:
-        img = font.render(fmt.format(float(arr[-1])), True, palette.MUTED)
-        surface.blit(img, (x + w - img.get_width() - 5, top + 3))
+    _value_under(surface, x, top, w, h, fmt.format(float(arr[-1])), font)
 
 
 def _si(v: float) -> str:
@@ -209,29 +214,6 @@ def _si(v: float) -> str:
         if abs(v) >= div:
             return f"{v / div:.3g}{suffix}"
     return f"{v:.0f}"
-
-
-def _fleet_chart(surface, x: int, top: int, w: int, h: int, per_sim, fleet: int | None,
-                 latest: float | None = None, font=None) -> None:
-    """A per-sim trace (steps/s, total steps), scaled from zero. Plots the all-sims
-    total (per-sim x fleet) when the fleet size is known, else the per-sim value.
-    Prints the latest per-sim value on the left and the all-sims one on the right;
-    `latest` overrides the last trace point (a compressed trace holds bin means)."""
-    pygame.draw.rect(surface, palette.DIM, pygame.Rect(x, top, w, h), 1, border_radius=4)
-    arr = np.asarray(per_sim, np.float64) * (fleet or 1)
-    if arr.shape[0] >= 2:
-        span = max(float(arr.max()), 1e-6)
-        xs = x + 4 + np.linspace(0, w - 8, arr.shape[0])
-        ys = top + h - 4 - arr / span * (h - 8)
-        pts = [(float(a), float(b)) for a, b in zip(xs, ys, strict=True)]
-        pygame.draw.aalines(surface, palette.ACCENT, False, pts)
-    if font and arr.shape[0]:
-        now = float(per_sim[-1]) if latest is None else float(latest)
-        sim = font.render(f"sim {_si(now)}", True, palette.MUTED)
-        surface.blit(sim, (x + 5, top + 3))
-        if fleet:
-            img = font.render(f"all {_si(now * fleet)}", True, palette.MUTED)
-            surface.blit(img, (x + w - img.get_width() - 5, top + 3))
 
 
 def _lamp(surface, x: float, y: float, w: float, on: bool, text: str, small=None) -> None:
@@ -256,8 +238,6 @@ def draw_hud(
     episodes: Sequence[float] | None = None,
     ep_rewards: Sequence[float] | None = None,
     throughput: Sequence[float] | None = None,
-    total_steps: Sequence[float] | None = None,
-    total_now: float | None = None,
     fleet: int | None = None,
     font=None,
     small=None,
@@ -271,10 +251,9 @@ def draw_hud(
     range instead of a per-frame autoscale. `episodes` is a sequence of finished
     episode lengths (steps) for the bar chart; None hides the panel. `ep_rewards` is
     the matching sequence of episode total rewards, drawn as bars after the reward
-    graph; None hides it. `throughput` is a per-sim steps/s history; `fleet` (the
-    number of sims stepping in parallel) turns it into the all-sims total. None hides
-    the throughput panel. `total_steps` is a per-sim cumulative step-count history
-    (`total_now` its exact latest value) for the TOTAL STEPS panel; None hides it.
+    graph; None hides it. `throughput` is a per-drone steps/s history; `fleet` (the
+    number of drones stepping in parallel) turns it into the all-drones total, the
+    one number shown. None hides the throughput panel.
     """
     surface.set_clip(pygame.Rect(rect))
     surface.fill(palette.BG, pygame.Rect(rect))
@@ -339,7 +318,7 @@ def draw_hud(
     speed = float(np.linalg.norm(frame.vel[f]))
     climb = float(frame.vel[f][2])
     for name, value, floor, signed in (
-        ("SPD m/s", speed, 2.0, False),
+        ("SPEED m/s", speed, 2.0, False),
         ("CLIMB m/s", climb, 1.0, True),
     ):
         full = max(ranges.get(name, 0.0), _nice_ceil(max(abs(value), floor)))
@@ -350,7 +329,7 @@ def draw_hud(
         x += 2 * r + 26
 
     if episodes is not None:
-        _ep_chart(surface, x, top, 150, box, episodes, font=small)
+        _ep_chart(surface, x, top, 150, box, episodes, font=font)
         caption(x, "EP STEPS")
         x += 170
 
@@ -365,23 +344,19 @@ def draw_hud(
     for name, values in named.items():
         if not fits():
             break
-        _graph(surface, x, top, graph_w, box, name, values, font=small)
+        _graph(surface, x, top, graph_w, box, values, font=font)
         caption(x, name.upper())
         x += graph_w + 20
 
     if ep_rewards is not None and fits():
-        _ep_chart(surface, x, top, graph_w, box, ep_rewards, font=small, fmt="{:+.3g}")
+        _ep_chart(surface, x, top, graph_w, box, ep_rewards, font=font, fmt="{:+.3g}")
         caption(x, "EP REWARD")
         x += graph_w + 20
 
     if throughput is not None and fits():
-        _fleet_chart(surface, x, top, graph_w, box, throughput, fleet, font=small)
-        caption(x, f"STEPS/S · {fleet:,} SIMS" if fleet else "STEPS/S")
-        x += graph_w + 20
-
-    if total_steps is not None and fits():
-        _fleet_chart(surface, x, top, graph_w, box, total_steps, fleet, latest=total_now,
-                     font=small)
-        caption(x, "TOTAL STEPS")
+        total = np.asarray(throughput, np.float64) * (fleet or 1)
+        _graph(surface, x, top, graph_w, box, total, font=font, from_zero=True,
+               fmt=lambda v: f"{_si(v)}/s")
+        caption(x, "STEPS/S · ALL DRONES" if fleet else "STEPS/S · PER DRONE")
         x += graph_w + 20
     surface.set_clip(None)
