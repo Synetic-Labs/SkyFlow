@@ -160,7 +160,7 @@ class Airframe:
     values: dict            # spec SCHEMA row (validated by skyflow_dynamics pack_params)
     rotor_speed_min: float; rotor_speed_max: float
     throttle_k: float       # throttle-curve blend for the command map
-AIRFRAMES = {"racer5in": ...,    # params.RACER_5IN: 5-inch racer, the default
+AIRFRAMES = {"racer5in": ...,    # RACER_5IN (SkyFlow-Dynamics): 5-inch racer, the default
              "crazyflie": ...}   # from skyflow_dynamics.spec.parameters.CRAZYFLIE (+limits)
 register_airframe(name, airframe)
 ```
