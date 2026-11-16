@@ -71,7 +71,7 @@ Dependencies: `jax>=0.11`, `numpy>=2`, `skyflow-dynamics[jax]` (uv source: the p
 URL). Extras: `cuda` → `jax[cuda13]`;
 `firmware` → `cudaflight>=0.6.0` (public GitHub release-wheel URL source); `viz` → nothing but
 `pygame-ce>=2.5` (§13; the maintained fork, imports as `pygame`). Dev group: `pytest>=9`,
-`ruff>=0.16`. License MIT. Version 0.2.0.
+`ruff>=0.16`. License MIT. Version 0.3.0.
 
 ## 3. Conventions (one frame inside)
 
@@ -143,6 +143,9 @@ substep(plant [F,17], omega_cmd [F,4], wind_vel [F,3], f_ext [F,3], tau_ext [F,3
         params [F,P], dt) -> [F,17]        # sfd.rk4_step_fn + sfd.post_step (renorm+clip via limits passed in)
 statedot(...) -> [F,17]                    # for diagnostics
 imu(plant, omega_cmd, wind_vel, params) -> (accel [F,3], gyro [F,3])   # sfd.imu_fn, identity mount
+imu_bias_step(bias [F,6], w [F,6], tau, sigma [6], dt) -> [F,6]        # sfd.imu_bias_step_fn: exact
+                                                                       # Gauss-Markov bias step (needs
+                                                                       # skyflow-dynamics >= 0.2.0)
 throttle_to_omega(u [F,4] in [0,1], w_min, w_max, k) -> [F,4]          # sfd.throttle_to_speed_fn
 pack_params / param_slices re-exported from sfd
 ```
@@ -204,6 +207,9 @@ class DomainRand:                        # ALL training-robustness randomization
     # sensing — the IMU/baro rows the firmware (§10) and IMU-observing tasks consume
     gyro_noise_rps: float = 0.0; accel_noise_mps2: float = 0.0  # process: white, per 1 kHz sample
     gyro_bias_rps: float = 0.0; accel_bias_mps2: float = 0.0    # trait: constant per-axis half-width
+    gyro_bias_walk: float = 0.0; accel_bias_walk: float = 0.0   # process: bias-walk driving-noise
+                                         # density, [unit]/√s (exact Gauss-Markov step, §5)
+    imu_bias_tau_s: float = 300.0        # bias correlation time, s (a clock — never scaled)
     baro_noise_pa: float = 0.0           # process: white on the sticks baro row
     # observation — applied by the ENV after task.observe (tasks own semantics, the env owns corruption)
     obs_noise: float = 0.0               # LEGACY stress knob: unit-blind uniform half-width
@@ -244,7 +250,8 @@ from the nominal model, in the ways the real world differs. Rules:
 - Three draw classes: **traits** (once per episode at reset/respawn, constant within it —
   params row, steady wind, IMU bias, delay), **processes** (fresh every sample — gusts,
   sensor noise, obs noise) and **events** (Bernoulli per control step — pokes). Trait
-  storage is the single `SimState.dr_state` leaf (§4).
+  storage is the single `SimState.dr_state` leaf (§4); it also holds the one slow
+  process state, the IMU bias walk, so that it respawns with the traits.
 - Every knob is a magnitude in physical units. `scale` multiplies every continuous
   magnitude and never touches clocks, event rates, integer delays or spawn spread;
   `scale=0` with `delay_steps=(0,0)` (= `off()`) is bit-exact nominal — a §11 invariant.
@@ -267,7 +274,10 @@ task_state(state) -> Any             # the task's OWN pytree (unwraps the §10 s
 
 Pure functions; the caller jits. **Step pipeline (order is normative):**
 
-1. Split `state.key`. Push `action` into `act_buf`; read delayed action per `delay_idx`.
+1. Split `state.key`. Advance the IMU bias walk one exact Gauss-Markov step
+   (`dynamics.imu_bias_step`, when a walk density is set) — every sensor row of this
+   step reads the advanced bias. Push `action` into `act_buf`; read delayed action per
+   `delay_idx`.
 2. Command map: motors mode → `u = (a+1)/2`, `Ω_c = throttle_to_omega(u, ...)`.
 3. Advance the OU gust deviation (exact discretization: decay `exp(-dt/τ)` + kick).
    Every consumer sees the total wind `dr_state.wind_mean + wind_vel`.
@@ -319,7 +329,8 @@ not. Adding a new input to `env.step` obliges a new row.
 | firmware code + tune | none | declared exact — the §10 point; inputs get randomized, never the controller |
 | IMU white noise | `gyro_noise_rps`, `accel_noise_mps2` | randomized |
 | IMU constant bias | `gyro_bias_rps`, `accel_bias_mps2` | randomized (firmware gyro-cal absorbs gyro bias at boot, like hardware) |
-| IMU bias walk, staleness, scale/misalignment | — | roadmap |
+| IMU bias walk | `gyro_bias_walk`, `accel_bias_walk`, `imu_bias_tau_s` | randomized — the backend's exact Gauss-Markov step (SkyFlow-Dynamics `imu_stochastic_errors`, verified), once per control step, on top of the constant bias; restarts at zero on respawn |
+| IMU staleness, scale/misalignment | — | roadmap |
 | RPM-tracked vibration harmonics + RPM filter | — | roadmap (researched, parked in ROADMAP.md) |
 | baro noise | `baro_noise_pa` | randomized (sticks) |
 | battery voltage sag | `battery_sag` (per-episode rotor-speed-ceiling draw) | randomized |

@@ -1,6 +1,7 @@
 """
 The new DR knobs on the sticks axis (TECH_DEBT §7 D10/D11): battery_sag,
-cmd_drop_prob, obs_error and the factor stage each run through the REAL CPU SITL
+cmd_drop_prob, obs_error, the factor stage and the IMU bias walk each run through the
+REAL CPU SITL
 for a few jitted steps, and the estimator leaves clear on auto-reset. Each test
 opens and closes its own fleet (one CPU fleet per process).
 """
@@ -30,6 +31,8 @@ _KNOBS = {
     "cmd_drop_prob": {"cmd_drop_prob": 0.3},
     "obs_error": {"obs_error": {"profile": "mocap"}},
     "factors": {"factors": {}},
+    "imu_bias_walk": {"gyro_bias_walk": 0.02, "accel_bias_walk": 0.5,
+                      "imu_bias_tau_s": 0.5},
 }
 
 
@@ -47,6 +50,9 @@ def test_dr_knob_steps_through_the_real_firmware(knob):
             assert bool(jnp.isfinite(obs).all()) and bool(jnp.isfinite(reward).all())
             assert "armed" in info
         assert bool(jnp.isfinite(state.plant).all())
+        if knob == "imu_bias_walk":
+            # the firmware read sensor rows whose bias moved every control step
+            assert float(jnp.abs(state.dr_state.imu_bias_walk).max()) > 0.0
 
 
 def test_estimator_leaves_clear_on_auto_reset():

@@ -175,6 +175,15 @@ class DomainRand:
     accel_noise_mps2: float = 0.0  # process: white per-sample std, m/s²
     gyro_bias_rps: float = 0.0  # trait: constant per-axis bias half-width, rad/s
     accel_bias_mps2: float = 0.0  # trait: constant per-axis bias half-width, m/s²
+    # process: IMU bias walk on top of the constant trait — the exact Gauss-Markov step
+    # of SkyFlow-Dynamics (imu_stochastic_errors, verified), advanced once per control
+    # step. Driving-noise densities; the stationary std is density·√(τ/2), and for
+    # τ ≫ episode length the bias random-walks by density·√t. 0 = off (bit-exact).
+    # Datasheet scale (RotorS ADIS16448 defaults): gyro 3.9e-5 rad/s/√s, accel
+    # 6.0e-3 m/s²/√s, τ 1000 s / 300 s; cheap MEMS under motor heat sit well above.
+    gyro_bias_walk: float = 0.0  # rad/s per √s
+    accel_bias_walk: float = 0.0  # m/s² per √s
+    imu_bias_tau_s: float = 300.0  # bias correlation time, s (a clock — never scaled)
     baro_noise_pa: float = 0.0  # process: white per-sample std on the baro row, Pa
     gyro_sat_rps: float = 0.0  # gyro full-scale clip, rad/s (0 = off). The BMI270 at
     # Betaflight's ±2000 dps range saturates at 34.9 rad/s; crash tumbles and yaw spins
@@ -234,6 +243,8 @@ class DomainRand:
             accel_noise_mps2=s * self.accel_noise_mps2,
             gyro_bias_rps=s * self.gyro_bias_rps,
             accel_bias_mps2=s * self.accel_bias_mps2,
+            gyro_bias_walk=s * self.gyro_bias_walk,
+            accel_bias_walk=s * self.accel_bias_walk,
             baro_noise_pa=s * self.baro_noise_pa,
             obs_noise=s * self.obs_noise,
             battery_sag=s * self.battery_sag,
@@ -454,13 +465,16 @@ class SkyFlowEnv:
             raise ValueError(f"need 0 <= delay min <= max, got dr.delay_steps={dr.delay_steps}")
         if dr.wind_tau_s <= 0.0:
             raise ValueError(f"dr.wind_tau_s must be > 0, got {dr.wind_tau_s}")
+        if dr.imu_bias_tau_s <= 0.0:
+            raise ValueError(f"dr.imu_bias_tau_s must be > 0, got {dr.imu_bias_tau_s}")
         if not 0.0 <= dr.poke_prob <= 1.0:
             raise ValueError(f"dr.poke_prob must be in [0,1], got {dr.poke_prob}")
         for name in (
             "scale", "body_scale", "wind_mean_mps", "wind_gust_mps", "poke_force_n",
             "poke_torque_nm", "poke_force_frac", "poke_torque_frac",
             "gyro_noise_rps", "accel_noise_mps2", "gyro_bias_rps",
-            "accel_bias_mps2", "baro_noise_pa", "gyro_sat_rps", "gyro_scale_frac",
+            "accel_bias_mps2", "gyro_bias_walk", "accel_bias_walk",
+            "baro_noise_pa", "gyro_sat_rps", "gyro_scale_frac",
             "imu_offset_m", "imu_mount_deg", "cog_offset_m", "cog_offset_frac",
             "battery_sag_rate_ps",
             "obs_noise", "spawn_scale",
@@ -532,6 +546,12 @@ class SkyFlowEnv:
         self._delay_min, self._delay_max = d_min, d_max
         self._imu_noise_on = dr.gyro_noise_rps > 0.0 or dr.accel_noise_mps2 > 0.0
         self._imu_bias_on = dr.gyro_bias_rps > 0.0 or dr.accel_bias_mps2 > 0.0
+        # Bias walk: per-column driving-noise densities in the imu_bias layout
+        # (accel(3), gyro(3)). Static gate — off leaves every legacy path bit-exact.
+        self._bias_walk_on = dr.gyro_bias_walk > 0.0 or dr.accel_bias_walk > 0.0
+        self._bias_walk_sigma = jnp.asarray(
+            [dr.accel_bias_walk] * 3 + [dr.gyro_bias_walk] * 3, jnp.float32
+        )
         self.fleet = int(cfg.num_envs)
         self.airframe = AIRFRAMES[cfg.airframe]
         # Battery sag shrinks the very ceiling the thrust-to-weight guard prices, so
@@ -894,6 +914,8 @@ class SkyFlowEnv:
             wind_mean=wind_mean, imu_bias=imu_bias, w_max=w_max, est_bias=est_bias,
             gyro_scale=gyro_scale, imu_offset=imu_offset, imu_mount=imu_mount,
             cog_offset=cog_offset,
+            # The walk starts at zero: the constant trait above is the turn-on bias.
+            imu_bias_walk=jnp.zeros((f, 6), jnp.float32),
         )
 
     def _measure(
@@ -903,12 +925,16 @@ class SkyFlowEnv:
         """sensors.measure with this env's DomainRand corruption. The static gates keep
         the nominal path key-free and bit-exact (sensors.py charter)."""
         dr = self.dr
+        if self._bias_walk_on:
+            imu_bias = dr_state.imu_bias + dr_state.imu_bias_walk
+        else:
+            imu_bias = dr_state.imu_bias if self._imu_bias_on else None
         return sensors.measure(
             plant, omega, wind, params,
             key=key if self._imu_noise_on else None,
             accel_noise_std=dr.accel_noise_mps2,
             gyro_noise_std=dr.gyro_noise_rps,
-            imu_bias=dr_state.imu_bias if self._imu_bias_on else None,
+            imu_bias=imu_bias,
             imu_offset=dr_state.imu_offset if self._mount_on else None,
             imu_mount=dr_state.imu_mount if self._mount_on else None,
             gyro_scale=dr_state.gyro_scale if self._gscale_on else None,
@@ -1079,6 +1105,18 @@ class SkyFlowEnv:
         (
             k_carry, k_wind, k_gate, k_poke_f, k_poke_tau, k_sub, k_imu, k_obs, k_reset,
         ) = jax.random.split(state.key, 9)
+        # IMU bias walk: one exact Gauss-Markov step per control step, before any
+        # sensor row of this step is read (the bias moves over seconds; the substeps
+        # hold it). fold_in keeps the legacy key stream untouched.
+        dr_state = state.dr_state
+        if self._bias_walk_on:
+            w_bias = jax.random.normal(jax.random.fold_in(k_imu, 301), (f, 6), jnp.float32)
+            dr_state = dr_state._replace(
+                imu_bias_walk=dynamics.imu_bias_step(
+                    dr_state.imu_bias_walk, w_bias, dr.imu_bias_tau_s,
+                    self._bias_walk_sigma, self.dt_control,
+                ).astype(jnp.float32)
+            )
         action = jnp.clip(jnp.asarray(action, jnp.float32), -1.0, 1.0)
         act_buf = jnp.concatenate([action[:, None, :], state.act_buf[:, :-1, :]], axis=1)
         delayed = act_buf[jnp.arange(f), state.delay_idx]
@@ -1180,7 +1218,7 @@ class SkyFlowEnv:
                 plant, blob, fwstate, omega_prev, impact, _ = carry
                 k_imu_t, k_baro_t = jax.random.split(k_t)
                 accel, gyro = self._measure(
-                    plant, omega_prev, wind_total, state.params, state.dr_state, k_imu_t
+                    plant, omega_prev, wind_total, state.params, dr_state, k_imu_t
                 )
                 baro = self._baro_pa(plant[:, 2:3]).astype(jnp.float32)
                 if baro_on:
@@ -1238,7 +1276,7 @@ class SkyFlowEnv:
         # rotation on the quaternion; during a dropout hold the estimator repeats
         # its last emitted estimate (staleness, not noise).
         k_obs_task, k_obs_dr = jax.random.split(k_obs)
-        imu = self._measure(plant, omega_last, wind_total, state.params, state.dr_state, k_imu)
+        imu = self._measure(plant, omega_last, wind_total, state.params, dr_state, k_imu)
         if self._est is not None:
             est_ou = errors.advance_ou(
                 state.est_ou, jax.random.fold_in(k_obs, 2), self.dt_control, self._est
@@ -1342,7 +1380,7 @@ class SkyFlowEnv:
             plant=plant,
             params=state.params,
             wind_vel=wind_vel,
-            dr_state=state.dr_state,
+            dr_state=dr_state,
             act_buf=act_buf,
             delay_idx=state.delay_idx,
             cmd_prev=delayed,
