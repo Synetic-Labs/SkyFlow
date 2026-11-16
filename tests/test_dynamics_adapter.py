@@ -199,6 +199,7 @@ def test_simstate_is_a_scannable_pytree(fleet_size, nominal_params, key):
         dr_state=DRState(
             wind_mean=jnp.zeros((f, 3), jnp.float32),
             imu_bias=jnp.zeros((f, 6), jnp.float32),
+            imu_bias_walk=jnp.zeros((f, 6), jnp.float32),
             w_max=jnp.full((f,), AIRFRAMES["crazyflie"].rotor_speed_max, jnp.float32),
             est_bias=jnp.zeros((f, 12), jnp.float32),
             gyro_scale=jnp.ones((f, 3), jnp.float32),

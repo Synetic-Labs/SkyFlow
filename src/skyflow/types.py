@@ -77,6 +77,9 @@ class DRState(NamedTuple):
     imu_offset: Array  # [F,3] f32 IMU position offset from the body origin, m
     imu_mount: Array  # [F,9] f32 IMU mount rotation, row-major (identity = exact)
     cog_offset: Array  # [F,3] f32 CoG shift, m — applied as -offset on every rotor position
+    imu_bias_walk: Array  # [F,6] f32 IMU bias-walk state, same layout as imu_bias. Zero at
+    # spawn; the env advances it once per control step (the one DRState leaf that is a
+    # process, kept here so it respawns with the traits). Adds to imu_bias.
 
 
 class TaskEval(NamedTuple):

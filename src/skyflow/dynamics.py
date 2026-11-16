@@ -45,6 +45,7 @@ __all__ = [
     "RACER_5IN",
     "STATE_DIM",
     "imu",
+    "imu_bias_step",
     "pack_params",
     "param_slices",
     "statedot",
@@ -174,3 +175,24 @@ def throttle_to_omega(u, w_min, w_max, k):
     vmap; endpoints are exact (u=0 → w_min, u=1 → w_max) for any blend k ∈ [0,1].
     """
     return sfd.throttle_to_speed_fn()(u, w_min, w_max, k)
+
+
+def imu_bias_step(bias, w, tau, sigma, dt):
+    """
+    One exact Gauss-Markov step of an IMU bias-walk row → bias' (same shape as `bias`).
+
+    The verified spec.sensors.imu_bias_gauss_markov_step (SkyFlow-Dynamics
+    imu_stochastic_errors, golden-tested against the executed rl-tools L2F):
+    b' = e^(-dt/τ)·b + sigma·√(τ/2·(1 - e^(-2dt/τ)))·w. `w` is a unit-normal draw (the
+    env's; RNG stays harness-side), `sigma` the driving-noise density in [unit]/√s —
+    it broadcasts, so one [6] row prices accel and gyro columns apart — `tau` the
+    correlation time in s. The stationary std is sigma·√(τ/2); for τ ≫ dt the step is a
+    random walk of std sigma·√dt. The generated function is elementwise and float32-stable
+    (the backend emits expm1), so it needs no vmap.
+    """
+    if not hasattr(sfd, "imu_bias_step_fn"):
+        raise RuntimeError(
+            "the IMU bias walk needs skyflow-dynamics >= 0.2.0 (backends.jax."
+            "imu_bias_step_fn); update the lock: uv lock --upgrade-package skyflow-dynamics"
+        )
+    return sfd.imu_bias_step_fn()(bias, w, tau, sigma, dt)
