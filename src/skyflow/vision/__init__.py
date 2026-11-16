@@ -31,7 +31,12 @@ from skyflow.vision.mask_noise import (
     noise_state_init,
     noise_state_step,
 )
-from skyflow.vision.renderer import render_floor, render_masks, render_masks_perworld
+from skyflow.vision.renderer import (
+    render_floor,
+    render_floor_checker,
+    render_masks,
+    render_masks_perworld,
+)
 
 __all__ = [
     "GROW_FAMILY",
@@ -51,6 +56,7 @@ __all__ = [
     "noise_state_init",
     "noise_state_step",
     "render_floor",
+    "render_floor_checker",
     "render_masks",
     "render_masks_perworld",
 ]

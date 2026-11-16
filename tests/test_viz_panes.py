@@ -572,6 +572,48 @@ class TestViewer:
         finally:
             viewer.close()
 
+    def test_fpv_swap_moves_the_map_to_a_pip_and_keeps_the_view(self, tmp_path):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid(half=(8, 8))), headless=True, threaded=False)
+        try:
+            f = _frame()
+            viewer.push(f, force=True)
+            main = viewer._scene_rect
+            anchor = (8.0, 8.0, 0.0)  # a world point, tracked across the swap
+            p0 = viewer._proj(main).point(anchor)
+            viewer._key(pygame.K_f)
+            viewer.push(f, force=True)
+            pip = viewer._scene_rect
+            assert viewer.fpv_main
+            assert pip[2] < main[2] and pip[3] < main[3]  # the map shrank to an inset
+            fpv = viewer._layout()[1]
+            assert pygame.Rect(fpv).contains(pygame.Rect(pip))
+            viewer.screenshot(str(tmp_path / "swap.png"))
+            assert (tmp_path / "swap.png").stat().st_size > 1000
+            viewer._key(pygame.K_f)  # and back: the same framing as before
+            viewer.push(f, force=True)
+            assert viewer._scene_rect == main
+            p1 = viewer._proj(main).point(anchor)
+            assert p1 == pytest.approx(p0, abs=1e-6)
+        finally:
+            viewer.close()
+
+    def test_window_resize_relayouts_the_panes(self):
+        from skyflow.viz.primitives import Grid, Scene
+
+        viewer = Viewer(Scene(Grid()), headless=True, threaded=False)
+        try:
+            f = _frame()
+            viewer.push(f, force=True)
+            w0 = viewer._scene_rect[2]
+            viewer._size = (1600, 1000)  # what the resize event handler sets
+            viewer.push(f, force=True)
+            assert viewer._scene_rect[2] == w0 + 320
+            assert viewer._layout()[1][0] == 1600 - 336 - 8  # FPV column on the right edge
+        finally:
+            viewer.close()
+
     def test_mailbox_reports_replaced_frames(self):
         from skyflow.viz.viewer import _Mailbox
 

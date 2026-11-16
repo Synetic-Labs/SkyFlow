@@ -196,6 +196,13 @@ class TestFpv:
         assert tuple(img[3, 1]) == palette.FPV_FLOOR
         assert tuple(img[1, 1]) == palette.FPV_SKY
 
+    def test_compose_checker_darkens_floor_cells(self):
+        floor = np.ones((2, 2), np.float32)
+        checker = np.array([[1.0, 0.0], [0.0, 1.0]], np.float32)
+        img = compose(None, floor, checker)
+        assert tuple(img[0, 0]) == palette.FPV_FLOOR_ALT
+        assert tuple(img[0, 1]) == palette.FPV_FLOOR
+
     def test_upscale_nearest(self):
         img = compose(np.eye(2, dtype=np.float32))
         big = upscale(img, 3)

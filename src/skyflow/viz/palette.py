@@ -32,6 +32,7 @@ STYLES: dict[str, Color] = {
 # FPV composite classes (matches the analytic renderer's world: gates, floor, sky).
 FPV_SKY: Color = (8, 9, 11)
 FPV_FLOOR: Color = (56, 61, 68)
+FPV_FLOOR_ALT: Color = (40, 44, 50)  # pilot-cam checker: the odd floor cells
 FPV_GATE: Color = (255, 64, 0)
 
 

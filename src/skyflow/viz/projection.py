@@ -93,6 +93,24 @@ class Projection:
         self.scale = new
         self.offset = (px + (self.offset[0] - px) * f, py + (self.offset[1] - py) * f)
 
+    def retarget(
+        self,
+        old_rect: tuple[float, float, float, float],
+        new_rect: tuple[float, float, float, float],
+    ) -> None:
+        """Carry the current view from one pane rect to another (a window resize, or
+        the map moving between the main pane and the picture-in-picture): the old
+        rect's centre lands on the new one's and the scale follows the size change
+        (geometric mean of the axis ratios — exactly reversible, so swapping panes
+        and back restores the view), so orbit, pan and zoom all survive."""
+        ox, oy, ow, oh = (float(v) for v in old_rect)
+        nx, ny, nw, nh = (float(v) for v in new_rect)
+        k = math.sqrt((nw / max(ow, 1.0)) * (nh / max(oh, 1.0)))
+        ocx, ocy = ox + ow / 2.0, oy + oh / 2.0
+        ncx, ncy = nx + nw / 2.0, ny + nh / 2.0
+        self.scale *= k
+        self.offset = (ncx + (self.offset[0] - ocx) * k, ncy + (self.offset[1] - ocy) * k)
+
     @classmethod
     def fit(
         cls,

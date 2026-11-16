@@ -57,6 +57,7 @@ The `viz` extra adds a live viewer. The camera is an analytic function of pose,
 ```bash
 uv run python examples/fly_hover.py --seconds 30 --view
 uv run python examples/fly_teleop.py --sticks joystick --record dvr/
+uv run python examples/fly_teleop.py --task freefly --sticks joystick   # F: FPV main view, F11: full screen
 uv run python -m skyflow.viz.replay dvr/lap_00.npz --pilot-cam 384x288
 ```
 
@@ -100,7 +101,8 @@ Env steps are 100 Hz control with observation, reward, termination, and reset.
 
 ## Tasks
 
-`hover` and `figure_eight` ship as reference tasks.
+`hover` and `figure_eight` ship as reference tasks. `freefly` is a playground for hand
+flying: a large field with gates (a split-S double gate among them) and no resets.
 
 ```python
 from skyflow import SimConfig, SkyFlowEnv, register_task

@@ -15,7 +15,7 @@ SkyFlow is a fleet-batched quadrotor **simulator** in pure JAX. It is only the s
   policy networks, checkpoints, logging frameworks, or Hydra/omegaconf. Training repos
   import SkyFlow and own all of that.
 - **Tasks are examples.** SkyFlow ships the Task protocol plus two reference tasks
-  (`hover`, `figure_eight`). Real research tasks live in the
+  (`hover`, `figure_eight`) and the `freefly` hand-flying playground. Real research tasks live in the
   downstream project and register against the protocol.
 - Differentiability is **not claimed** in docs or API. The design avoids blockers
   (pure functions, no in-place host state on the motors path), and a `differentiable`
@@ -37,15 +37,16 @@ src/skyflow/
   sensors.py            # IMU packaging: generated imu_fn + noise/scale DR hooks (harness-side by spec charter)
   env.py                # SkyFlowEnv platform: substep scan, delay buffer, wind, pokes, ground, crash set, auto-reset
   tasks/
-    __init__.py         # registry: register_task/build_task; registers hover + figure_eight
+    __init__.py         # registry: register_task/build_task; registers hover + figure_eight + freefly
     base.py             # obs helpers (world_to_body, finalize_obs), NO protocol here (protocol lives in types.py)
     hover.py            # HoverTask
     gate_course.py      # GateCourseTask, registered as "figure_eight" (state or vision obs) + gate pass/progress reward
+    freefly.py          # FreeflyTask: open-field playground for hand flying, never crashes + FREEFLY_ENV
   vision/
     __init__.py
     camera.py           # CameraModel (intrinsics, mount, rays)
     gates.py            # GateSet + course builders: from_waypoints/line/circle/figure_eight + classify_crossings
-    renderer.py         # analytic ray-cast coverage masks (gates, floor)
+    renderer.py         # analytic ray-cast coverage masks (gates, floor) + display-only floor checker
     mask_noise.py       # persistent mask corruption families
   firmware.py           # control="sticks" seam against cudaflight (§10)
   viz/                  # OPTIONAL viewer, extra "viz" (§13). Core never imports it.
@@ -239,6 +240,7 @@ class SimConfig:
     bounds_xy_m: float = 20.0; bounds_z_m: float = 8.0
     max_speed_mps: float = 30.0; max_rate_rps: float = 50.0
     ground_tilt_limit_rad: float = pi/3
+    ground_crash: bool = True          # False: touchdowns never crash (contact clamp only)
 ```
 
 **The DomainRand contract.** Robustness training = the sim world deliberately differing
@@ -290,7 +292,7 @@ Pure functions; the caller jits. **Step pipeline (order is normative):**
    the firmware filters what the real one filters (§10).
 6. Airborne latch; crash set: flyaway (|x|,|y| > bounds_xy, z > bounds_z, speed >
    max_speed, rate > max_rate), ground crash (z < 0.05 and airborne and (descent > 1 m/s or
-   tilt > limit)). Task `evaluate` on (prev_plant, plant): reward, success, task crash.
+   tilt > limit); skipped when `ground_crash=False`). Task `evaluate` on (prev_plant, plant): reward, success, task crash.
 7. `terminated = crash or task_crash or (success and success_terminates)`;
    `truncated = steps ≥ max_episode_steps or stuck`; `done = terminated or truncated`.
 8. Observe: `imu = sensors.measure(...)` with DomainRand bias/noise;
@@ -376,6 +378,16 @@ progress: `r = w_prog·(d_prev - d)` toward the pre-gate point + pass credit
 minus rate penalty. Obs (state mode): `[gate_rel(3), gate_normal(3), next_gate_rel(3),
 vel_body(3), rot_matrix(9), last_action(4)]`; vision mode replaces the gate blocks with
 the rendered mask `[H,W,1]` (+ same proprio tail). Success = last gate passed (terminates).
+
+**freefly** — a playground for hand flying, not a training task. A 120 x 120 m field
+with 11 gates of one 1.5 m design (`playground()`): straight, angled, a split-S double
+gate (two openings stacked frame on frame, normals opposite), a 6 m tower gate, a
+horizontal dive gate and a three-gate tunnel. Spawn: resting on the pad at the origin
+facing +x, no randomization. Obs `[pos(3), vel_body(3), rot_matrix(9), last_action(4)]`
+= 19. Never crashes or succeeds; gates have no collision physics, so frame hits are
+counted only. Reward = clean gate passes this step (either direction). `FREEFLY_ENV`
+holds the SimConfig overrides for a session: `ground_crash=False`, no practical step or
+stuck limit, flyaway bounds at the field edge.
 
 Reward constants live in task kwargs with the shipped defaults; no reward code in env.py.
 
@@ -581,6 +593,14 @@ binds — replay resolves the same binds and plots the same channels with no tas
 whole `[T, W, ...]` chunks (`extend`) so the fused scan is never stalled. Replay
 (`python -m skyflow.viz.replay`) re-renders FPV from poses; mp4 export through imageio
 when importable (soft dep, like matplotlib in the examples).
+
+Layout: the window resizes freely and F11 toggles desktop full screen; panes re-lay out
+from the window size every frame. F swaps the pilot cam into the main pane (rendered at
+640x480, aspect kept) and shrinks the map to a picture-in-picture inset that keeps full
+mouse control; the map's view carries across every resize and swap
+(`Projection.retarget`, exactly reversible). The pilot cam draws a display-only checker
+on the floor (`render_floor_checker`, fading with distance) so a human pilot can read
+speed and height; the policy pane never gets it.
 
 Teleop is an example, not package code: `examples/fly_teleop.py` drives control="sticks"
 through the CPU firmware fleet, paced to the wall clock, sticks from the keyboard, a local

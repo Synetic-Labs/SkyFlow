@@ -300,6 +300,9 @@ class SimConfig:
     max_speed_mps: float = 30.0
     max_rate_rps: float = 50.0
     ground_tilt_limit_rad: float = math.pi / 3
+    # False: a hard or tilted touchdown is NOT a crash — the §8 contact clamp still
+    # stops the vehicle at z = 0, but the episode goes on (free-flying sessions)
+    ground_crash: bool = True
 
 
 def _installed_base_rev() -> "str | None":
@@ -1256,7 +1259,7 @@ class SkyFlowEnv:
             | (jnp.linalg.norm(plant[:, 3:6], axis=-1) > cfg.max_speed_mps)
             | (jnp.linalg.norm(plant[:, 10:13], axis=-1) > cfg.max_rate_rps)
         )
-        crash = flyaway | (impact & airborne)
+        crash = (flyaway | (impact & airborne)) if cfg.ground_crash else flyaway
         ev = self.task.evaluate(state.plant, plant, ts_in)
         reward = ev.reward.astype(jnp.float32)
 

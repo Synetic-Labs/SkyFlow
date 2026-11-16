@@ -16,8 +16,9 @@ Keys (always listed in a bar along the window's bottom edge): Space pause · ←
 step/scrub (replay) · [ ] speed · Tab focus drone · V iso/top/profile (a switch lands on
 a fresh fit) · C follow the focused world · X full glyphs for all watched worlds ·
 G fleet scatter · left-drag orbit (the scene's near side follows the cursor) ·
-right-drag pan · wheel zoom · P print a screenshot · R reset request (only hosts that
-consume take_reset) · Esc quit.
+right-drag pan · wheel zoom · F swap FPV and map (the pilot cam fills the main pane, the
+map shrinks to a picture-in-picture) · F11 full screen (the window also resizes freely) ·
+P print a screenshot · R reset request (only hosts that consume take_reset) · Esc quit.
 """
 
 import os
@@ -50,6 +51,8 @@ from skyflow.viz.scenepane import draw_scene
 __all__ = ["Viewer"]
 
 _PILOT_RES = (192, 256)  # (H, W) of the default pilot cam pane
+_PILOT_MAIN_RES = (480, 640)  # (H, W) of the pilot cam when it fills the main pane (F)
+_PIP_FRAC = (0.30, 0.38)  # picture-in-picture map size, fraction of the main pane (w, h)
 _TOP_H, _HUD_H, _FPV_W, _KEYBAR_H = 30, 150, 336, 20
 _TRAIL_LEN = 300
 _STATUS_COLORS = {
@@ -270,6 +273,10 @@ class Viewer:
         self._pilot = pilot if pilot is not None else PilotCam(
             camera, gates, height=_PILOT_RES[0], width=_PILOT_RES[1]
         )
+        # the swapped (F) layout's big pilot view; an injected pilot serves both panes
+        self._pilot_main = pilot if pilot is not None else PilotCam(
+            camera, gates, height=_PILOT_MAIN_RES[0], width=_PILOT_MAIN_RES[1]
+        )
         if policy_floor is not None:
             self._policy_floor = policy_floor
         else:
@@ -282,6 +289,9 @@ class Viewer:
         self.snap_drops = 0  # frames dropped in _snap (first one warns with traceback)
 
         self._size = size
+        self._windowed_size = size  # restored when F11 leaves full screen
+        self._fullscreen = False
+        self.fpv_main = False  # F: the pilot cam fills the main pane, the map goes PIP
         self._headless = headless
         self._display_dt = 1.0 / float(display_hz)
         self._frames_left = frames
@@ -322,9 +332,8 @@ class Viewer:
         self._sps_acc = 0  # steps advanced inside that window
         self._sps_warm = False  # the first window holds first-draw compiles: dropped
         self._fleet: int | None = None  # sims stepping in parallel (from the frames)
-        self._scene_rect = (
-            8, _TOP_H + 8, size[0] - _FPV_W - 24, size[1] - _TOP_H - _HUD_H - _KEYBAR_H - 16
-        )
+        # the map pane's rect: the main pane, or the PIP inset when fpv_main (F)
+        self._scene_rect = self._layout()[0]
         self._last_draw = 0.0
         self._last_submit = 0.0
         self._last_fleet: tuple[float, np.ndarray | None] = (0.0, None)
@@ -356,12 +365,12 @@ class Viewer:
         pygame.display.init()
         pygame.font.init()
         try:
-            self._screen = pygame.display.set_mode(self._size)
+            self._screen = pygame.display.set_mode(self._size, pygame.RESIZABLE)
         except pygame.error:  # no video device: fall back to the dummy driver
             os.environ["SDL_VIDEODRIVER"] = "dummy"
             pygame.display.quit()
             pygame.display.init()
-            self._screen = pygame.display.set_mode(self._size)
+            self._screen = pygame.display.set_mode(self._size, pygame.RESIZABLE)
         pygame.display.set_caption(self.title)
         self._font = pygame.font.SysFont("dejavusansmono,consolas,menlo,monospace", 14)
         self._small = pygame.font.SysFont("dejavusansmono,consolas,menlo,monospace", 11)
@@ -808,6 +817,12 @@ class Viewer:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 self.close()
+            elif ev.type in (pygame.VIDEORESIZE, pygame.WINDOWSIZECHANGED):
+                # SDL resized the window surface itself; read the new size back
+                surf = pygame.display.get_surface()
+                if surf is not None:
+                    self._screen = surf
+                    self._size = surf.get_size()
             elif ev.type == pygame.KEYDOWN:
                 self._key(ev.key)
             elif ev.type == pygame.MOUSEBUTTONDOWN and ev.button in (1, 2, 3) and self._in_scene(ev.pos):
@@ -838,6 +853,10 @@ class Viewer:
         elif key == pygame.K_v:
             self._proj_kind = KINDS[(KINDS.index(self._proj_kind) + 1) % len(KINDS)]
             self._projs.pop(self._proj_kind, None)  # a view switch lands on a fresh fit
+        elif key == pygame.K_f:
+            self.fpv_main = not self.fpv_main
+        elif key == pygame.K_F11:
+            self._toggle_fullscreen()
         elif key == pygame.K_c:
             self.follow = not self.follow
         elif key == pygame.K_x:
@@ -863,6 +882,8 @@ class Viewer:
         ("Space", "pause"),
         ("Tab", "focus"),
         ("V", "view"),
+        ("F", "FPV/map"),
+        ("F11", "full screen"),
         ("C", "follow"),
         ("X", "glyphs"),
         ("G", "fleet"),
@@ -874,6 +895,89 @@ class Viewer:
         ("[ ]", "speed"),
         ("Esc", "quit"),
     )
+
+    def _layout(self) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+        """(map rect, FPV rect) for the current window size and layout. Normal: the
+        map is the main pane and the FPV panes stack in the right column. Swapped (F):
+        the pilot cam takes the whole main area and the map is an inset in its
+        lower-right corner."""
+        w, h = self._size
+        top = _TOP_H + 8
+        main_h = max(40, h - _TOP_H - _HUD_H - _KEYBAR_H - 16)
+        if not self.fpv_main:
+            map_w = max(40, w - _FPV_W - 24)
+            return (8, top, map_w, main_h), (w - _FPV_W - 8, top, _FPV_W, main_h)
+        fpv = (8, top, max(40, w - 16), main_h)
+        pip_w = max(160, int(fpv[2] * _PIP_FRAC[0]))
+        pip_h = max(120, int(fpv[3] * _PIP_FRAC[1]))
+        pip = (fpv[0] + fpv[2] - pip_w - 8, fpv[1] + fpv[3] - pip_h - 8, pip_w, pip_h)
+        return pip, fpv
+
+    def _sync_layout(self) -> tuple[int, int, int, int]:
+        """Apply the current layout; returns the FPV rect. When the map pane moved or
+        changed size, every cached view is carried over (orbit/pan/zoom survive)."""
+        map_rect, fpv_rect = self._layout()
+        if map_rect != self._scene_rect:
+            for proj in self._projs.values():
+                proj.retarget(self._scene_rect, map_rect)
+            self._scene_rect = map_rect
+        return fpv_rect
+
+    def _toggle_fullscreen(self) -> None:
+        """F11: desktop full screen, or back to the last windowed size."""
+        try:
+            if self._fullscreen:
+                self._screen = pygame.display.set_mode(self._windowed_size, pygame.RESIZABLE)
+            else:
+                self._windowed_size = self._size
+                self._screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        except pygame.error as e:  # e.g. a driver without full screen: stay as we are
+            warnings.warn(f"full screen toggle failed: {e}", RuntimeWarning, stacklevel=2)
+            return
+        self._fullscreen = not self._fullscreen
+        self._size = self._screen.get_size()
+
+    def _draw_policy(self, vf: ViewFrame, x: int, y: int, width: int) -> int:
+        """The policy obs pane (label + verbatim obs image) at (x, y); returns the
+        height drawn, 0 when this viewer has no image observation to show."""
+        if self.image_shape is None or self.obs_layout is None or vf.obs is None:
+            return 0
+        self._screen.blit(
+            self._small.render(
+                f"FPV · POLICY OBS {self.image_shape[1]}x{self.image_shape[0]} (verbatim)",
+                True,
+                palette.MUTED,
+            ),
+            (x, y),
+        )
+        mask = obs_mask(vf.obs[vf.focus], self.image_shape, self.obs_layout, self.image_term)
+        floor = None
+        if self._policy_floor is not None:  # display-only backdrop, never an obs
+            _, floor = self._policy_floor.channels(vf.pos[vf.focus], vf.quat[vf.focus])
+        img = compose(mask, floor)
+        k = max(1, width // img.shape[1])
+        return 16 + self._blit_image(upscale(img, k), x, y + 16, width)
+
+    def _draw_fpv_main(self, vf: ViewFrame, rect: tuple[int, int, int, int]) -> None:
+        """Swapped layout (F): the pilot cam fills `rect`, aspect kept (letterboxed),
+        smooth-scaled from its render resolution."""
+        rx, ry, rw, rh = rect
+        img = self._pilot_main.render(vf.pos[vf.focus], vf.quat[vf.focus])
+        ih, iw = img.shape[:2]
+        k = min(rw / iw, rh / ih)
+        dw, dh = max(1, int(iw * k)), max(1, int(ih * k))
+        x, y = rx + (rw - dw) // 2, ry + (rh - dh) // 2
+        surf = pygame.surfarray.make_surface(np.transpose(img, (1, 0, 2)))
+        self._screen.blit(pygame.transform.smoothscale(surf, (dw, dh)), (x, y))
+        pygame.draw.rect(self._screen, palette.DIM, pygame.Rect(x, y, dw, dh), 1)
+        cam = self._pilot_main.camera
+        label = f"FPV · PILOT CAM {cam.width}x{cam.height} · F: map"
+        self._screen.blit(self._small.render(label, True, palette.MUTED), (x + 8, y + 6))
+        # the policy view stays on screen as a lower-left inset (vision tasks only)
+        pw = min(_FPV_W - 16, dw // 3)
+        if self.image_shape is not None and vf.obs is not None:
+            ph = 16 + round(pw * self.image_shape[0] / self.image_shape[1])
+            self._draw_policy(vf, rx + 8, ry + rh - ph - 8, pw)
 
     def _draw_keybar(self) -> None:
         """Always-on key list: one horizontal row along the very bottom edge."""
@@ -998,6 +1102,9 @@ class Viewer:
         self._top_bar(vf)
 
         # panes
+        fpv_rect = self._sync_layout()
+        if self.fpv_main:
+            self._draw_fpv_main(vf, fpv_rect)
         scene_rect = self._scene_rect
         proj = self._proj(scene_rect)
         if self.follow:  # keep the focused world centred; orbit/zoom still compose
@@ -1021,36 +1128,24 @@ class Viewer:
             show_fleet=self.show_fleet,
         )
 
-        fx = wpx - _FPV_W - 8
-        y = _TOP_H + 8
-        cam = self._pilot.camera
-        screen.blit(
-            self._small.render(
-                f"FPV · PILOT CAM {cam.width}x{cam.height}", True, palette.MUTED
-            ),
-            (fx, y),
-        )
-        y += 16
-        pilot_img = self._pilot.render(vf.pos[vf.focus], vf.quat[vf.focus])
-        y += self._blit_image(pilot_img, fx, y, _FPV_W - 16) + 10
-
-        if self.image_shape is not None and self.obs_layout is not None and vf.obs is not None:
+        if self.fpv_main:
+            # PIP frame on top of the map inset, so it reads apart from the FPV image
+            pygame.draw.rect(screen, palette.MUTED, pygame.Rect(scene_rect), 1)
+        else:
+            fx = fpv_rect[0]
+            y = fpv_rect[1]
+            cam = self._pilot.camera
             screen.blit(
                 self._small.render(
-                    f"FPV · POLICY OBS {self.image_shape[1]}x{self.image_shape[0]} (verbatim)",
-                    True,
+                    f"FPV · PILOT CAM {cam.width}x{cam.height} · F: expand", True,
                     palette.MUTED,
                 ),
                 (fx, y),
             )
             y += 16
-            mask = obs_mask(vf.obs[vf.focus], self.image_shape, self.obs_layout, self.image_term)
-            floor = None
-            if self._policy_floor is not None:  # display-only backdrop, never an obs
-                _, floor = self._policy_floor.channels(vf.pos[vf.focus], vf.quat[vf.focus])
-            img = compose(mask, floor)
-            k = max(1, (_FPV_W - 16) // img.shape[1])
-            self._blit_image(upscale(img, k), fx, y, _FPV_W - 16)
+            pilot_img = self._pilot.render(vf.pos[vf.focus], vf.quat[vf.focus])
+            y += self._blit_image(pilot_img, fx, y, _FPV_W - 16) + 10
+            self._draw_policy(vf, fx, y, _FPV_W - 16)
 
         self._draw_keybar()
 
