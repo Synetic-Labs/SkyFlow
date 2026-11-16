@@ -20,7 +20,8 @@ dependencies = [
     # headers; an older runtime rejects its handlers (CUDA does so silently).
     "jax>=0.11.1",
     "numpy>=2",
-    "skyflow-dynamics[jax]",
+    # >=0.2.0: backends.jax.imu_bias_step_fn (the IMU bias walk, DESIGN.md §7).
+    "skyflow-dynamics[jax]>=0.2.0",
 ]
 
 [project.optional-dependencies]
