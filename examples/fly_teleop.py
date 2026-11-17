@@ -8,16 +8,17 @@ DESIGN.md §10). Needs the `viz` and `firmware` extras.
 
 Run from the repo root:
 
-    uv run python examples/fly_teleop.py                        # keyboard sticks
+    uv run python examples/fly_teleop.py                        # keyboard sticks, freefly map
     uv run python examples/fly_teleop.py --sticks joystick      # local gamepad (pygame)
     uv run python examples/fly_teleop.py --sticks joystick --invert pitch,throttle  # RC radio in USB mode
     uv run python examples/fly_teleop.py --sticks udp:9111      # UDP AETR datagrams
     uv run python examples/fly_teleop.py --task hover --record dvr/
-    uv run python examples/fly_teleop.py --task freefly --sticks joystick  # open field, no resets
+    uv run python examples/fly_teleop.py --task figure_eight    # the gate race course
 
 Keyboard: W/S throttle · A/D yaw · arrows roll/pitch (window must have focus).
 Viewer: F swaps the FPV view into the main pane (map goes picture-in-picture), F11 is full
-screen. `--task freefly` also applies FREEFLY_ENV: touchdowns never reset, no time limit.
+screen. The default map, freefly, also applies FREEFLY_ENV: touchdowns never reset, no
+time limit.
 UDP protocol: 20-byte little-endian `<ffffI` = roll, pitch, yaw, throttle in [-1,1] plus a
 button bitmask (bit0 reset, bit1 save lap); latest datagram wins, any sender works.
 Recording (--record DIR): R / button-0 resets the world and DISCARDS the lap; K /
@@ -135,7 +136,7 @@ def main() -> None:
                     help="joystick axis indices for roll,pitch,throttle,yaw")
     ap.add_argument("--invert", default="", metavar="AXES",
                     help="joystick axes to flip, comma-separated from roll,pitch,throttle,yaw")
-    ap.add_argument("--task", default="figure_eight", help="registered task to fly in")
+    ap.add_argument("--task", default="freefly", help="registered task to fly in")
     ap.add_argument("--control-hz", type=float, default=100.0, help="control rate")
     ap.add_argument("--seconds", type=float, default=0.0, help="auto-quit after this long (0 = fly)")
     ap.add_argument("--seed", type=int, default=0, help="reset PRNG seed")

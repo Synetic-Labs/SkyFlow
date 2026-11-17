@@ -57,7 +57,7 @@ The `viz` extra adds a live viewer. The camera is an analytic function of pose,
 ```bash
 uv run python examples/fly_hover.py --seconds 30 --view
 uv run python examples/fly_teleop.py --sticks joystick --record dvr/
-uv run python examples/fly_teleop.py --task freefly --sticks joystick   # F: FPV main view, F11: full screen
+uv run python examples/fly_teleop.py --sticks joystick   # freefly map; F: FPV main view, F11: full screen
 uv run python -m skyflow.viz.replay dvr/lap_00.npz --pilot-cam 384x288
 ```
 
