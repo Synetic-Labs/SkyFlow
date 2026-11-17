@@ -22,10 +22,15 @@ from skyflow.viz import palette
 __all__ = ["PilotCam", "compose", "obs_mask", "upscale"]
 
 
-def compose(mask: np.ndarray | None, floor: np.ndarray | None = None) -> np.ndarray:
+def compose(
+    mask: np.ndarray | None,
+    floor: np.ndarray | None = None,
+    checker: np.ndarray | None = None,
+) -> np.ndarray:
     """
     [H,W] coverage(s) in [0,1] → [H,W,3] uint8: gate orange over floor grey over sky.
-    Either channel may be None; shapes must agree when both are given.
+    Either channel may be None; shapes must agree when both are given. `checker`
+    (pilot cam only, display texture) darkens the odd floor cells.
     """
     if mask is None and floor is None:
         raise ValueError("compose needs at least one of mask / floor")
@@ -35,6 +40,9 @@ def compose(mask: np.ndarray | None, floor: np.ndarray | None = None) -> np.ndar
     if floor is not None:
         f = np.clip(np.asarray(floor, np.float32), 0.0, 1.0)[..., None]
         img = img * (1.0 - f) + np.asarray(palette.FPV_FLOOR, np.float32) * f
+    if checker is not None:
+        k = np.clip(np.asarray(checker, np.float32), 0.0, 1.0)[..., None]
+        img = img * (1.0 - k) + np.asarray(palette.FPV_FLOOR_ALT, np.float32) * k
     if mask is not None:
         m = np.clip(np.asarray(mask, np.float32), 0.0, 1.0)[..., None]
         img = img * (1.0 - m) + np.asarray(palette.FPV_GATE, np.float32) * m
@@ -72,6 +80,9 @@ class PilotCam:
     Keeps the given camera's lens and mount but swaps resolution (supersample 1 — the
     pilot pane is large enough not to alias). With `gates=None` it renders the floor/sky
     horizon only, which is the pilot view for tasks with no gate geometry at all.
+    `checker_m` lays a display-only checkerboard of that cell size on the floor (fading
+    out over `checker_fade_m`) so a human pilot can read speed and height; None keeps
+    the plain floor.
     """
 
     def __init__(
@@ -82,6 +93,8 @@ class PilotCam:
         height: int = 192,
         width: int = 256,
         floor_half: float | None = None,
+        checker_m: float | None = 4.0,
+        checker_fade_m: float = 60.0,
     ) -> None:
         from skyflow.vision.camera import CameraModel
 
@@ -89,31 +102,51 @@ class PilotCam:
         self.camera = dataclasses.replace(base, height=height, width=width, supersample=1)
         self.gates = gates
         self.floor_half = floor_half
+        self.checker_m = checker_m
+        self.checker_fade_m = float(checker_fade_m)
         self._fn: Any = None  # jitted on first render
+
+    def _channels3(
+        self, pos: np.ndarray, quat: np.ndarray
+    ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None]:
+        """One pose → (gate coverage or None, floor, checker or None), all [H,W]."""
+        if self._fn is None:
+            import jax
+
+            from skyflow.vision.renderer import (
+                render_floor,
+                render_floor_checker,
+                render_masks,
+            )
+
+            cam, gates, floor_half = self.camera, self.gates, self.floor_half
+            cell, fade = self.checker_m, self.checker_fade_m
+
+            def _render(p, q):
+                floor = render_floor(cam, p, q, half_extent=floor_half)
+                checker = None if cell is None else render_floor_checker(
+                    cam, p, q, cell_m=cell, fade_m=fade, half_extent=floor_half
+                )
+                mask = None if gates is None else render_masks(cam, gates, p, q)
+                return mask, floor, checker
+
+            self._fn = jax.jit(_render)
+        p = np.asarray(pos, np.float32).reshape(1, 3)
+        q = np.asarray(quat, np.float32).reshape(1, 4)
+        mask, floor, checker = self._fn(p, q)
+        return (
+            None if mask is None else np.asarray(mask)[0],
+            np.asarray(floor)[0],
+            None if checker is None else np.asarray(checker)[0],
+        )
 
     def channels(
         self, pos: np.ndarray, quat: np.ndarray
     ) -> tuple[np.ndarray | None, np.ndarray]:
         """One pose (world z-up, wxyz) → ([H,W] gate coverage or None, [H,W] floor)."""
-        if self._fn is None:
-            import jax
-
-            from skyflow.vision.renderer import render_floor, render_masks
-
-            cam, gates, floor_half = self.camera, self.gates, self.floor_half
-
-            def _render(p, q):
-                floor = render_floor(cam, p, q, half_extent=floor_half)
-                if gates is None:
-                    return None, floor
-                return render_masks(cam, gates, p, q), floor
-
-            self._fn = jax.jit(_render)
-        p = np.asarray(pos, np.float32).reshape(1, 3)
-        q = np.asarray(quat, np.float32).reshape(1, 4)
-        mask, floor = self._fn(p, q)
-        return (None if mask is None else np.asarray(mask)[0]), np.asarray(floor)[0]
+        mask, floor, _ = self._channels3(pos, quat)
+        return mask, floor
 
     def render(self, pos: np.ndarray, quat: np.ndarray) -> np.ndarray:
         """One pose (world z-up, wxyz) → [H,W,3] uint8 composite."""
-        return compose(*self.channels(pos, quat))
+        return compose(*self._channels3(pos, quat))

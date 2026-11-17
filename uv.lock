@@ -644,7 +644,7 @@ dev = [
 [[package]]
 name = "skyflow-dynamics"
 version = "0.2.0"
-source = { git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics#3733120bf9ab959bcd57e426fd99257de406d04e" }
+source = { git = "https://github.com/Synetic-Labs/SkyFlow-Dynamics#5ad1f0554404ad6afaabe804e3e71e010ae295ff" }
 dependencies = [
     { name = "numpy" },
     { name = "sympy" },

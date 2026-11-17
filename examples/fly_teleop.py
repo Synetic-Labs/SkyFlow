@@ -8,12 +8,17 @@ DESIGN.md §10). Needs the `viz` and `firmware` extras.
 
 Run from the repo root:
 
-    uv run python examples/fly_teleop.py                        # keyboard sticks
+    uv run python examples/fly_teleop.py                        # keyboard sticks, freefly map
     uv run python examples/fly_teleop.py --sticks joystick      # local gamepad (pygame)
+    uv run python examples/fly_teleop.py --sticks joystick --invert pitch,throttle  # RC radio in USB mode
     uv run python examples/fly_teleop.py --sticks udp:9111      # UDP AETR datagrams
     uv run python examples/fly_teleop.py --task hover --record dvr/
+    uv run python examples/fly_teleop.py --task figure_eight    # the gate race course
 
 Keyboard: W/S throttle · A/D yaw · arrows roll/pitch (window must have focus).
+Viewer: F swaps the FPV view into the main pane (map goes picture-in-picture), F11 is full
+screen. The default map, freefly, also applies FREEFLY_ENV: touchdowns never reset, no
+time limit.
 UDP protocol: 20-byte little-endian `<ffffI` = roll, pitch, yaw, throttle in [-1,1] plus a
 button bitmask (bit0 reset, bit1 save lap); latest datagram wins, any sender works.
 Recording (--record DIR): R / button-0 resets the world and DISCARDS the lap; K /
@@ -39,6 +44,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from skyflow import DomainRand, SimConfig, SkyFlowEnv
+from skyflow.tasks.freefly import FREEFLY_ENV
 
 _UDP_FMT = "<ffffI"  # roll, pitch, yaw, throttle, buttons
 _BTN_RESET, _BTN_SAVE = 1, 2
@@ -61,22 +67,32 @@ class KeyboardSticks:
         return np.array([[roll, pitch, self.throttle, yaw]], np.float32), buttons
 
 
-class JoystickSticks:
-    """First local gamepad via pygame; axis order roll,pitch,throttle,yaw (--axes)."""
+_AETR = ("roll", "pitch", "throttle", "yaw")
 
-    def __init__(self, pygame, axes: tuple[int, int, int, int]) -> None:
+
+class JoystickSticks:
+    """
+    First local gamepad via pygame; axis order roll,pitch,throttle,yaw (--axes).
+    Signs assume a gamepad (SDL reads +1 down); --invert flips named axes for devices
+    that read the other way, e.g. RC radios in USB joystick mode.
+    """
+
+    def __init__(self, pygame, axes: tuple[int, int, int, int], invert: frozenset[str]) -> None:
         pygame.joystick.init()
         if pygame.joystick.get_count() == 0:
             raise SystemExit("no joystick found — plug one in or use --sticks keyboard/udp")
         self._js = pygame.joystick.Joystick(0)
         self._js.init()
         self._axes = axes
+        sdl = np.array([1.0, -1.0, -1.0, 1.0], np.float32)  # gamepad: pitch/throttle flip
+        flip = np.array([-1.0 if name in invert else 1.0 for name in _AETR], np.float32)
+        self._sign = (sdl * flip)[None, :]
         print(f"joystick: {self._js.get_name()} ({self._js.get_numaxes()} axes)")
 
     def read(self, pygame, dt: float) -> tuple[np.ndarray, int]:
         r, p, t, y = (float(self._js.get_axis(a)) for a in self._axes)
         # SDL sticks read +1 down; AETR wants +1 forward/up
-        aetr = np.array([[r, -p, -t, y]], np.float32)
+        aetr = np.array([[r, p, t, y]], np.float32) * self._sign
         buttons = 0
         if self._js.get_numbuttons() > 0 and self._js.get_button(0):
             buttons |= _BTN_RESET
@@ -118,7 +134,9 @@ def main() -> None:
                     help='"keyboard", "joystick", or "udp:PORT"')
     ap.add_argument("--axes", default="0,1,2,3",
                     help="joystick axis indices for roll,pitch,throttle,yaw")
-    ap.add_argument("--task", default="figure_eight", help="registered task to fly in")
+    ap.add_argument("--invert", default="", metavar="AXES",
+                    help="joystick axes to flip, comma-separated from roll,pitch,throttle,yaw")
+    ap.add_argument("--task", default="freefly", help="registered task to fly in")
     ap.add_argument("--control-hz", type=float, default=100.0, help="control rate")
     ap.add_argument("--seconds", type=float, default=0.0, help="auto-quit after this long (0 = fly)")
     ap.add_argument("--seed", type=int, default=0, help="reset PRNG seed")
@@ -142,6 +160,8 @@ def main() -> None:
         dr=DomainRand().off(),
         # hand flying wanders more than a policy: hold the goal still and give room
         task_kwargs={"goal_hold_s": 3600.0} if args.task == "hover" else {},
+        # freefly: no resets on touchdown, no time limit, bounds at the field edge
+        **(FREEFLY_ENV if args.task == "freefly" else {}),
     )
     env = SkyFlowEnv(cfg)
     viewer = Viewer.for_env(
@@ -173,7 +193,10 @@ def main() -> None:
         ax = [int(a) for a in args.axes.split(",")]
         if len(ax) != 4:
             raise SystemExit(f"--axes needs 4 comma-separated axis ids (AETR), got {args.axes!r}")
-        sticks = JoystickSticks(pygame, (ax[0], ax[1], ax[2], ax[3]))
+        inv = frozenset(a for a in args.invert.split(",") if a)
+        if not inv <= set(_AETR):
+            raise SystemExit(f"--invert takes names from {','.join(_AETR)}, got {args.invert!r}")
+        sticks = JoystickSticks(pygame, (ax[0], ax[1], ax[2], ax[3]), inv)
     elif args.sticks.startswith("udp:"):
         sticks = UdpSticks(int(args.sticks.split(":", 1)[1]))
     else:

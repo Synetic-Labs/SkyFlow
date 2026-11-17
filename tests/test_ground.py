@@ -79,3 +79,19 @@ def test_pad_spawn_takes_off_under_full_throttle(key):
     assert bool(jnp.all(state.plant[:, 2] > 0.5)), "full throttle failed to lift off"
     assert bool(state.airborne.all())
     assert bool(jnp.all(state.plant[:, 5] > 0.0))  # still climbing
+
+
+def test_ground_crash_off_keeps_the_episode(key):
+    """ground_crash=False: the same 4.4 m/s impact never ends the episode, and the
+    contact clamp still holds the vehicle at z >= 0."""
+    env = make_env(ground_crash=False)
+    step = jax.jit(env.step)
+    _, state = env.reset(key)
+    state = state.replace(plant=state.plant.at[:, 2].set(1.0))
+    idle = -jnp.ones((FLEET, 4), jnp.float32)
+
+    for _ in range(80):
+        _, state, _, done, _ = step(state, idle)
+        assert bool(jnp.all(state.plant[:, 2] >= 0.0)), "ground penetration"
+        assert not bool(jnp.any(done)), "a touchdown must not end the episode"
+    assert bool(jnp.all(state.plant[:, 2] == 0.0)), "the vehicle rests on the ground"

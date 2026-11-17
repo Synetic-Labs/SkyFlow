@@ -184,6 +184,47 @@ def render_floor(
     return hit.astype(jnp.float32).reshape(fleet, H, ss, W, ss).mean(axis=(2, 4))
 
 
+def render_floor_checker(
+    cam: CameraModel,
+    pos: jax.Array,
+    quat: jax.Array,
+    *,
+    cell_m: float,
+    fade_m: float | None = None,
+    R_body_from_cam: jax.Array | None = None,
+    half_extent: float | None = None,
+) -> jax.Array:
+    """
+    Checkerboard texture on the ground plane — a DISPLAY channel for human pilots
+    (DESIGN.md §13), never an observation: a flat floor gives a pilot no sense of speed
+    or height. Same rays and ground hits as :func:`render_floor`; a pixel is covered
+    where its ground hit lands on an odd ``cell_m`` square. ``fade_m`` scales coverage
+    by exp(-distance / fade_m), so far cells fade into the plain floor instead of
+    aliasing at the horizon.
+
+    Returns coverage [F, H, W] float32 in [0, 1], a subset of the floor channel.
+    """
+    H, W, ss = cam.height, cam.width, cam.supersample
+    pos_ned, quat_ned = pose_ned(pos, quat)
+    cam_origin, rays_world = _camera_rays(cam, pos_ned, quat_ned, R_body_from_cam)
+    fleet = pos_ned.shape[0]
+
+    oz = cam_origin[:, None, 2]
+    dz = rays_world[..., 2]
+    t = (0.0 - oz) / jnp.where(jnp.abs(dz) < 1e-9, 1e-9, dz)
+    hit = (t > 1e-6) & (jnp.abs(dz) > 1e-9)
+    nx = cam_origin[:, None, 0] + t * rays_world[..., 0]
+    ny = cam_origin[:, None, 1] + t * rays_world[..., 1]
+    if half_extent is not None:
+        hit = hit & (jnp.abs(nx) <= half_extent) & (jnp.abs(ny) <= half_extent)
+    parity = (jnp.floor(nx / cell_m) + jnp.floor(ny / cell_m)) % 2.0
+    cover = jnp.where(hit, parity, 0.0)
+    if fade_m is not None:
+        dist = jnp.where(hit, t * jnp.linalg.norm(rays_world, axis=-1), 0.0)
+        cover = cover * jnp.exp(-dist / fade_m)
+    return cover.astype(jnp.float32).reshape(fleet, H, ss, W, ss).mean(axis=(2, 4))
+
+
 def render_masks_perworld(
     cam: CameraModel,
     centers: jax.Array, normals: jax.Array, laterals: jax.Array, verticals: jax.Array,
