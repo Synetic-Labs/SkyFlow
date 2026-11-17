@@ -36,7 +36,8 @@ def test_registered_and_contract():
     plant, ts = task.spawn(jax.random.PRNGKey(0), 3, jnp.zeros((3, 1)))
     assert plant.shape == (3, 17) and plant.dtype == jnp.float32
     np.testing.assert_array_equal(np.asarray(plant[:, 0:3]), 0.0)  # on the pad
-    obs, _ = task.observe(plant, ts, (None, None), jnp.zeros((3, 4)), None, True)
+    imu = (jnp.zeros((3, 3)), jnp.zeros((3, 3)))
+    obs, _ = task.observe(plant, ts, imu, jnp.zeros((3, 4)), jax.random.PRNGKey(1), True)
     assert obs.shape == (3, 19)
 
 

@@ -97,7 +97,7 @@ class FreeflyTask:
     """Open-field free flight among gates: never crashes, never succeeds."""
 
     success_terminates = False
-    image_shape = None
+    image_shape: tuple[int, int, int] | None = None
 
     def __init__(self, gates: GateSet | None = None, *, body_radius_m: float = 0.1):
         """
